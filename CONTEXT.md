@@ -104,6 +104,10 @@ _Avoid_: Quick Look, Open, viewer
 The temporary full-document preview opened for a file without handing it to an editing application.
 _Avoid_: Preview Panel, Open, viewer
 
+**Status Strip**:
+The persistent zone of the window that shows progress and failures of asynchronous work, from batch operations to cloud downloads. It is the application's only feedback surface.
+_Avoid_: Toast, notification, alert
+
 **Accessible Filesystem**:
 The local, cloud-backed, or mounted file-system content that macOS permissions make available to the application.
 _Avoid_: Disk, Finder files
