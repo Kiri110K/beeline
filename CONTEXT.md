@@ -40,6 +40,14 @@ _Avoid_: Result, document
 A system-derived collection of recently used Items. Recents is a collection, not a directory or navigation history.
 _Avoid_: History, recent folder
 
+**Name Index**:
+The application-owned index of Item names and paths that answers Search Queries. It covers hidden and Junk content as well as visible content.
+_Avoid_: Spotlight, database, cache
+
+**Junk**:
+Pattern-classified content, such as dependency, build, cache, and agent-session directories, that stays searchable but carries a heavy ranking penalty and refreshes lazily.
+_Avoid_: Excluded, ignored, hidden
+
 **Visit Journal**:
 The application-owned record of Locations entered and files opened through the application, used solely as ranking input for Search Results.
 _Avoid_: History, Recents, log
