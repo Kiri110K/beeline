@@ -1,0 +1,7 @@
+{"event":"process_start","monotonicMs":0.059583,"wallTime":"2026-08-21T07:31:15.032Z","pid":27933,"electron":"37.10.3","chrome":"138.0.7204.251"}
+{"event":"shortcut_registration","monotonicMs":171.562708,"wallTime":"2026-08-21T07:31:15.203Z","pid":27933,"shortcut":"CommandOrControl+Shift+E","registered":true}
+{"event":"backend_ready","monotonicMs":171.879208,"wallTime":"2026-08-21T07:31:15.203Z","pid":27933,"shortcut":"CommandOrControl+Shift+E","shortcutRegistered":true,"logPath":"/Users/kiri110k/Library/Application Support/Visual Files Electron Demo/events.ndjson"}
+{"event":"frontend_ready","monotonicMs":269.269,"wallTime":"2026-08-21T07:31:15.301Z","pid":27933,"startVisibleForTest":true}
+{"event":"show_requested","monotonicMs":269.328917,"wallTime":"2026-08-21T07:31:15.301Z","pid":27933,"sequence":1,"origin":"test-hook"}
+{"event":"window_visible","monotonicMs":336.55025,"wallTime":"2026-08-21T07:31:15.368Z","pid":27933,"focused":true,"sequence":1,"origin":"test-hook"}
+{"event":"recents_loaded","monotonicMs":478.318667,"wallTime":"2026-08-21T07:31:15.510Z","pid":27933,"durationMs":159.72875,"itemCount":290}

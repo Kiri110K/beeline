@@ -1,0 +1,56 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  color: #ebedf2;
+  background: #111216;
+  font-synthesis: none;
+  user-select: none;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input { font: inherit; }
+button { color: inherit; }
+
+.window { height: 100%; display: grid; grid-template-rows: 52px 48px 32px minmax(0, 1fr) 30px; background: #15161b; border: 1px solid #34363f; border-radius: 12px; overflow: hidden; box-shadow: 0 24px 70px rgb(0 0 0 / 45%); }
+.chrome { display: flex; align-items: end; gap: 12px; background: #1b1c22; padding: 9px 12px 0; -webkit-app-region: drag; }
+.traffic-lights { display: flex; gap: 8px; align-self: center; padding: 0 2px 6px; }
+.traffic-lights i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; }
+.traffic-lights i:nth-child(2) { background: #febc2e; }
+.traffic-lights i:nth-child(3) { background: #28c840; }
+.tabs { display: flex; align-items: end; min-width: 0; gap: 3px; overflow-x: auto; -webkit-app-region: no-drag; }
+.tab, .new-tab { border: 0; cursor: default; background: transparent; }
+.tab { min-width: 105px; max-width: 175px; height: 37px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #9599a5; padding: 0 10px 0 13px; border-radius: 8px 8px 0 0; }
+.tab span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab.active { color: #f6f7fa; background: #25272e; }
+.tab-close { opacity: 0; font-size: 17px; line-height: 1; border-radius: 4px; padding: 0 2px; }
+.tab:hover .tab-close, .tab.active .tab-close { opacity: .8; }
+.tab-close:hover { background: #3a3d47; }
+.new-tab { width: 32px; height: 32px; color: #a9acb6; font-size: 20px; border-radius: 7px; }
+.new-tab:hover { background: #2b2d35; }
+.toolbar { display: grid; grid-template-columns: 30px minmax(120px, 1fr) auto auto; align-items: center; gap: 8px; padding: 7px 10px; background: #25272e; border-bottom: 1px solid #343640; }
+.toolbar input { height: 34px; border-radius: 8px; border: 1px solid #434650; background: #17181d; color: #f2f3f6; padding: 0 11px; outline: none; user-select: text; }
+.toolbar input:focus { border-color: #755cff; box-shadow: 0 0 0 2px rgb(117 92 255 / 22%); }
+.toolbar button { height: 30px; border: 0; border-radius: 7px; padding: 0 10px; background: #353741; color: #d4d6dd; }
+.toolbar button:hover:not(:disabled) { background: #41444f; }
+.toolbar button:disabled { opacity: .35; }
+.back { font-size: 24px; padding: 0 !important; }
+.column-header, .row { display: grid; grid-template-columns: minmax(270px, 1fr) 105px 175px 90px; align-items: center; }
+.column-header { padding: 0 13px; color: #80838e; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #292b32; }
+.list { position: relative; overflow: auto; outline: none; scrollbar-color: #4b4e59 transparent; }
+.list:focus { box-shadow: inset 0 0 0 1px rgb(117 92 255 / 25%); }
+.list-spacer { position: relative; width: 100%; }
+.row { position: absolute; top: 0; left: 0; width: 100%; padding: 0 13px; color: #b8bbc4; font-size: 13px; border-bottom: 1px solid #202127; }
+.row:hover { background: #202229; }
+.row.selected { background: #5f49d7; color: white; }
+.row > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.name { color: #eef0f4; display: flex; align-items: center; min-width: 0; }
+.icon { display: inline-block; width: 20px; color: #8d77ff; font-size: 16px; }
+.selected .icon { color: white; }
+.status { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 0 11px; color: #818590; background: #1b1c22; border-top: 1px solid #292b32; font-size: 11px; }
+.status span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status .error { color: #ff7c78; }
+.status .warning { color: #f5bb45; flex: none; }
+.context-menu { position: fixed; z-index: 5; width: 165px; padding: 5px; border: 1px solid #454852; border-radius: 9px; background: rgb(38 40 47 / 98%); box-shadow: 0 12px 35px rgb(0 0 0 / 45%); }
+.context-menu button { display: block; width: 100%; height: 29px; text-align: left; border: 0; border-radius: 5px; background: transparent; padding: 0 9px; }
+.context-menu button:hover:not(:disabled) { background: #654ee0; }
+.context-menu button:disabled { opacity: .35; }

@@ -1,0 +1,65 @@
+:root {
+  color: #eef0f4;
+  background: transparent;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input { font: inherit; color: inherit; }
+button { border: 0; }
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr 30px;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: rgba(24, 25, 29, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 13px;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.52);
+}
+
+.chrome { background: rgba(37, 38, 44, 0.98); border-bottom: 1px solid #45474f; padding-top: 12px; }
+.tabs { display: flex; align-items: end; gap: 5px; min-height: 34px; padding: 0 12px; overflow-x: auto; }
+.tab, .icon-button, .benchmark-button { cursor: default; background: #303139; }
+.tab { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-width: 130px; max-width: 210px; height: 32px; padding: 0 9px 0 12px; border-radius: 8px 8px 0 0; color: #aeb1ba; }
+.tab.active { color: #fff; background: #18191d; }
+.tab span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-close { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 5px; color: #8c8f98; }
+.tab-close:hover { color: #fff; background: #4b4d56; }
+.icon-button, .benchmark-button { height: 25px; border-radius: 6px; color: #b7bac3; }
+.icon-button { width: 26px; font-size: 20px; line-height: 20px; }
+.benchmark-button { margin-left: auto; padding: 0 9px; font-size: 12px; }
+.icon-button:hover, .benchmark-button:hover { background: #474952; color: #fff; }
+
+.path-form { display: grid; grid-template-columns: 30px 1fr; gap: 7px; padding: 10px 12px 12px; }
+.path-form input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid #4c4e57; border-radius: 8px; outline: none; background: #202126; }
+.path-form input:focus { border-color: #7f8cff; box-shadow: 0 0 0 3px rgba(108, 122, 255, 0.19); }
+.back-button { border-radius: 7px; background: #303139; font-size: 24px; line-height: 24px; }
+.back-button:disabled { color: #60626a; }
+
+.list-shell { min-height: 0; display: grid; grid-template-rows: 32px 1fr; }
+.row-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 125px 155px 90px; column-gap: 12px; align-items: center; padding: 0 15px; }
+.list-header { color: #8d909a; font-size: 12px; border-bottom: 1px solid #35363d; background: #202126; }
+.list-scroll { position: relative; min-height: 0; overflow: auto; outline: none; }
+.virtual-space { position: relative; width: 100%; }
+.file-row { position: absolute; inset: 0 0 auto 0; height: 38px; border-bottom: 1px solid rgba(255, 255, 255, 0.035); color: #c8cad1; font-size: 13px; user-select: none; }
+.file-row.selected { color: #fff; background: #4c5fc8; }
+.file-row:not(.selected):hover { background: rgba(255, 255, 255, 0.055); }
+.file-row > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.name-cell { display: flex; align-items: center; gap: 7px; }
+.kind-icon { width: 12px; color: #7f8cff; font-size: 17px; }
+.selected .kind-icon { color: #fff; }
+.size-cell { text-align: right; }
+.empty-state { padding: 44px; text-align: center; color: #8c8f98; }
+.empty-state.error { color: #ff8b8b; white-space: pre-wrap; }
+.status { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 13px; border-top: 1px solid #35363d; background: #202126; color: #888b94; font-size: 11px; }
+.status span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.context-menu { position: fixed; z-index: 10; width: 170px; padding: 5px; border: 1px solid #5a5d66; border-radius: 8px; background: rgba(45, 46, 53, 0.99); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45); }
+.context-menu button { display: block; width: 100%; padding: 7px 9px; border-radius: 5px; text-align: left; background: transparent; }
+.context-menu button:hover { background: #5265d1; }

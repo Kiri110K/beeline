@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visual Files - макет C, пространственный верстак</title>
+<style>
+  :root {
+    --deck: #0a0b0d;
+    --card: #15161a;
+    --card2: #191a1f;
+    --head: #1e1f25;
+    --seam: #2b2d34;
+    --seam2: #3a3d45;
+    --ink: #d8dae1;
+    --mid: #8b8e97;
+    --low: #62656d;
+    --accent: #7c8bf0;
+    --fill: #2c3049;
+    --amber: #d5a05a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; background: #08090b; color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px; -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: default; }
+  input { font: inherit; color: inherit; }
+  .sheetwrap { max-width: 1320px; margin: 0 auto; padding: 18px 18px 60px; }
+  .intro { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; }
+  .intro h1 { margin: 0; font-size: 14px; font-weight: 600; }
+  .intro p { margin: 0; font-size: 12px; color: var(--mid); }
+  .key { display: inline-block; min-width: 15px; padding: 1px 4px; border: 1px solid var(--seam2); border-radius: 3px; background: #23252b; color: #9da0a9; font-size: 10px; text-align: center; }
+
+  /* ---------- окно как верстак из трёх плит ---------- */
+  .w-win {
+    position: relative; width: 100%; max-width: 1280px; height: 664px;
+    display: grid; grid-template-columns: 188px 1fr 320px;
+    gap: 8px; padding: 8px;
+    background: var(--deck); border: 1px solid #303239; border-radius: 10px;
+    box-shadow: 0 18px 48px rgba(0,0,0,.55); overflow: hidden;
+  }
+  .w-win.narrow { max-width: 820px; grid-template-columns: 54px 1fr 236px; }
+
+  .plate { background: var(--card); border: 1px solid var(--seam); border-radius: 8px; min-height: 0; overflow: hidden; }
+  .plate-head {
+    display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px;
+    background: var(--head); border-bottom: 1px solid var(--seam);
+    color: #7a7d86; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; white-space: nowrap;
+  }
+
+  /* рейка контекстов слева: Tabs как рабочие места */
+  .w-rail { display: grid; grid-template-rows: 30px 1fr auto; }
+  .w-rail-body { overflow: auto; padding: 6px; }
+  .w-railgrp { padding: 8px 6px 4px; color: #63666e; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; }
+  .w-ctx {
+    position: relative; display: block; width: 100%; text-align: left;
+    padding: 6px 8px 6px 11px; border-radius: 6px; margin-bottom: 3px;
+    border: 1px solid transparent;
+  }
+  .w-ctx .nm { font-size: 12.5px; color: #c3c6cd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+  .w-ctx .pt { font-size: 10px; color: #5d606a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+  .w-ctx:hover { background: #1e1f25; }
+  .w-ctx.on { background: var(--fill); border-color: #4a4f74; }
+  .w-ctx.on .nm { color: #fff; font-weight: 600; }
+  .w-ctx.on .pt { color: #a3a8cc; }
+  .w-ctx .bar { position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: transparent; }
+  .w-ctx.pin .bar { background: var(--accent); }
+  .w-ctx.on .bar { background: #fff; }
+  .w-ctx .x { position: absolute; right: 5px; top: 5px; width: 15px; height: 15px; border-radius: 4px; color: #64676f; font-size: 12px; line-height: 13px; }
+  .w-ctx .x:hover { background: #4c4f58; color: #fff; }
+  .w-rail-foot { border-top: 1px solid var(--seam); padding: 6px; }
+  .w-newctx { width: 100%; padding: 5px 8px; border: 1px dashed var(--seam2); border-radius: 6px; color: #8b8e97; font-size: 11.5px; }
+  .w-newctx:hover { border-color: var(--accent); color: #c2c8fb; }
+  .w-win.narrow .w-ctx .pt, .w-win.narrow .w-railgrp, .w-win.narrow .w-newctx span,
+  .w-win.narrow .w-rail .plate-head span { display: none; }
+  .w-win.narrow .w-ctx { padding: 6px 4px 6px 8px; text-align: center; }
+  .w-win.narrow .w-ctx .x { display: none; }
+
+  /* центральная плита: заголовок Location, список, статус */
+  .w-main { display: grid; grid-template-rows: 44px 1fr 26px; position: relative; }
+  .w-head {
+    display: flex; align-items: center; gap: 8px; padding: 0 10px;
+    background: var(--head); border-bottom: 1px solid var(--seam);
+  }
+  .w-crumbs { display: flex; align-items: center; gap: 3px; min-width: 0; overflow: hidden; }
+  .w-crumb { padding: 3px 7px; border-radius: 5px; font-size: 12.5px; color: #a2a5ae; white-space: nowrap; }
+  .w-crumb:hover { background: #2b2d34; color: #fff; }
+  .w-crumb.last { color: #fff; font-weight: 600; background: #262832; }
+  .w-sep { color: #4d505a; font-size: 11px; }
+  .w-count { color: #62656d; font-size: 11px; white-space: nowrap; }
+  .w-navback { display: flex; gap: 2px; }
+  .w-navback button { width: 22px; height: 22px; border-radius: 5px; color: #9a9da6; font-size: 13px; }
+  .w-navback button:hover:not(:disabled) { background: #2f3138; color: #fff; }
+  .w-navback button:disabled { color: #494c54; }
+
+  /* компактный Navigation Input, который раскрывается на всю плиту */
+  .w-find { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; width: 206px; transition: none; }
+  .w-main.open .w-find { flex: 1; width: auto; }
+  .w-main.open .w-crumbs, .w-main.open .w-count { display: none; }
+  .w-findbox { position: relative; display: flex; align-items: center; width: 100%; }
+  .w-findbox .lead { position: absolute; left: 8px; color: var(--low); font-size: 12px; pointer-events: none; }
+  #find {
+    width: 100%; height: 26px; padding: 0 66px 0 26px;
+    background: #0d0e11; border: 1px solid var(--seam2); border-radius: 6px; outline: none; font-size: 12.5px;
+  }
+  #find::placeholder { color: #55585f; }
+  #find.kept { border-style: dashed; color: var(--mid); }
+  .w-main.open #find { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(124,139,240,.2); }
+  .w-findtag { position: absolute; right: 7px; display: flex; gap: 3px; pointer-events: none; }
+  .w-findtag .key { font-size: 9.5px; }
+
+  .w-list { overflow: auto; outline: none; position: relative; }
+  .w-grp {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 12px 4px; background: #121317;
+    border-bottom: 1px solid #202228;
+    color: #6d7079; font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase;
+  }
+  .w-grp .n { letter-spacing: 0; text-transform: none; color: #4f525a; font-size: 10.5px; }
+  .w-row {
+    position: relative; display: grid; grid-template-columns: 16px minmax(0,1fr) auto auto;
+    align-items: center; gap: 10px;
+    height: 28px; padding: 0 12px 0 12px; font-size: 12.5px; color: #c1c4cb;
+    white-space: nowrap; user-select: none;
+  }
+  .w-row .bar { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: transparent; }
+  .w-row .g { text-align: center; font-size: 11px; color: #767a84; }
+  .w-row.dir .g { color: #8d94ea; }
+  .w-row .nm { overflow: hidden; text-overflow: ellipsis; }
+  .w-row .k { color: var(--low); font-size: 11px; }
+  .w-row .s { color: var(--low); font-size: 11px; min-width: 62px; text-align: right; }
+  .w-row:hover:not(.foc):not(.sel) { background: #1b1c21; }
+  .w-row.sel { background: #1f2230; color: #dfe1e8; box-shadow: inset 0 0 0 1px #313653; }
+  .w-row.foc { background: var(--fill); color: #fff; }
+  .w-row.foc .bar { background: var(--accent); }
+  .w-row.foc .k, .w-row.foc .s { color: #b3b8dc; }
+  .w-row.foc .g { color: #fff; }
+  .w-row.gone { color: #6a6d75; }
+  .w-row.gone .nm::after { content: ' недоступен'; color: var(--amber); font-size: 10px; }
+  .w-empty { padding: 32px 14px; color: var(--mid); }
+  .w-status {
+    display: flex; align-items: center; gap: 10px; padding: 0 10px;
+    background: var(--head); border-top: 1px solid var(--seam);
+    color: #6d7079; font-size: 10.5px; white-space: nowrap; overflow: hidden;
+  }
+  .w-status .tag { padding: 0 6px; border: 1px solid var(--seam2); border-radius: 3px; color: #9da0a9; }
+  .w-status .tag.hot { border-color: #4a4f8c; color: #adb3f0; }
+  .w-status .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Search Results: врезка внутри плиты Location, рамка плиты видна вокруг */
+  .w-results {
+    position: absolute; z-index: 25; left: 8px; right: 8px; top: 52px;
+    max-height: calc(100% - 88px); display: none; flex-direction: column;
+    background: #1b1c22; border: 1px solid #4c505e; border-radius: 8px;
+    box-shadow: 0 20px 48px rgba(0,0,0,.62);
+  }
+  .w-main.open .w-results { display: flex; }
+  .w-rhead {
+    display: flex; align-items: center; gap: 10px; flex: none; padding: 6px 11px;
+    background: #24262d; border-bottom: 1px solid #33363d; border-radius: 8px 8px 0 0;
+    font-size: 10.5px; color: #7a7d86;
+  }
+  .w-rhead .lay { color: #adb3f0; }
+  .w-rhead .fix { color: var(--amber); }
+  .w-rbody { overflow: auto; min-height: 0; padding: 4px 0 6px; }
+  .w-rgrp { padding: 6px 11px 3px; color: #63666e; font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; }
+  .w-rrow {
+    position: relative; display: grid; grid-template-columns: 16px minmax(120px,1fr) minmax(0,1.5fr) auto;
+    align-items: center; gap: 10px; padding: 5px 11px; font-size: 12.5px; white-space: nowrap;
+  }
+  .w-rrow > span { overflow: hidden; text-overflow: ellipsis; }
+  .w-rrow .g { text-align: center; font-size: 11px; color: #8d94ea; }
+  .w-rrow .p { color: #62656d; font-size: 11px; }
+  .w-rrow .t { color: #62656d; font-size: 10.5px; }
+  .w-rrow:hover:not(.on) { background: #23252b; }
+  .w-rrow.on { background: #3b4184; color: #fff; }
+  .w-rrow.on .p { color: #c9cdf3; }
+  .w-rrow.on .t { color: #d3d7f8; }
+  .w-rrow.on .g { color: #fff; }
+  .w-rrow mark { background: transparent; color: #efc172; }
+  .w-rrow.on mark { color: #ffdf9d; }
+  .w-rfoot { display: flex; align-items: center; gap: 14px; flex: none; padding: 6px 11px; border-top: 1px solid #33363d; color: #63666e; font-size: 10.5px; border-radius: 0 0 8px 8px; }
+  .w-rnone { padding: 24px 12px; color: var(--mid); font-size: 12.5px; line-height: 1.5; }
+  .w-rload { display: flex; gap: 10px; align-items: center; padding: 6px 11px; }
+  .w-rload i { display: block; height: 8px; border-radius: 3px; background: #2b2d35; }
+
+  /* правая плита: Preview Panel с собственной шапкой и полкой действий */
+  .w-side { display: grid; grid-template-rows: 30px 1fr auto; position: relative; }
+  .w-side-body { overflow: auto; padding: 12px; min-height: 0; }
+  .w-side h2 { margin: 0 0 3px; font-size: 14px; font-weight: 600; word-break: break-word; }
+  .w-side .path { color: var(--low); font-size: 10.5px; word-break: break-all; margin-bottom: 11px; }
+  .w-vis { border: 1px solid var(--seam); border-radius: 6px; overflow: hidden; background: #0c0d10; margin-bottom: 11px; }
+  .w-vis svg { display: block; width: 100%; height: auto; }
+  .w-pre {
+    border: 1px solid var(--seam); border-radius: 6px; background: #0c0d10; padding: 9px; margin-bottom: 11px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px; line-height: 1.55;
+    color: #a5a8b2; white-space: pre-wrap; max-height: 220px; overflow: hidden;
+  }
+  .w-page { background: #dcdcd6; border-radius: 5px; padding: 11px; margin-bottom: 11px; }
+  .w-page b { display: block; height: 8px; width: 56%; background: #62625d; border-radius: 2px; margin-bottom: 8px; }
+  .w-page i { display: block; height: 4px; background: #a8a8a1; border-radius: 2px; margin-bottom: 6px; }
+  .w-slab { display: grid; place-items: center; height: 96px; border: 1px solid var(--seam); border-radius: 6px; background: #0c0d10; color: #55585f; font-size: 28px; margin-bottom: 11px; }
+  .w-flag { border: 1px solid #4d4331; background: #241f16; color: #d8ad6c; border-radius: 6px; padding: 8px 9px; font-size: 11.5px; margin-bottom: 11px; }
+  .w-fact { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 11px; }
+  .w-fact dt { color: var(--low); }
+  .w-fact dd { margin: 0; color: #b5b8c0; word-break: break-word; }
+  .w-shelf { border-top: 1px solid var(--seam); background: var(--head); padding: 6px; display: flex; gap: 6px; }
+  .w-shelf button { flex: 1; padding: 5px 6px; border: 1px solid var(--seam2); border-radius: 6px; color: #a2a5ae; font-size: 11px; }
+  .w-shelf button:hover, .w-shelf button.on { background: #2f323b; color: #fff; }
+
+  /* Action Menu живёт в колонке Preview Panel */
+  .w-menu {
+    position: absolute; z-index: 40; left: 6px; right: 6px; bottom: 44px;
+    background: #23252b; border: 1px solid #4c505e; border-radius: 8px;
+    box-shadow: 0 -12px 40px rgba(0,0,0,.55); padding: 4px; display: none; max-height: calc(100% - 60px); overflow: auto;
+  }
+  .w-menu.on { display: block; }
+  .w-menu .h { padding: 5px 8px 6px; border-bottom: 1px solid #32343b; margin-bottom: 4px; color: #7a7d86; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; }
+  .w-mi { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 5px 8px; border-radius: 6px; font-size: 12px; text-align: left; }
+  .w-mi .r { display: flex; align-items: center; gap: 5px; color: #6f727b; font-size: 10px; }
+  .w-mi .aa { border: 1px solid #3f424b; border-radius: 3px; padding: 0 4px; font-size: 9px; }
+  .w-mi.on { background: #3b4184; color: #fff; }
+  .w-mi.on .r { color: #ccd0f6; }
+  .w-mi.on .aa { border-color: #8d94ea; }
+
+  /* Quick Look накрывает список и предпросмотр, но рейка и заголовок Location остаются */
+  .w-ql {
+    position: absolute; z-index: 60; left: 204px; right: 8px; top: 8px; bottom: 8px;
+    background: rgba(9,10,12,.975); border: 1px solid #3a3d45; border-radius: 8px;
+    display: none; grid-template-rows: 34px 1fr 28px;
+  }
+  .w-win.narrow .w-ql { left: 70px; }
+  .w-ql.on { display: grid; }
+  .w-ql-h { display: flex; align-items: center; gap: 10px; padding: 0 12px; border-bottom: 1px solid #26282e; }
+  .w-ql-h .t { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .w-ql-h .c { color: var(--low); font-size: 10.5px; white-space: nowrap; }
+  .w-ql-b { overflow: auto; padding: 14px; display: grid; place-items: start center; }
+  .w-ql-doc { width: min(560px, 100%); }
+  .w-ql-doc .paper { background: #dcdcd6; border-radius: 4px; padding: 24px 28px; }
+  .w-ql-doc .paper b { display: block; height: 11px; width: 54%; background: #55554f; border-radius: 2px; margin-bottom: 13px; }
+  .w-ql-doc .paper i { display: block; height: 6px; background: #a3a39c; border-radius: 2px; margin-bottom: 8px; }
+  .w-ql-doc pre { background: #0c0d10; border: 1px solid #26282e; border-radius: 6px; padding: 14px; margin: 0; font-size: 11.5px; line-height: 1.6; color: #b1b4bd; white-space: pre-wrap; }
+  .w-ql-f { display: flex; align-items: center; gap: 14px; padding: 0 12px; border-top: 1px solid #26282e; color: #63666e; font-size: 10.5px; }
+
+  /* полка настроек After Action снизу центральной плиты */
+  .w-tray {
+    position: absolute; z-index: 30; left: 0; right: 0; bottom: 0;
+    background: #1d1f25; border-top: 1px solid #4c505e; display: none;
+    box-shadow: 0 -14px 34px rgba(0,0,0,.45);
+  }
+  .w-tray.on { display: block; }
+  .w-tray .th { display: flex; align-items: center; gap: 10px; padding: 7px 11px; border-bottom: 1px solid #2d2f36; color: #8b8e97; font-size: 11px; }
+  .w-tray .tg { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; padding: 6px 11px 10px; }
+  .w-tray .tr { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid #26282e; font-size: 12px; }
+  .w-seg { display: inline-flex; border: 1px solid #3f424b; border-radius: 5px; overflow: hidden; }
+  .w-seg button { padding: 2px 7px; font-size: 10px; color: #8b8e97; }
+  .w-seg button.on { background: #3d4152; color: #fff; }
+
+  .w-toast {
+    position: absolute; z-index: 70; left: 204px; bottom: 42px; max-width: calc(100% - 228px);
+    padding: 6px 11px; background: #292b32; border: 1px solid #4c505e; border-radius: 6px;
+    color: #d3d5dc; font-size: 11.5px; display: none;
+  }
+  .w-win.narrow .w-toast { left: 70px; max-width: calc(100% - 94px); }
+  .w-toast.on { display: block; }
+
+  /* ---------- пояснения вне приложения ---------- */
+  .grid2 { margin-top: 14px; display: grid; grid-template-columns: 1fr 1.05fr; gap: 14px; }
+  @media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+  .note { border: 1px solid #23252a; border-radius: 8px; background: #101115; padding: 12px 14px; }
+  .note h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: #8b8e97; }
+  .note p { margin: 0 0 8px; font-size: 12.5px; line-height: 1.55; color: #b3b6be; }
+  .note ol, .note ul { margin: 0 0 8px; padding-left: 18px; font-size: 12.5px; line-height: 1.55; color: #b3b6be; }
+  .note li { margin-bottom: 3px; }
+  .strip { display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge { border: 1px solid #2a2c32; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #9a9da6; background: #16171b; }
+  .badge b { color: #d6d8de; font-weight: 600; }
+  .badge.hot { border-color: #4a4f8c; color: #aeb4f2; }
+  .push { border: 1px solid #2e3037; border-radius: 5px; padding: 4px 10px; font-size: 11.5px; color: #b3b6be; background: #17181d; cursor: pointer; }
+  .push:hover { background: #272930; color: #fff; }
+  .push.on { border-color: var(--accent); color: #c3c9fb; }
+  table.kb { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.kb td { padding: 3px 0; border-top: 1px solid #1f2126; color: #b3b6be; vertical-align: top; }
+  table.kb td:first-child { width: 142px; color: #8b8e97; white-space: nowrap; }
+  .amb { color: var(--amber); }
+</style>
+</head>
+<body>
+<div class="sheetwrap">
+
+<div class="intro">
+  <h1>Visual Files - макет C: пространственный верстак</h1>
+  <p>Одноразовый интерактивный прототип. Три плиты: контексты, Location, Preview Panel.</p>
+</div>
+
+<div class="w-win" id="win">
+
+  <section class="plate w-rail">
+    <div class="plate-head"><span>Контексты</span></div>
+    <div class="w-rail-body" id="rail"></div>
+    <div class="w-rail-foot">
+      <button class="w-newctx" id="newctx">+ <span>Временный контекст</span></button>
+    </div>
+  </section>
+
+  <section class="plate w-main" id="main">
+    <div class="w-head">
+      <div class="w-navback">
+        <button id="back" title="Назад, Cmd+[">&#8249;</button>
+        <button id="fwd" title="Вперёд, Cmd+]">&#8250;</button>
+      </div>
+      <div class="w-crumbs" id="crumbs"></div>
+      <span class="w-count" id="count"></span>
+      <div class="w-find">
+        <div class="w-findbox">
+          <span class="lead">&#9906;</span>
+          <input id="find" spellcheck="false" autocomplete="off" placeholder="Путь или Search Query">
+          <span class="w-findtag"><span class="key">/</span><span class="key">&#8984;L</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="w-list" id="list" tabindex="-1"></div>
+
+    <div class="w-status">
+      <span class="tag" id="mode">Browse Mode</span>
+      <span class="grow" id="info"></span>
+    </div>
+
+    <div class="w-results" id="results"></div>
+    <div class="w-tray" id="tray"></div>
+  </section>
+
+  <section class="plate w-side" id="side">
+    <div class="plate-head"><span>Preview Panel</span><span id="pvfollow" style="margin-left:auto;letter-spacing:0;text-transform:none"></span></div>
+    <div class="w-side-body" id="pv"></div>
+    <div class="w-shelf">
+      <button id="qlbtn">Quick Look <span class="key">&#9251;</span></button>
+      <button id="actbtn">Действия <span class="key">&#8984;K</span></button>
+    </div>
+    <div class="w-menu" id="menu"></div>
+  </section>
+
+  <div class="w-ql" id="ql"></div>
+  <div class="w-toast" id="toast"></div>
+</div>
+
+<div class="grid2">
+  <div class="note">
+    <h3>Текущее логическое состояние</h3>
+    <div class="strip" id="readout"></div>
+    <p style="margin:11px 0 6px">Сценарии и состояния</p>
+    <div class="strip">
+      <button class="push" data-scn="agents">Запрос agents</button>
+      <button class="push" data-scn="фпутеы">Запрос фпутеы</button>
+      <button class="push" data-scn="work">Запрос work</button>
+      <button class="push" data-scn="цщкл">Запрос цщкл</button>
+      <button class="push" data-scn="~/Downloads">Путь ~/Downloads</button>
+      <button class="push" data-scn="реестр поставщиков">Пустой результат</button>
+      <button class="push" id="slow">Медленный поиск: выкл</button>
+      <button class="push" id="gone">К недоступному Item</button>
+      <button class="push" id="narrow">Узкое окно 820px</button>
+      <button class="push" id="reset">Сброс</button>
+    </div>
+    <h3 style="margin-top:14px">Противоречия в issue 07, разрешённые по своему усмотрению</h3>
+    <ul>
+      <li><span class="amb">Ctrl+J/K.</span> Сказано и что они работают в Search Results, и что не перехватываются при активном Navigation Input. Здесь работают.</li>
+      <li><span class="amb">Right Arrow в Search Mode.</span> Двигает курсор по тексту, Reveal делает только когда курсор в конце строки.</li>
+      <li><span class="amb">Space в Search Mode.</span> При активном поле пробел печатается, поэтому Quick Look открывается только из Browse Mode.</li>
+    </ul>
+  </div>
+
+  <div class="note">
+    <h3>Что тут за идея и что от тебя нужно</h3>
+    <p>Центральная идея C: приложение это верстак из трёх отдельных плит с видимыми швами. Слева рейка контекстов, где Tab это не корешок сверху, а рабочее место со своим именем и своей Location. По центру плита текущей Location с хлебными крошками, сгруппированным списком и своей строкой статуса. Справа плита Preview Panel со своей шапкой и полкой действий внизу.</p>
+    <p>Navigation Input здесь не адресная строка, а компактное поле в заголовке Location. При активации оно раздвигается на весь заголовок, а Search Results падают врезкой внутрь центральной плиты с отступом от её краёв. Рамка плиты Location видна вокруг врезки, и это буквальное доказательство, что Location не менялась.</p>
+    <p>Action Menu тоже привязан к месту: он раскрывается внутри колонки Preview Panel, прямо над полкой действий. Действия живут рядом с Item, который они меняют, а не в общей панели инструментов.</p>
+    <p>Обратная связь, которая мне нужна:</p>
+    <ol>
+      <li>Рейка контекстов на 188px: полезная опора или отъеденное место.</li>
+      <li>Помогают ли группы в списке (Папки и Файлы, а в Recents группировка по исходной Location) или дробят его.</li>
+      <li>Читаются ли хлебные крошки как навигация, по ним можно кликать.</li>
+      <li>Правильно ли, что Action Menu живёт в колонке предпросмотра, а не у списка.</li>
+      <li>Не теряется ли Navigation Input в заголовке, когда он компактный.</li>
+    </ol>
+    <p>Это не заявка на лучший вариант, а один из трёх разборов одного и того же контракта.</p>
+    <h3 style="margin-top:12px">Клавиатура, которая реально работает</h3>
+    <table class="kb">
+      <tr><td>Up / Down</td><td>Focused Item в списке или во врезке Search Results</td></tr>
+      <tr><td>Ctrl+J / Ctrl+K</td><td>то же вниз и вверх</td></tr>
+      <tr><td>Shift+Up / Down</td><td>диапазон Selected Items в Browse Mode</td></tr>
+      <tr><td>Left / Right</td><td>Browse: история назад и primary action. Search: курсор в тексте, Reveal при курсоре в конце</td></tr>
+      <tr><td>Enter</td><td>Browse: primary action только для Focused Item. Search: Reveal</td></tr>
+      <tr><td>Space</td><td>Quick Look, внутри него Up и Down ходят только по файлам</td></tr>
+      <tr><td>Escape</td><td>Quick Look, Action Menu, полка After Action, Search Results, Selected Items, окно</td></tr>
+      <tr><td>Cmd+K</td><td>Action Menu в колонке Preview Panel</td></tr>
+      <tr><td>Cmd+L и клавиша /</td><td>раскрыть Navigation Input и выделить сохранённый запрос</td></tr>
+      <tr><td>Cmd+[ / Cmd+]</td><td>история контекста назад и вперёд</td></tr>
+      <tr><td>Cmd+T, Cmd+Delete</td><td>новый временный контекст, в корзину</td></tr>
+      <tr><td>Мышь</td><td>клик выделяет, двойной клик primary action, правый клик Action Menu, Shift+клик диапазон, Cmd+клик добавление</td></tr>
+    </table>
+  </div>
+</div>
+</div>
+
+<script>
+"use strict";
+
+/* ============== данные ============== */
+const mk = (n, k, s, m, x) => Object.assign({ n, k, s, m, d:false }, x || {});
+const mkd = (n, m, to, x) => Object.assign({ n, k:'Папка', s:'', m, d:true, to }, x || {});
+
+const BODY = {
+  agents: "# AGENTS.md\n\n## Стек\nBun, TypeScript, React. Перед коммитом гонять `bun test`.\n\n## Каталоги\n- `src/` исходники\n- `docs/adr/` решения\n- `.scratch/` черновики\n\n## Правила\nНовых зависимостей без обсуждения не добавлять.\n",
+  context: "# Visual Files\n\nЛичный контекст для работы с файлами без Finder.\n\n**Tab**: независимая сессия просмотра со своей Location.\n**Location**: директория, которую сейчас смотрит Tab.\n**Recents**: коллекция недавних Items, не директория.\n",
+  notes: "созвон по Удокану перенесли на четверг\nсчёт 4471 оплачен, акт ждём\nпутевые за июль сверить с реестром техники\n",
+  budget: "статья;план;факт\nаренда;480000;471200\nтопливо;1240000;1301400\nвахта;3100000;2980000\n",
+  net: "# Сеть\n\nVPN офиса поднимается через `wg-quick up office`.\nМаршрут до 10.20.0.0/16 идёт мимо туннеля.\n"
+};
+
+const SPACE = {
+  recents: { title:'Recents', path:'Recents', coll:true, items:[
+    mk('Миграционка.pdf','PDF','1,8 МБ','22 авг 2026, 13:42',{from:'~/Downloads', pv:'pdf'}),
+    mk('IMG_7209.HEIC','HEIC','2,4 МБ','22 авг 2026, 11:07',{from:'~/Downloads', pv:'photo'}),
+    mk('Снимок экрана 2026-08-22.png','PNG','780 КБ','22 авг 2026, 9:14',{from:'~/Downloads', pv:'shot'}),
+    mk('счёт-4471.pdf','PDF','96 КБ','21 авг 2026, 12:31',{from:'~/Downloads', pv:'pdf'}),
+    mk('AGENTS.md','Markdown','34,1 КБ','22 авг 2026, 10:02',{from:'~/work', pv:'text', text:BODY.agents}),
+    mk('схема-интеграции.png','PNG','1,1 МБ','21 авг 2026, 17:05',{from:'~/work', pv:'diagram'}),
+    mk('отчёт-2026-08.pdf','PDF','640 КБ','21 авг 2026, 16:20',{from:'~/work', pv:'pdf'}),
+    mkd('ГМК Удокан','22 авг 2026, 8:59','~/work/ГМК Удокан',{from:'~/work'}),
+    mkd('Платформа','22 авг 2026, 8:56','~/work/Платформа',{from:'~/work'}),
+    mkd('Автомобили','22 авг 2026, 8:08','~/work/Автомобили',{from:'~/work'}),
+    mkd('Путевые листы','22 авг 2026, 8:08','~/work/Путевые листы',{from:'~/work'}),
+    mk('Смета_2026.xlsx','Таблица','412 КБ','21 авг 2026, 19:40',{from:'~/icloud'}),
+    mk('Отпуск.mov','Видео','-','20 авг 2026, 22:10',{from:'~/icloud', gone:'Файл в iCloud Drive и не загружен на этот Mac'}),
+    mkd('work','22 авг 2026, 10:02','~/work',{from:'~'}),
+    mkd('Downloads','22 авг 2026, 11:13','~/Downloads',{from:'~'}),
+    mkd('iCloud Drive','20 авг 2026, 22:10','~/icloud',{from:'~'}),
+    mk('CONTEXT.md','Markdown','8,2 КБ','21 авг 2026, 15:58',{from:'~/lab/raycast-visual-files', pv:'text', text:BODY.context}),
+    mkd('agent-skills','21 авг 2026, 11:02','~/lab/agent-skills',{from:'~/lab'})
+  ]},
+  '~': { title:'kiri110k', path:'/Users/kiri110k', items:[
+    mkd('Applications','21 авг 2026, 19:19','~/Applications'),
+    mkd('Desktop','22 авг 2026, 9:14','~/Desktop'),
+    mkd('Documents','19 авг 2026, 14:02','~/Documents'),
+    mkd('Downloads','22 авг 2026, 11:13','~/Downloads'),
+    mkd('iCloud Drive','20 авг 2026, 22:10','~/icloud'),
+    mkd('lab','22 авг 2026, 13:40','~/lab'),
+    mkd('work','22 авг 2026, 10:02','~/work'),
+    mk('NETWORK-SETUP.md','Markdown','6,4 КБ','18 авг 2026, 20:11',{pv:'text', text:BODY.net})
+  ]},
+  '~/work': { title:'work', path:'/Users/kiri110k/work', items:[
+    mkd('Автомобили','22 авг 2026, 8:08','~/work/Автомобили'),
+    mkd('Архив 2025','14 янв 2026, 10:40','~/work/Архив 2025'),
+    mkd('ГМК Удокан','22 авг 2026, 8:59','~/work/ГМК Удокан'),
+    mkd('Платформа','22 авг 2026, 8:56','~/work/Платформа'),
+    mkd('Путевые листы','22 авг 2026, 8:08','~/work/Путевые листы'),
+    mk('AGENTS.md','Markdown','34,1 КБ','22 авг 2026, 10:02',{pv:'text', text:BODY.agents}),
+    mk('budget.csv','CSV','24 КБ','21 авг 2026, 18:44',{pv:'text', text:BODY.budget}),
+    mk('notes.md','Markdown','2,1 КБ','22 авг 2026, 9:51',{pv:'text', text:BODY.notes}),
+    mk('отчёт-2026-08.pdf','PDF','640 КБ','21 авг 2026, 16:20',{pv:'pdf'}),
+    mk('схема-интеграции.png','PNG','1,1 МБ','21 авг 2026, 17:05',{pv:'diagram'}),
+    mk('.env.local','Конфиг','0,4 КБ','12 авг 2026, 11:00',{})
+  ]},
+  '~/Downloads': { title:'Downloads', path:'/Users/kiri110k/Downloads', items:[
+    mk('IMG_7209.HEIC','HEIC','2,4 МБ','22 авг 2026, 11:07',{pv:'photo'}),
+    mk('Миграционка.pdf','PDF','1,8 МБ','22 авг 2026, 13:42',{pv:'pdf'}),
+    mk('Снимок экрана 2026-08-22.png','PNG','780 КБ','22 авг 2026, 9:14',{pv:'shot'}),
+    mk('договор.docx','Документ','88 КБ','21 авг 2026, 14:03',{}),
+    mk('счёт-4471.pdf','PDF','96 КБ','21 авг 2026, 12:31',{pv:'pdf'}),
+    mk('setup-1.2.4.dmg','Образ','142 МБ','19 авг 2026, 9:40',{}),
+    mk('tauri-bench.zip','Архив','9,6 МБ','21 авг 2026, 16:52',{})
+  ]},
+  '~/icloud': { title:'iCloud Drive', path:'~/Library/Mobile Documents/com~apple~CloudDocs', items:[
+    mkd('Документы','20 авг 2026, 21:00','~/icloud/Документы'),
+    mkd('Презентации','15 авг 2026, 13:22','~/icloud/Презентации'),
+    mk('Заметки.md','Markdown','12 КБ','20 авг 2026, 21:05',{pv:'text', text:"# Заметки\n\n- переоформить пропуск\n- забрать доверенность\n"}),
+    mk('Смета_2026.xlsx','Таблица','412 КБ','21 авг 2026, 19:40',{}),
+    mk('Отпуск.mov','Видео','-','20 авг 2026, 22:10',{gone:'Файл в iCloud Drive и не загружен на этот Mac'})
+  ]},
+  '~/lab': { title:'lab', path:'/Users/kiri110k/lab', items:[
+    mkd('agent-skills','21 авг 2026, 11:02','~/lab/agent-skills'),
+    mkd('raycast-visual-files','22 авг 2026, 13:40','~/lab/raycast-visual-files'),
+    mk('README.md','Markdown','1,9 КБ','10 авг 2026, 12:00',{pv:'text', text:"# lab\n\nПесочница. Ничего важного тут не хранить.\n"})
+  ]},
+  '~/lab/agent-skills': { title:'agent-skills', path:'/Users/kiri110k/lab/agent-skills', items:[
+    mkd('skills','21 авг 2026, 11:02','~/lab/agent-skills/skills'),
+    mk('AGENTS.md','Markdown','5,2 КБ','21 авг 2026, 11:02',{pv:'text', text:"# AGENTS.md\n\nОбщие правила для агентов на всех машинах.\n"}),
+    mk('MODELS.md','Markdown','7,8 КБ','21 авг 2026, 10:58',{pv:'text', text:"# MODELS.md\n\nКанонический рубрикатор моделей.\n"}),
+    mk('workflow-notes.md','Markdown','3,3 КБ','20 авг 2026, 18:30',{pv:'text', text:"# workflow-notes\n\nЧто держать в голове про воркфлоу.\n"})
+  ]},
+  '~/lab/agent-skills/skills': { title:'skills', path:'/Users/kiri110k/lab/agent-skills/skills', items:[
+    mk('handoff.md','Markdown','4,4 КБ','21 авг 2026, 11:02',{pv:'text', text:"# handoff\n\nКак передавать состояние между сессиями.\n"})
+  ]},
+  '~/lab/raycast-visual-files': { title:'raycast-visual-files', path:'/Users/kiri110k/lab/raycast-visual-files', items:[
+    mkd('demos','21 авг 2026, 16:55','~/lab/raycast-visual-files/demos'),
+    mkd('docs','20 авг 2026, 11:12','~/lab/raycast-visual-files/docs'),
+    mkd('.claude','22 авг 2026, 12:00','~/lab/raycast-visual-files/.claude'),
+    mk('CONTEXT.md','Markdown','8,2 КБ','21 авг 2026, 15:58',{pv:'text', text:BODY.context}),
+    mk('Workspace.code-workspace','Конфиг','0,8 КБ','20 авг 2026, 10:04',{})
+  ]},
+  '~/lab/raycast-visual-files/demos': { title:'demos', path:'/Users/kiri110k/lab/raycast-visual-files/demos', items:[
+    mk('GUI-VERIFICATION.md','Markdown','5,8 КБ','21 авг 2026, 17:10',{pv:'text', text:"# Sequential GUI verification\n\nTauri, Electron, AppKit прогнаны по одной процедуре.\n"})
+  ]},
+  '~/lab/raycast-visual-files/docs': { title:'docs', path:'/Users/kiri110k/lab/raycast-visual-files/docs', items:[
+    mk('adr-0001.md','Markdown','3,1 КБ','20 авг 2026, 11:12',{pv:'text', text:"# ADR 0001\n\nХост приложения: Tauri.\n"})
+  ]},
+  '~/lab/raycast-visual-files/.claude': { title:'.claude', path:'/Users/kiri110k/lab/raycast-visual-files/.claude', items:[
+    mkd('agents','22 авг 2026, 12:00','~/lab/raycast-visual-files/.claude/agents'),
+    mk('settings.json','Конфиг','1,2 КБ','22 авг 2026, 12:00',{})
+  ]},
+  '~/lab/raycast-visual-files/.claude/agents': { title:'agents', path:'/Users/kiri110k/lab/raycast-visual-files/.claude/agents', items:[
+    mk('reviewer.md','Markdown','2,4 КБ','22 авг 2026, 12:00',{pv:'text', text:"---\nname: reviewer\n---\n\nЧитает диф и ищет ошибки.\n"}),
+    mk('explorer.md','Markdown','1,7 КБ','22 авг 2026, 12:00',{pv:'text', text:"---\nname: explorer\n---\n\nТолько чтение.\n"})
+  ]},
+  '~/work/ГМК Удокан': { title:'ГМК Удокан', path:'/Users/kiri110k/work/ГМК Удокан', items:[
+    mkd('Фото объекта','20 авг 2026, 19:12','~/work/ГМК Удокан/Фото объекта'),
+    mk('Договор №44-ГМК.pdf','PDF','2,2 МБ','22 авг 2026, 8:59',{pv:'pdf'}),
+    mk('Реестр техники.xlsx','Таблица','188 КБ','22 авг 2026, 8:40',{}),
+    mk('Протокол совещания.docx','Документ','54 КБ','19 авг 2026, 16:00',{})
+  ]},
+  '~/work/ГМК Удокан/Фото объекта': { title:'Фото объекта', path:'/Users/kiri110k/work/ГМК Удокан/Фото объекта', items:[
+    mk('IMG_6943.HEIC','HEIC','3,1 МБ','20 авг 2026, 19:12',{pv:'photo'}),
+    mk('IMG_6944.HEIC','HEIC','2,8 МБ','20 авг 2026, 19:12',{pv:'photo'})
+  ]},
+  '~/work/Платформа': { title:'Платформа', path:'/Users/kiri110k/work/Платформа', items:[
+    mk('roadmap.md','Markdown','9,1 КБ','22 авг 2026, 8:56',{pv:'text', text:"# roadmap\n\nQ3: интеграция с 1С\nQ4: мобильный клиент\n"}),
+    mk('архитектура.png','PNG','1,4 МБ','21 авг 2026, 17:40',{pv:'diagram'}),
+    mk('смета.xlsx','Таблица','96 КБ','20 авг 2026, 12:10',{})
+  ]},
+  '~/work/Автомобили': { title:'Автомобили', path:'/Users/kiri110k/work/Автомобили', items:[
+    mk('КамАЗ-6520 паспорт.pdf','PDF','1,2 МБ','22 авг 2026, 8:08',{pv:'pdf'}),
+    mk('страховки.xlsx','Таблица','44 КБ','15 авг 2026, 10:22',{})
+  ]},
+  '~/work/Путевые листы': { title:'Путевые листы', path:'/Users/kiri110k/work/Путевые листы', items:[
+    mk('июль-2026.pdf','PDF','3,4 МБ','1 авг 2026, 9:00',{pv:'pdf'}),
+    mk('август-2026.pdf','PDF','2,9 МБ','22 авг 2026, 8:08',{pv:'pdf'})
+  ]},
+  '~/work/Архив 2025': { title:'Архив 2025', path:'/Users/kiri110k/work/Архив 2025', items:[
+    mk('отчёт-2025-12.pdf','PDF','710 КБ','14 янв 2026, 10:40',{pv:'pdf'}),
+    mk('реестр-2025.xlsx','Таблица','320 КБ','14 янв 2026, 10:38',{})
+  ]},
+  '~/icloud/Документы': { title:'Документы', path:'~/Library/Mobile Documents/com~apple~CloudDocs/Документы', items:[
+    mk('Паспорт скан.pdf','PDF','1,1 МБ','12 авг 2026, 8:00',{pv:'pdf'}),
+    mk('Доверенность.pdf','PDF','340 КБ','20 авг 2026, 21:00',{pv:'pdf'})
+  ]},
+  '~/icloud/Презентации': { title:'Презентации', path:'~/Library/Mobile Documents/com~apple~CloudDocs/Презентации', items:[
+    mk('Удокан-2026.key','Презентация','24 МБ','15 авг 2026, 13:22',{})
+  ]},
+  '~/Desktop': { title:'Desktop', path:'/Users/kiri110k/Desktop', items:[
+    mk('Снимок экрана 2026-08-22 в 9.14.png','PNG','780 КБ','22 авг 2026, 9:14',{pv:'shot'})
+  ]},
+  '~/Documents': { title:'Documents', path:'/Users/kiri110k/Documents', items:[
+    mkd('Сканы','19 авг 2026, 14:02','~/Documents/Сканы'),
+    mk('резюме.pdf','PDF','210 КБ','2 июл 2026, 15:00',{pv:'pdf'})
+  ]},
+  '~/Documents/Сканы': { title:'Сканы', path:'/Users/kiri110k/Documents/Сканы', items:[
+    mk('скан-01.pdf','PDF','420 КБ','19 авг 2026, 14:02',{pv:'pdf'})
+  ]},
+  '~/Applications': { title:'Applications', path:'/Applications', items:[
+    mkd('Visual Files Tauri Benchmark.app','21 авг 2026, 16:31','~/Applications'),
+    mkd('Visual Files Native.app','21 авг 2026, 16:33','~/Applications')
+  ]}
+};
+
+/* родители для хлебных крошек */
+const PARENT = {};
+for (const id in SPACE) {
+  if (SPACE[id].coll) continue;
+  SPACE[id].items.forEach(it => { if (it.d && it.to && SPACE[it.to] && !PARENT[it.to]) PARENT[it.to] = id; });
+}
+
+const NEAR = ['~/work','~/Downloads','~','~/icloud'];
+const BOOK = [];
+for (const id in SPACE) {
+  if (SPACE[id].coll) continue;
+  SPACE[id].items.forEach(it => BOOK.push({ n: it.n, d: it.d, to: it.to, parent: id, it, path: SPACE[id].path + '/' + it.n }));
+}
+const RECENT = new Set(SPACE.recents.items.map(i => i.n));
+
+const RUK = "йцукенгшщзхъфывапролджэячсмитьбю.ё", ENK = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`";
+function swapLayout(s) {
+  let o = '', touched = false;
+  for (const c of s) { const i = RUK.indexOf(c.toLowerCase()); if (i >= 0) { o += ENK[i]; touched = true; } else o += c; }
+  return touched ? o : null;
+}
+
+/* ============== состояние ============== */
+let ctxSeq = 3;
+const W = {
+  ctx: [
+    { id:1, name:'Проект Удокан', pin:true, at:'~/work/ГМК Удокан', hist:['~/work/ГМК Удокан'], hp:0, foc:1, sel:new Set([1]), anc:1, query:'', top:0 },
+    { id:2, name:'Рабочий каталог', pin:true, at:'~/work', hist:['~/work'], hp:0, foc:0, sel:new Set([0]), anc:0, query:'', top:0 },
+    { id:3, name:'Recents', pin:false, at:'recents', hist:['recents'], hp:0, foc:0, sel:new Set([0]), anc:0, query:'', top:0 }
+  ],
+  cur: 1,
+  open: false, res: [], rf: 0, meta: null, busy: false, slow: false,
+  keep: null,
+  menu: null, mi: 0,
+  ql: null, qi: 0,
+  tray: false,
+  after: {
+    'Открыть файл':'Hide Window', 'Открыть в терминале или IDE':'Hide Window',
+    'Копировать путь':'Hide Window', 'Копировать файл':'Hide Window',
+    'В корзину':'Keep Open', 'Quick Look':'Keep Open',
+    'Войти в Location':'Keep Open', 'Навигация':'Keep Open'
+  }
+};
+
+const g = id => document.getElementById(id);
+const win = g('win'), find = g('find'), listEl = g('list'), mainEl = g('main');
+const C = () => W.ctx.find(c => c.id === W.cur);
+const L = () => SPACE[C().at];
+const editing = () => document.activeElement === find;
+const E = s => String(s).replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c]));
+function light(text, term) {
+  if (!term) return E(text);
+  const i = text.toLowerCase().indexOf(term.toLowerCase());
+  return i < 0 ? E(text) : E(text.slice(0, i)) + '<mark>' + E(text.slice(i, i + term.length)) + '</mark>' + E(text.slice(i + term.length));
+}
+
+/* список группируется: в Location по виду, в Recents по исходной Location */
+function grouped() {
+  const p = L();
+  if (p.coll) {
+    const order = [], by = new Map();
+    p.items.forEach(it => {
+      const key = it.from && SPACE[it.from] ? SPACE[it.from].title : 'Прочее';
+      if (!by.has(key)) { by.set(key, []); order.push(key); }
+      by.get(key).push(it);
+    });
+    return order.map(k => ({ label: k, items: by.get(k) }));
+  }
+  const dirs = p.items.filter(i => i.d), files = p.items.filter(i => !i.d);
+  const out = [];
+  if (dirs.length) out.push({ label: 'Папки', items: dirs });
+  if (files.length) out.push({ label: 'Файлы', items: files });
+  return out;
+}
+function flat() { return grouped().reduce((a, gr) => a.concat(gr.items), []); }
+
+/* ============== отрисовка ============== */
+function draw() {
+  drawRail(); drawHead(); drawList(); drawResults(); drawPreview();
+  drawStatus(); drawMenu(); drawQL(); drawTray(); drawReadout();
+  mainEl.classList.toggle('open', W.open);
+  g('back').disabled = C().hp <= 0;
+  g('fwd').disabled = C().hp >= C().hist.length - 1;
+  find.classList.toggle('kept', !editing() && !!C().query);
+  g('pvfollow').textContent = W.open ? 'следует за Search Results' : 'следует за Browse';
+}
+
+function drawRail() {
+  const box = g('rail');
+  let h = '';
+  const put = (title, list) => {
+    if (!list.length) return;
+    h += '<div class="w-railgrp">' + title + '</div>';
+    list.forEach(c => {
+      h += '<button class="w-ctx' + (c.pin ? ' pin' : '') + (c.id === W.cur ? ' on' : '') + '" data-id="' + c.id + '">' +
+        '<span class="bar"></span><span class="nm">' + E(c.name) + '</span>' +
+        '<span class="pt">' + E(SPACE[c.at].coll ? 'Recents' : SPACE[c.at].path.replace('/Users/kiri110k', '~')) + '</span>' +
+        (c.pin ? '' : '<span class="x" data-close="' + c.id + '">×</span>') + '</button>';
+    });
+  };
+  put('Закреплённые', W.ctx.filter(c => c.pin));
+  put('Временные', W.ctx.filter(c => !c.pin));
+  box.innerHTML = h;
+  box.querySelectorAll('.w-ctx').forEach(b => {
+    b.onmousedown = e => {
+      if (e.target.dataset.close) { e.stopPropagation(); dropCtx(+e.target.dataset.close); return; }
+      pickCtx(+b.dataset.id);
+    };
+  });
+}
+
+function drawHead() {
+  const p = L(), box = g('crumbs');
+  const chain = [];
+  let id = C().at;
+  while (id && SPACE[id]) { chain.unshift(id); id = PARENT[id]; }
+  let h = '';
+  chain.forEach((cid, i) => {
+    if (i) h += '<span class="w-sep">›</span>';
+    h += '<button class="w-crumb' + (i === chain.length - 1 ? ' last' : '') + '" data-go="' + E(cid) + '">' + E(SPACE[cid].title) + '</button>';
+  });
+  box.innerHTML = h;
+  box.querySelectorAll('.w-crumb').forEach(b => {
+    b.onclick = () => { if (b.dataset.go !== C().at) { hop(b.dataset.go, null); draw(); } };
+  });
+  const t = C();
+  g('count').textContent = p.items.length + ' Items' + (t.sel.size > 1 ? ', выделено ' + t.sel.size : '');
+}
+
+function drawList() {
+  const t = C(), groups = grouped();
+  let h = '', idx = 0;
+  if (!groups.length) h = '<div class="w-empty">Location пуста</div>';
+  groups.forEach(gr => {
+    h += '<div class="w-grp"><span>' + E(gr.label) + '</span><span class="n">' + gr.items.length + '</span></div>';
+    gr.items.forEach(it => {
+      const i = idx++;
+      h += '<div class="w-row ' + (it.d ? 'dir' : 'file') + (t.sel.has(i) ? ' sel' : '') +
+        (t.foc === i ? ' foc' : '') + (it.gone ? ' gone' : '') + '" data-i="' + i + '">' +
+        '<span class="bar"></span><span class="g">' + (it.d ? '▸' : it.gone ? '○' : '•') + '</span>' +
+        '<span class="nm">' + E(it.n) + '</span>' +
+        '<span class="k">' + E(it.gone ? '' : (it.d ? '' : it.k)) + '</span>' +
+        '<span class="s">' + E(it.d ? it.m.split(',')[0] : (it.s || it.m.split(',')[0])) + '</span></div>';
+    });
+  });
+  listEl.innerHTML = h;
+  listEl.querySelectorAll('.w-row').forEach(node => {
+    const i = +node.dataset.i;
+    node.onmousedown = e => { if (e.button === 2) return; e.preventDefault(); pick(i, e); };
+    node.ondblclick = () => { C().foc = i; act(); };
+    node.oncontextmenu = e => {
+      e.preventDefault();
+      const c = C();
+      if (!c.sel.has(i)) { c.foc = i; c.sel = new Set([i]); c.anc = i; draw(); }
+      popMenu();
+    };
+  });
+  listEl.scrollTop = t.top;
+}
+
+function drawResults() {
+  const box = g('results');
+  if (!W.open) { box.innerHTML = ''; return; }
+  const m = W.meta || {};
+  let h = '<div class="w-rhead"><span class="lay">Search Results, отдельный слой поверх Location ' + E(L().title) + '</span>';
+  if (m.fixed) h += '<span class="fix">раскладка: ' + E(m.raw) + ' → ' + E(m.term) + '</span>';
+  h += '<span style="margin-left:auto">' + (W.busy ? 'Spotlight ищет' : W.res.length + ' совпадений') + '</span></div><div class="w-rbody">';
+
+  if (W.busy && !W.res.length) {
+    for (let i = 0; i < 4; i++) h += '<div class="w-rload"><i style="width:16px"></i><i style="width:' + (120 + i * 34) + 'px"></i><i style="width:' + (170 - i * 22) + 'px;opacity:.6"></i></div>';
+  } else if (!W.res.length) {
+    h += '<div class="w-rnone">По запросу "' + E(m.raw || '') + '" ничего не нашлось.<br>' +
+      'Location осталась прежней, её рамка видна вокруг этой врезки. Escape закроет слой, вернёт прежний Focused Item и оставит запрос в поле неактивным.</div>';
+  } else {
+    let cur = null;
+    W.res.forEach((r, i) => {
+      if (r.src !== cur) { cur = r.src; h += '<div class="w-rgrp">' + E(cur) + '</div>'; }
+      h += '<div class="w-rrow' + (i === W.rf ? ' on' : '') + '" data-i="' + i + '">' +
+        '<span class="g">' + (r.d ? '▸' : '•') + '</span>' +
+        '<span class="nm">' + light(r.n, m.term) + '</span>' +
+        '<span class="p">' + light(r.path, m.term) + '</span>' +
+        '<span class="t">' + E(r.d ? 'Location' : r.kind) + '</span></div>';
+    });
+    if (W.busy) h += '<div class="w-rload"><i style="width:16px"></i><i style="width:190px"></i></div>';
+  }
+  h += '</div><div class="w-rfoot"><span>Enter или клик - Reveal</span><span>Right в конце строки - Reveal</span>' +
+    '<span>Escape - закрыть слой</span><span style="margin-left:auto">Preview Panel справа следует за фокусом результата</span></div>';
+  box.innerHTML = h;
+  box.querySelectorAll('.w-rrow').forEach(n => {
+    n.onmousedown = e => { e.preventDefault(); W.rf = +n.dataset.i; reveal(); };
+    n.onmouseenter = () => { W.rf = +n.dataset.i; drawResults(); drawPreview(); };
+  });
+  const on = box.querySelector('.w-rrow.on');
+  if (on) on.scrollIntoView({ block: 'nearest' });
+}
+
+function focused() {
+  if (W.open && W.res.length) {
+    const r = W.res[W.rf];
+    return r ? { it: r.it || { n:r.n, d:r.d, k:r.kind, s:'', m:'' }, path: r.path, to: r.to } : null;
+  }
+  const items = flat(), it = items[C().foc];
+  if (!it) return null;
+  const base = L().coll && it.from ? SPACE[it.from].path : L().path;
+  return { it, path: base + '/' + it.n, to: it.to };
+}
+
+function picPhoto() {
+  return '<svg viewBox="0 0 300 200"><rect width="300" height="200" fill="#2a303a"/>' +
+    '<rect y="126" width="300" height="74" fill="#3a4a3e"/>' +
+    '<rect x="18" y="54" width="82" height="72" fill="#48505e"/>' +
+    '<rect x="112" y="32" width="58" height="94" fill="#585f6e"/>' +
+    '<rect x="182" y="66" width="100" height="60" fill="#434b59"/>' +
+    '<circle cx="248" cy="36" r="16" fill="#8a8457"/></svg>';
+}
+function picShot() {
+  return '<svg viewBox="0 0 300 200"><rect width="300" height="200" fill="#121317"/>' +
+    '<rect width="300" height="19" fill="#1f2026"/><rect x="9" y="6" width="44" height="6" fill="#474a52"/>' +
+    '<rect x="13" y="34" width="124" height="6" fill="#373a42"/><rect x="13" y="50" width="220" height="6" fill="#2e3139"/>' +
+    '<rect x="13" y="66" width="178" height="6" fill="#2e3139"/><rect x="13" y="88" width="274" height="1" fill="#292b31"/>' +
+    '<rect x="13" y="102" width="96" height="6" fill="#373a42"/><rect x="13" y="118" width="228" height="6" fill="#2e3139"/>' +
+    '<rect x="13" y="134" width="152" height="6" fill="#2e3139"/></svg>';
+}
+function picDiagram() {
+  return '<svg viewBox="0 0 300 200"><rect width="300" height="200" fill="#eeeee9"/>' +
+    '<rect x="20" y="24" width="90" height="36" fill="#fff" stroke="#5a5a5b"/>' +
+    '<rect x="190" y="24" width="90" height="36" fill="#fff" stroke="#5a5a5b"/>' +
+    '<rect x="105" y="126" width="90" height="36" fill="#5a5a5b" fill-opacity=".07" stroke="#5a5a5b"/>' +
+    '<line x1="110" y1="42" x2="190" y2="42" stroke="#5a5a5b"/>' +
+    '<line x1="65" y1="60" x2="130" y2="126" stroke="#5a5a5b"/>' +
+    '<line x1="235" y1="60" x2="170" y2="126" stroke="#5a5a5b"/>' +
+    '<rect x="33" y="38" width="64" height="5" fill="#8b8b8d"/>' +
+    '<rect x="203" y="38" width="64" height="5" fill="#8b8b8d"/>' +
+    '<rect x="118" y="140" width="64" height="5" fill="#8b8b8d"/></svg>';
+}
+
+function drawPreview() {
+  const box = g('pv'), f = focused();
+  if (!f) { box.innerHTML = '<div class="path">Нет Focused Item</div>'; return; }
+  const it = f.it;
+  let h = '<h2>' + E(it.n) + '</h2><div class="path">' + E(f.path) + '</div>';
+  if (it.gone) h += '<div class="w-flag">Item недоступен. ' + E(it.gone) + '</div><div class="w-slab">○</div>';
+  else if (it.d) {
+    h += '<div class="w-slab">▸</div>';
+    const inner = f.to && SPACE[f.to] ? SPACE[f.to].items : null;
+    if (inner) h += '<div class="w-pre">' + E(inner.slice(0, 7).map(x => (x.d ? '▸ ' : '  ') + x.n).join('\n') +
+      (inner.length > 7 ? '\n… ещё ' + (inner.length - 7) : '')) + '</div>';
+  }
+  else if (it.pv === 'photo') h += '<div class="w-vis">' + picPhoto() + '</div>';
+  else if (it.pv === 'shot') h += '<div class="w-vis">' + picShot() + '</div>';
+  else if (it.pv === 'diagram') h += '<div class="w-vis">' + picDiagram() + '</div>';
+  else if (it.pv === 'text') h += '<div class="w-pre">' + E(it.text || '') + '</div>';
+  else if (it.pv === 'pdf') h += '<div class="w-page"><b></b><i style="width:95%"></i><i style="width:88%"></i><i style="width:93%"></i><i style="width:64%"></i><i style="width:0"></i><i style="width:96%"></i><i style="width:72%"></i></div>';
+  else h += '<div class="w-slab">▢</div>';
+
+  h += '<dl class="w-fact">' +
+    '<dt>Тип</dt><dd>' + E(it.d ? 'Папка' : it.k) + '</dd>' +
+    '<dt>Размер</dt><dd>' + E(it.d ? 'рекурсивно не считается' : (it.s || '-')) + '</dd>' +
+    '<dt>Изменён</dt><dd>' + E(it.gone ? 'недоступен' : (it.m || '-')) + '</dd>' +
+    (it.d && f.to && SPACE[f.to] ? '<dt>Внутри</dt><dd>' + SPACE[f.to].items.length + ' Items</dd>' : '') +
+    '<dt>Источник</dt><dd>' + E(W.open ? 'Search Results' : 'Location ' + L().title) + '</dd>' +
+    '</dl>';
+  box.innerHTML = h;
+}
+
+function drawStatus() {
+  const c = C(), f = focused();
+  g('mode').textContent = W.open ? 'Search Mode' : 'Browse Mode';
+  g('mode').className = 'tag' + (W.open ? ' hot' : '');
+  g('info').textContent = W.open
+    ? 'Location осталась ' + L().title + ', слой показывает ' + W.res.length + ' результатов'
+    : (L().coll ? 'Recents, коллекция а не директория' : L().path) + (f ? ' · фокус ' + f.it.n : '');
+}
+
+function drawReadout() {
+  const c = C(), f = focused();
+  const layers = [];
+  if (W.ql) layers.push('Quick Look');
+  if (W.menu) layers.push('Action Menu');
+  if (W.tray) layers.push('After Action');
+  if (W.open) layers.push('Search Results');
+  const data = [
+    ['Mode', W.open ? 'Search' : 'Browse', W.open],
+    ['Tab', c.name + (c.pin ? ' (Pinned)' : ' (Temporary)'), false],
+    ['Location', L().title, false],
+    ['Navigation Input', editing() ? 'активен' : (c.query ? 'сохранён, неактивен' : 'пуст'), editing()],
+    ['Focused Item', f ? f.it.n : '-', false],
+    ['Selected Items', W.open ? 'не применимо' : String(c.sel.size), false],
+    ['Слои', layers.length ? layers.join(' → ') : 'нет', layers.length > 0]
+  ];
+  g('readout').innerHTML = data.map(d =>
+    '<span class="badge' + (d[2] ? ' hot' : '') + '">' + E(d[0]) + ': <b>' + E(d[1]) + '</b></span>').join('');
+}
+
+/* ============== поиск ============== */
+let beat = null;
+function query(raw) {
+  clearTimeout(beat);
+  const s = raw.trim();
+  if (!s) { W.res = []; W.meta = null; W.busy = false; draw(); return; }
+  const swapped = swapLayout(s);
+  const term = swapped && swapped !== s ? swapped : s;
+  W.meta = { raw: s, term, fixed: !!(swapped && swapped !== s) };
+
+  const first = [], rest = [];
+  if (s.startsWith('~') || s.startsWith('/')) {
+    const id = Object.keys(SPACE).find(k => !SPACE[k].coll &&
+      (k.toLowerCase() === s.toLowerCase() || SPACE[k].path.toLowerCase() === s.toLowerCase()));
+    if (id) first.push({ n: SPACE[id].title, d:true, to:id, path: SPACE[id].path, kind:'Папка', src:'Точный путь' });
+  }
+  const lt = term.toLowerCase();
+  BOOK.forEach(e => {
+    const byName = e.n.toLowerCase().includes(lt), byPath = e.path.toLowerCase().includes(lt);
+    if (!byName && !byPath) return;
+    if (first.some(x => x.path === e.path)) return;
+    const src = e.parent === C().at ? 'Текущая Location'
+      : (e.d && NEAR.includes(e.parent)) ? 'Частые Locations'
+      : RECENT.has(e.n) ? 'Recents' : 'Spotlight';
+    const row = { n:e.n, d:e.d, to:e.to, parent:e.parent, it:e.it, path:e.path, kind:e.it.k, src, byName };
+    (src === 'Spotlight' ? rest : first).push(row);
+  });
+  const rank = { 'Точный путь':0, 'Текущая Location':1, 'Частые Locations':2, 'Recents':3, 'Spotlight':4 };
+  const by = (a, b) => (rank[a.src] - rank[b.src]) || (b.byName - a.byName) || a.n.localeCompare(b.n, 'ru');
+  first.sort(by); rest.sort(by);
+
+  W.res = first; W.rf = 0; W.busy = true;
+  draw();
+  beat = setTimeout(() => {
+    W.res = first.concat(rest);
+    W.busy = false;
+    if (W.rf >= W.res.length) W.rf = Math.max(0, W.res.length - 1);
+    draw();
+  }, W.slow ? 1400 : 220);
+}
+
+function expandFind() {
+  if (!W.open) {
+    const c = C();
+    W.keep = { at: c.at, foc: c.foc, sel: new Set(c.sel), anc: c.anc, top: listEl.scrollTop };
+    W.open = true;
+  }
+  draw();
+  find.value = C().query;
+  find.focus(); find.select();
+  if (find.value.trim()) query(find.value); else { W.res = []; W.meta = null; draw(); }
+}
+function collapseFind(restore) {
+  clearTimeout(beat);
+  W.open = false; W.res = []; W.busy = false; W.meta = null;
+  C().query = find.value;
+  if (restore && W.keep) {
+    const c = C(), k = W.keep;
+    c.at = k.at; c.foc = k.foc; c.sel = new Set(k.sel); c.anc = k.anc; c.top = k.top;
+  }
+  W.keep = null;
+  find.blur();
+  draw();
+}
+
+function reveal() {
+  const r = W.res[W.rf];
+  if (!r) return;
+  clearTimeout(beat);
+  W.keep = null;
+  W.open = false; W.res = []; W.busy = false;
+  C().query = find.value;
+  find.blur();
+  if (r.d && r.to && SPACE[r.to]) {
+    hop(r.to, null);
+    tell('Reveal: Location стала ' + SPACE[r.to].title + '. Ничего не запускалось.');
+  } else {
+    const home = r.parent && SPACE[r.parent] ? r.parent : '~';
+    hop(home, r.n);
+    tell('Reveal: Location ' + SPACE[home].title + ', Focused Item ' + r.n + '. Приложение не открывалось.');
+  }
+  draw();
+}
+
+/* ============== навигация ============== */
+function hop(id, name) {
+  const c = C();
+  c.hist = c.hist.slice(0, c.hp + 1);
+  if (c.hist[c.hp] !== id) { c.hist.push(id); c.hp = c.hist.length - 1; }
+  c.at = id; c.top = 0;
+  if (!c.pin) c.name = SPACE[id].title;
+  const items = flat();
+  let i = 0;
+  if (name) { const k = items.findIndex(x => x.n === name); if (k >= 0) i = k; }
+  c.foc = i; c.sel = new Set([i]); c.anc = i;
+}
+function back(d) {
+  const c = C(), n = c.hp + d;
+  if (n < 0 || n >= c.hist.length) { tell('История контекста кончилась'); return; }
+  c.hp = n; c.at = c.hist[n];
+  if (!c.pin) c.name = SPACE[c.at].title;
+  if (c.foc >= flat().length) c.foc = 0;
+  c.sel = new Set([c.foc]); c.anc = c.foc;
+  draw();
+}
+function walk(d, ext) {
+  const c = C(), n = flat().length;
+  if (!n) return;
+  const i = Math.max(0, Math.min(n - 1, c.foc + d));
+  c.foc = i;
+  if (ext) { c.sel = new Set(); for (let k = Math.min(c.anc, i); k <= Math.max(c.anc, i); k++) c.sel.add(k); }
+  else { c.sel = new Set([i]); c.anc = i; }
+  draw();
+  const node = listEl.querySelector('.w-row[data-i="' + i + '"]');
+  if (node) node.scrollIntoView({ block: 'nearest' });
+  c.top = listEl.scrollTop;
+}
+function walkRes(d) {
+  if (!W.res.length) return;
+  W.rf = Math.max(0, Math.min(W.res.length - 1, W.rf + d));
+  drawResults(); drawPreview(); drawStatus(); drawReadout();
+}
+function pick(i, e) {
+  const c = C();
+  if (e.metaKey) { c.sel.has(i) ? c.sel.delete(i) : c.sel.add(i); c.foc = i; c.anc = i; }
+  else if (e.shiftKey) { c.sel = new Set(); for (let k = Math.min(c.anc, i); k <= Math.max(c.anc, i); k++) c.sel.add(k); c.foc = i; }
+  else { c.sel = new Set([i]); c.foc = i; c.anc = i; }
+  draw();
+}
+function act() {
+  const c = C(), it = flat()[c.foc];
+  if (!it) return;
+  if (it.gone) { tell('Item недоступен: ' + it.gone); return; }
+  if (it.d) {
+    if (!it.to || !SPACE[it.to]) { tell('Содержимое этой папки в макете не заполнено'); return; }
+    hop(it.to, null); draw();
+    tell('Enter Location. After Action: ' + W.after['Войти в Location']);
+  } else {
+    tell('Open with Default App для ' + it.n + ' (симуляция). After Action: ' + W.after['Открыть файл']);
+  }
+}
+
+/* ============== контексты ============== */
+function pickCtx(id) {
+  if (W.open) collapseFind(true);
+  W.cur = id; find.value = C().query; draw();
+}
+function newCtx() {
+  if (W.open) collapseFind(true);
+  const c = { id:++ctxSeq, name:'Recents', pin:false, at:'recents', hist:['recents'], hp:0, foc:0, sel:new Set([0]), anc:0, query:'', top:0 };
+  W.ctx.push(c); W.cur = c.id;
+  find.value = '';
+  expandFind();
+  tell('Новый временный контекст: Recents под активным Navigation Input');
+}
+function dropCtx(id) {
+  const c = W.ctx.find(x => x.id === id);
+  if (!c || c.pin || W.ctx.length === 1) return;
+  const i = W.ctx.indexOf(c);
+  W.ctx.splice(i, 1);
+  if (W.cur === id) W.cur = W.ctx[Math.max(0, i - 1)].id;
+  find.value = C().query; draw();
+}
+
+/* ============== Action Menu ============== */
+function menuFor() {
+  const c = C();
+  if (W.open) {
+    const r = W.res[W.rf];
+    return { head: r ? 'Search Result: ' + r.n : 'Search Results', list: r ? [
+      { l:'Reveal', k:'Enter' },
+      { l:'Открыть в новом контексте', k:'' },
+      { l:'Открыть с приложением по умолчанию', k:'', a:'Открыть файл' },
+      { l:'Копировать путь', k:'⌘⇧C', a:'Копировать путь' }
+    ] : [{ l:'Нет результата', k:'' }] };
+  }
+  const sel = [...c.sel].map(i => flat()[i]).filter(Boolean);
+  if (!sel.length) return { head:'Действия приложения, Selected Items пуст', list:[
+    { l:'Новый временный контекст', k:'⌘T', run:newCtx },
+    { l:'Вставить путь', k:'⌘V' },
+    { l:'Обновить Location', k:'⌘R' },
+    { l:'Настройки', k:'⌘,', run:() => { W.tray = true; } },
+    { l:'Выход', k:'⌘Q' }
+  ]};
+  if (sel.length > 1) return { head:'Selected Items: ' + sel.length, list:[
+    { l:'Открыть все', k:'', a:'Открыть файл' },
+    { l:'Открыть в новом контексте', k:'' },
+    { l:'Копировать пути', k:'⌘⇧C', a:'Копировать путь' },
+    { l:'Копировать файлы', k:'⌘C', a:'Копировать файл' },
+    { l:'В корзину', k:'⌘⌫', a:'В корзину' }
+  ]};
+  const it = sel[0];
+  return { head: (it.d ? 'Папка: ' : 'Файл: ') + it.n, list: it.d ? [
+    { l:'Войти в Location', k:'Enter', a:'Войти в Location', run:act },
+    { l:'Закрепить как контекст', k:'' },
+    { l:'Открыть в терминале', k:'', a:'Открыть в терминале или IDE' },
+    { l:'Копировать путь', k:'⌘⇧C', a:'Копировать путь' },
+    { l:'В корзину', k:'⌘⌫', a:'В корзину' }
+  ] : [
+    { l:'Открыть с приложением по умолчанию', k:'Enter', a:'Открыть файл', run:act },
+    { l:'Quick Look', k:'Space', a:'Quick Look', run:openQL },
+    { l:'Открыть в новом контексте', k:'' },
+    { l:'Открыть в IDE', k:'', a:'Открыть в терминале или IDE' },
+    { l:'Копировать путь', k:'⌘⇧C', a:'Копировать путь' },
+    { l:'Копировать файл', k:'⌘C', a:'Копировать файл' },
+    { l:'Переименовать', k:'' },
+    { l:'В корзину', k:'⌘⌫', a:'В корзину' }
+  ]};
+}
+/* Action Menu всегда пристыкован к колонке Preview Panel, в том числе при правом клике по списку:
+   действия живут рядом с Item, а не там, где оказался курсор */
+function popMenu() {
+  if (W.ql) W.ql = null;
+  W.menu = menuFor(); W.mi = 0;
+  draw();
+}
+function drawMenu() {
+  const box = g('menu');
+  box.classList.toggle('on', !!W.menu);
+  if (!W.menu) return;
+  let h = '<div class="h">' + E(W.menu.head) + '</div>';
+  W.menu.list.forEach((m, i) => {
+    h += '<button class="w-mi' + (i === W.mi ? ' on' : '') + '" data-i="' + i + '"><span>' + E(m.l) + '</span>' +
+      '<span class="r">' + (m.a ? '<span class="aa">' + E(W.after[m.a]) + '</span>' : '') + E(m.k || '') + '</span></button>';
+  });
+  box.innerHTML = h;
+  box.querySelectorAll('.w-mi').forEach(b => {
+    b.onmouseenter = () => { W.mi = +b.dataset.i; drawMenu(); };
+    b.onmousedown = e => { e.preventDefault(); W.mi = +b.dataset.i; runMenu(); };
+  });
+}
+function runMenu() {
+  const m = W.menu ? W.menu.list[W.mi] : null;
+  W.menu = null;
+  if (!m) { draw(); return; }
+  if (m.run) { m.run(); draw(); if (!m.a) return; }
+  draw();
+  tell(m.l + (m.a ? '. After Action: ' + W.after[m.a] : '. Симуляция, наружу ничего не уходит.'));
+}
+
+/* ============== Quick Look ============== */
+function openQL() {
+  const c = C(), it = flat()[c.foc];
+  if (!it || it.d) { tell('Quick Look открывается только для файла'); return; }
+  W.menu = null;
+  const sel = [...c.sel].map(i => flat()[i]).filter(x => x && !x.d);
+  const files = sel.length > 1 ? sel : flat().filter(x => !x.d);
+  const i = files.indexOf(it);
+  W.ql = files; W.qi = i < 0 ? 0 : i;
+  draw();
+}
+function qlWalk(d) {
+  W.qi = Math.max(0, Math.min(W.ql.length - 1, W.qi + d));
+  const c = C(), k = flat().indexOf(W.ql[W.qi]);
+  if (k >= 0) { c.foc = k; if (c.sel.size <= 1) { c.sel = new Set([k]); c.anc = k; } }
+  draw();
+}
+function drawQL() {
+  const box = g('ql');
+  box.classList.toggle('on', !!W.ql);
+  if (!W.ql) return;
+  const it = W.ql[W.qi];
+  if (!it) { box.innerHTML = ''; return; }
+  let doc;
+  if (it.gone) doc = '<pre>Item недоступен.\n' + E(it.gone) + '</pre>';
+  else if (it.pv === 'text') doc = '<pre>' + E(it.text || '') + '</pre>';
+  else if (it.pv === 'pdf') doc = '<div class="paper"><b></b><i style="width:96%"></i><i style="width:90%"></i><i style="width:94%"></i><i style="width:63%"></i><i style="width:0"></i><i style="width:95%"></i><i style="width:86%"></i><i style="width:97%"></i><i style="width:40%"></i></div>';
+  else if (it.pv === 'photo') doc = '<div style="border-radius:4px;overflow:hidden">' + picPhoto() + '</div>';
+  else if (it.pv === 'shot') doc = '<div style="border-radius:4px;overflow:hidden">' + picShot() + '</div>';
+  else if (it.pv === 'diagram') doc = '<div style="border-radius:4px;overflow:hidden">' + picDiagram() + '</div>';
+  else doc = '<pre>Полнодокументный просмотр для ' + E(it.k) + ' в макете не рисуется.\nМетаданные: ' + E(it.s || '-') + ', ' + E(it.m || '-') + '</pre>';
+  box.innerHTML =
+    '<div class="w-ql-h"><span class="t">' + E(it.n) + '</span><span class="c">' + (W.qi + 1) + ' из ' + W.ql.length + ' файлов' +
+    (C().sel.size > 1 ? ', в пределах Selected Items' : '') + '</span>' +
+    '<span class="c" style="margin-left:auto">Рейка контекстов остаётся видимой</span></div>' +
+    '<div class="w-ql-b"><div class="w-ql-doc">' + doc + '</div></div>' +
+    '<div class="w-ql-f"><span>Up и Down только по файлам</span><span>Space или Escape закрывают</span>' +
+    '<span>Cmd+K закроет Quick Look и откроет Action Menu</span></div>';
+}
+
+/* ============== полка After Action ============== */
+function drawTray() {
+  const box = g('tray');
+  box.classList.toggle('on', W.tray);
+  if (!W.tray) return;
+  let h = '<div class="th"><span>After Action: что делает окно после действия</span>' +
+    '<span style="margin-left:auto;color:#63666e">значения видно прямо в Action Menu</span></div><div class="tg">';
+  Object.keys(W.after).forEach(k => {
+    h += '<div class="tr"><span>' + E(k) + '</span><span class="w-seg">' +
+      '<button data-k="' + E(k) + '" data-v="Hide Window" class="' + (W.after[k] === 'Hide Window' ? 'on' : '') + '">Hide</button>' +
+      '<button data-k="' + E(k) + '" data-v="Keep Open" class="' + (W.after[k] === 'Keep Open' ? 'on' : '') + '">Keep Open</button>' +
+      '</span></div>';
+  });
+  h += '</div>';
+  box.innerHTML = h;
+  box.querySelectorAll('.w-seg button').forEach(b => { b.onclick = () => { W.after[b.dataset.k] = b.dataset.v; draw(); }; });
+}
+
+let tellT = null;
+function tell(msg) {
+  const t = g('toast');
+  t.textContent = msg; t.classList.add('on');
+  clearTimeout(tellT);
+  tellT = setTimeout(() => t.classList.remove('on'), 3600);
+}
+
+/* ============== Escape ============== */
+function peel() {
+  if (W.ql) { W.ql = null; draw(); return; }
+  if (W.menu) { W.menu = null; draw(); return; }
+  if (W.tray) { W.tray = false; draw(); return; }
+  if (W.open) {
+    collapseFind(true);
+    tell('Слой Search Results закрыт. Прежний Focused Item и прокрутка вернулись, запрос сохранён неактивным.');
+    return;
+  }
+  const c = C();
+  if (c.sel.size > 1) { c.sel = new Set([c.foc]); c.anc = c.foc; draw(); return; }
+  tell('Дальше Escape скрыл бы окно. В макете окно остаётся.');
+}
+
+/* ============== клавиатура ============== */
+document.addEventListener('keydown', e => {
+  const k = e.key, meta = e.metaKey, ctrl = e.ctrlKey;
+  if (meta && !e.altKey) {
+    const low = k.toLowerCase();
+    if (low === 'l') { e.preventDefault(); expandFind(); return; }
+    if (low === 'k') { e.preventDefault(); W.menu ? (W.menu = null, draw()) : popMenu(); return; }
+    if (low === 't') { e.preventDefault(); newCtx(); return; }
+    if (k === '[') { e.preventDefault(); back(-1); return; }
+    if (k === ']') { e.preventDefault(); back(1); return; }
+    if (k === 'Backspace') { e.preventDefault(); bin(); return; }
+  }
+  if (k === 'Escape') { e.preventDefault(); peel(); return; }
+
+  if (W.ql) {
+    if (k === 'ArrowDown' || (ctrl && k.toLowerCase() === 'j')) { e.preventDefault(); qlWalk(1); return; }
+    if (k === 'ArrowUp' || (ctrl && k.toLowerCase() === 'k')) { e.preventDefault(); qlWalk(-1); return; }
+    if (k === ' ') { e.preventDefault(); W.ql = null; draw(); return; }
+    return;
+  }
+  if (W.menu) {
+    if (k === 'ArrowDown' || (ctrl && k.toLowerCase() === 'j')) { e.preventDefault(); W.mi = Math.min(W.menu.list.length - 1, W.mi + 1); drawMenu(); return; }
+    if (k === 'ArrowUp' || (ctrl && k.toLowerCase() === 'k')) { e.preventDefault(); W.mi = Math.max(0, W.mi - 1); drawMenu(); return; }
+    if (k === 'Enter') { e.preventDefault(); runMenu(); return; }
+    return;
+  }
+  if (e.code === 'Slash' && !editing() && !meta && !ctrl) { e.preventDefault(); expandFind(); return; }
+
+  if (W.open) {
+    if (k === 'ArrowDown' || (ctrl && k.toLowerCase() === 'j')) { e.preventDefault(); walkRes(1); return; }
+    if (k === 'ArrowUp' || (ctrl && k.toLowerCase() === 'k')) { e.preventDefault(); walkRes(-1); return; }
+    if (k === 'Enter') { e.preventDefault(); reveal(); return; }
+    if (k === 'ArrowRight' && find.selectionStart === find.value.length && find.selectionStart === find.selectionEnd) { e.preventDefault(); reveal(); return; }
+    return;
+  }
+  if (editing()) return;
+
+  if (k === 'ArrowDown' || (ctrl && k.toLowerCase() === 'j')) { e.preventDefault(); walk(1, e.shiftKey); return; }
+  if (k === 'ArrowUp' || (ctrl && k.toLowerCase() === 'k')) { e.preventDefault(); walk(-1, e.shiftKey); return; }
+  if (k === 'ArrowLeft') { e.preventDefault(); back(-1); return; }
+  if (k === 'ArrowRight' || k === 'Enter') { e.preventDefault(); act(); return; }
+  if (k === ' ') { e.preventDefault(); openQL(); return; }
+});
+
+function bin() {
+  const c = C();
+  const names = [...c.sel].map(i => flat()[i]).filter(Boolean).map(x => x.n);
+  if (!names.length) { tell('Selected Items пуст, удалять нечего'); return; }
+  tell('В корзину: ' + names.join(', ') + ' (симуляция). After Action: ' + W.after['В корзину']);
+}
+
+/* ============== мышь ============== */
+find.addEventListener('mousedown', e => { if (document.activeElement !== find) { e.preventDefault(); expandFind(); } });
+find.addEventListener('input', () => { C().query = find.value; query(find.value); });
+find.addEventListener('blur', () => { draw(); });
+find.addEventListener('focus', drawReadout);
+g('back').onclick = () => back(-1);
+g('fwd').onclick = () => back(1);
+g('newctx').onclick = newCtx;
+g('qlbtn').onclick = openQL;
+g('actbtn').onclick = () => { W.menu ? (W.menu = null, draw()) : popMenu(); };
+listEl.addEventListener('scroll', () => { if (!W.open) C().top = listEl.scrollTop; });
+/* фаза погружения: слой снимается до того, как клик дойдёт до строки списка */
+win.addEventListener('mousedown', e => {
+  if (W.menu && !g('menu').contains(e.target) && !e.target.closest('#actbtn')) { W.menu = null; draw(); }
+  if (W.tray && !g('tray').contains(e.target)) { W.tray = false; draw(); }
+  if (W.open && !g('results').contains(e.target) && e.target !== find && !e.target.closest('.w-find')) {
+    collapseFind(true);
+  }
+}, true);
+listEl.addEventListener('contextmenu', e => {
+  if (e.target.closest('.w-row')) return;
+  e.preventDefault();
+  C().sel = new Set(); draw(); popMenu();
+});
+
+/* ============== внешние переключатели ============== */
+document.querySelectorAll('[data-scn]').forEach(b => {
+  b.onclick = () => { expandFind(); find.value = b.dataset.scn; C().query = find.value; query(find.value); };
+});
+g('slow').onclick = () => {
+  W.slow = !W.slow;
+  g('slow').textContent = 'Медленный поиск: ' + (W.slow ? 'вкл' : 'выкл');
+  g('slow').classList.toggle('on', W.slow);
+  if (W.open) query(find.value);
+};
+g('gone').onclick = () => {
+  if (W.open) collapseFind(true);
+  hop('~/icloud', 'Отпуск.mov'); draw();
+  tell('Focused Item недоступен: Preview Panel показывает состояние вместо содержимого');
+};
+g('narrow').onclick = () => {
+  win.classList.toggle('narrow');
+  g('narrow').classList.toggle('on', win.classList.contains('narrow'));
+  draw();
+};
+g('reset').onclick = () => location.reload();
+
+/* ============== старт ============== */
+draw();
+tell('Стартовое состояние: закреплённый контекст Проект Удокан, Browse Mode. Нажми / или Cmd+L.');
+</script>
+</body>
+</html>
