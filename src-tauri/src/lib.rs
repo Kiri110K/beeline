@@ -1,6 +1,8 @@
 mod listing;
 mod name_index;
+mod operations;
 mod pinned_tabs;
+mod qos;
 mod recents;
 mod telemetry;
 
@@ -23,6 +25,10 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 use listing::list_location;
 use name_index::{record_visit, search_name_index, NameIndex};
+use operations::{
+    cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
+    rename_item, reveal_in_finder, trash_items, Operations,
+};
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use recents::{get_recents, RecentsCache};
 use telemetry::Telemetry;
@@ -298,16 +304,25 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            cancel_operation,
+            create_folder,
+            delete_items_permanently,
             frontend_ready,
             get_recents,
             hide_window,
             home_directory,
             list_location,
             load_pinned_tabs,
+            open_in_app,
+            paste_copy,
+            paste_move,
             record_visit,
+            rename_item,
+            reveal_in_finder,
             save_pinned_tabs,
             search_name_index,
-            telemetry_event
+            telemetry_event,
+            trash_items
         ])
         .setup(move |app| {
             let telemetry = Telemetry::new(&app.path().app_data_dir()?, process_started)?;
@@ -317,6 +332,7 @@ pub fn run() {
             )?;
             app.manage(telemetry);
             app.manage(ShellState::new(!hidden_launch));
+            app.manage(Operations::new());
             // Load the last-success Recents cache so the first get_recents paints from it
             // instantly; the refresh is triggered lazily by that first call (§7, §11).
             app.manage(RecentsCache::load(&app.path().app_data_dir()?));

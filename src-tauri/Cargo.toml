@@ -26,3 +26,4 @@ tauri-plugin-global-shortcut = "2.3.2"
 tauri-plugin-autostart = "2.5.1"
 time = { version = "0.3.55", features = ["formatting"] }
 notify = "8.2.0"
+trash = "5.2.6"

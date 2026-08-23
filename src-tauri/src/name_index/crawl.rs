@@ -32,31 +32,10 @@ use crate::{
 /// Progress telemetry cadence: one event per this many indexed entries.
 const PROGRESS_STEP: usize = 100_000;
 
-/// Lower the calling thread's QoS on macOS so index work never competes with the
-/// UI. This links `libSystem` (always present); no crate dependency is needed.
-/// `QOS_CLASS_BACKGROUND` is `0x09`, `QOS_CLASS_UTILITY` is `0x11`.
-fn set_qos(qos_class: u32) {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `pthread_set_qos_class_self_np` is a libSystem C function that only
-        // reads its two scalar arguments and adjusts the current thread's QoS.
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-        }
-        // SAFETY: see above — plain scalar call, no memory is touched.
-        unsafe {
-            pthread_set_qos_class_self_np(qos_class, 0);
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = qos_class;
-}
-
 /// Steady-state index work (FSEvents increments, junk drains) stays at background
-/// QoS: rare small bursts where throttling costs nothing.
-pub fn set_background_qos() {
-    set_qos(0x09);
-}
+/// QoS: rare small bursts where throttling costs nothing. The libSystem shim lives in
+/// [`crate::qos`] so the operations engine reuses it.
+pub use crate::qos::set_background_qos;
 
 /// The one-time initial crawl and the startup diff-rescan run at utility QoS.
 /// Background QoS gets darwin's heaviest IO throttle — measured on the reference
@@ -64,7 +43,7 @@ pub fn set_background_qos() {
 /// full home). Deviation from SPEC §10's blanket "background QoS for heavy work"
 /// is recorded on ticket #26.
 pub fn set_crawl_qos() {
-    set_qos(0x11);
+    crate::qos::set_qos(0x11);
 }
 
 fn mtime_ms(metadata: &fs::Metadata) -> i64 {
