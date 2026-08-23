@@ -71,7 +71,20 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 ```sh
 cd /Users/kiri110k/lab/beeline
 pnpm typecheck && pnpm lint && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-pnpm tauri build   # бандл: src-tauri/target/release/bundle/macos/Beeline.app
-open src-tauri/target/release/bundle/macos/Beeline.app
+pnpm tauri build   # подписывается идентити «Beeline Dev Signing» (login keychain)
+rm -rf /Applications/Beeline.app && ditto src-tauri/target/release/bundle/macos/Beeline.app /Applications/Beeline.app
+open /Applications/Beeline.app   # запускать ТОЛЬКО из /Applications — там FDA-грант
 # шорткат-тоггл и Escape — см. osascript выше; тайминги — в telemetry.ndjson
 ```
+
+## GUI-тесты и машина Кирилла
+
+- Синтетические клавиши (osascript) слать ТОЛЬКО когда машина свободна:
+  HIDIdleTime ≥ 120 с И фронтмост = beeline (проверять перед каждой пачкой).
+  Прецедент 23.08: Cmd+T/Cmd+W улетали в активные окна Кирилла.
+- Активировать Beeline AppleScript'ом нельзя (Accessory) — фокусировать его
+  же глобальным шорткатом (key code 3 + ctrl/opt/cmd).
+- TCC: подпись стабильная, FDA-грант на /Applications/Beeline.app ставит
+  Кирилл один раз; до гранта запуски дают попапы — не запускать без него.
+- Первичный кроулинг Name Index — Utility QoS (background душится ядром,
+  84 записи/с; фикс в crawl.rs::set_crawl_qos, отклонение от §10 в тикете #26).

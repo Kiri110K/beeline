@@ -1,4 +1,5 @@
 mod listing;
+mod name_index;
 mod pinned_tabs;
 mod telemetry;
 
@@ -20,6 +21,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 use listing::list_location;
+use name_index::{search_name_index, NameIndex};
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use telemetry::Telemetry;
 
@@ -181,11 +183,7 @@ fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn hide_window(
-    app: AppHandle,
-    state: State<'_, ShellState>,
-    origin: String,
-) -> Result<(), String> {
+fn hide_window(app: AppHandle, state: State<'_, ShellState>, origin: String) -> Result<(), String> {
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window is missing".to_owned())?;
@@ -304,6 +302,7 @@ pub fn run() {
             list_location,
             load_pinned_tabs,
             save_pinned_tabs,
+            search_name_index,
             telemetry_event
         ])
         .setup(move |app| {
@@ -343,6 +342,15 @@ pub fn run() {
                 }),
             )?;
 
+            // The window is already created above; init only spawns background threads
+            // and returns, so window show is never delayed (§10).
+            match NameIndex::init(app.handle()) {
+                Ok(name_index) => {
+                    app.manage(name_index);
+                }
+                Err(error) => eprintln!("name index init failed: {error}"),
+            }
+
             Ok(())
         });
 
@@ -353,5 +361,12 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    app.run(|_app_handle, _event| {});
+    app.run(|app_handle, event| {
+        // Persist the Name Index on graceful shutdown (never periodically, §11).
+        if let tauri::RunEvent::Exit = event {
+            if let Some(name_index) = app_handle.try_state::<NameIndex>() {
+                name_index.persist();
+            }
+        }
+    });
 }

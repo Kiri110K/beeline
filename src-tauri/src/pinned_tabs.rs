@@ -55,6 +55,5 @@ pub fn save_pinned_tabs(app: AppHandle, tabs: Vec<PersistedPinnedTab>) -> Result
     let temp_path = path.with_extension("json.tmp");
     fs::write(&temp_path, json.as_bytes())
         .map_err(|error| format!("failed to write pinned tabs: {error}"))?;
-    fs::rename(&temp_path, &path)
-        .map_err(|error| format!("failed to replace pinned tabs: {error}"))
+    fs::rename(&temp_path, &path).map_err(|error| format!("failed to replace pinned tabs: {error}"))
 }
