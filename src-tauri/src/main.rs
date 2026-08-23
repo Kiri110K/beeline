@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    beeline_scaffold_lib::run()
+    beeline_lib::run()
 }
