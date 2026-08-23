@@ -386,6 +386,50 @@ pub fn run() {
                 let _ = window.set_visible_on_all_workspaces(true);
             }
 
+            // Headless benchmark hook: run backend loads with the window hidden,
+            // log the normal events with origin "headless", then exit. Tasks are
+            // semicolon-separated paths; the token "recents" runs a Recents query.
+            if let Ok(bench) = env::var("VISUAL_FILES_HEADLESS_BENCH") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    for task in bench.split(';').filter(|t| !t.is_empty()) {
+                        if task == "recents" {
+                            match load_recents_sync() {
+                                Ok(result) => state.logger.log(
+                                    "recents_loaded",
+                                    json!({
+                                        "duration_ms": result.duration_ms,
+                                        "item_count": result.items.len(),
+                                        "origin": "headless",
+                                    }),
+                                ),
+                                Err(error) => state
+                                    .logger
+                                    .log("headless_bench_error", json!({ "task": task, "error": error })),
+                            }
+                            continue;
+                        }
+                        match load_path_sync(task.to_string()) {
+                            Ok(result) => state.logger.log(
+                                "directory_loaded",
+                                json!({
+                                    "duration_ms": result.duration_ms,
+                                    "item_count": result.items.len(),
+                                    "location": result.location,
+                                    "origin": "headless",
+                                }),
+                            ),
+                            Err(error) => state
+                                .logger
+                                .log("headless_bench_error", json!({ "task": task, "error": error })),
+                        }
+                    }
+                    state.logger.log("headless_bench_done", json!({}));
+                    std::process::exit(0);
+                });
+            }
+
             let shortcut_name =
                 env::var("VISUAL_FILES_SHORTCUT").unwrap_or_else(|_| DEFAULT_SHORTCUT.to_string());
             let shortcut = Shortcut::from_str(&shortcut_name).map_err(|error| {

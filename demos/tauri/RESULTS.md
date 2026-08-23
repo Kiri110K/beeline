@@ -63,3 +63,29 @@ The benchmark question is not answered until someone runs the release bundle int
 - actual Open, Copy path, and Space Quick Look behavior.
 
 These checks must run sequentially so the Tauri, Electron, and AppKit demos do not fight over shortcuts or foreground focus.
+
+## Performance envelope run (2026-08-23, ticket #7)
+
+Release bundle, Apple Silicon, macOS 26.5.1. Raw log: `raw/perf-ticket-run-20260823.ndjson`.
+
+### Measured
+
+- Cold entry: the first process start showed Recents at 543.6 ms (frontend ready 237.2 ms). Four immediate restarts with warm OS caches: frontend ready 126.7–129.6 ms, Recents shown 193.5–201.3 ms. A true post-reboot start was not measured.
+- Warm entry: 30 shortcut invocations on the resident hidden process. `shortcut_received` to `window_visible`: median 2.4 ms, p95 8.7 ms, max 11.4 ms. Visual confirmation of Path Input focus per show was not automated.
+- Recents (mdfind 90-day window plus metadata for up to 500 paths): 59–84 ms across 11 runs, 278–289 accessible items. The first query of the session took 305.6 ms.
+- Directory enumeration, backend only (`read_dir` + per-item stat + sort): 8 items 0.05 ms; 63 items (`/Applications`) 0.2 ms; 50,000 synthetic items 299.4 ms first pass and 185.4 ms warm; a mounted 5,001-item APFS disk-image volume 16.5 ms; the iCloud Drive root (25 items) 2.2 ms with no downloads triggered.
+- Idle resident, window hidden, after 2 minutes: `phys_footprint` 19 MB (peak 21 MB), RSS 90 MB, 0.0% CPU.
+
+### Method
+
+- A headless hook was added for this run: `VISUAL_FILES_HEADLESS_BENCH` takes semicolon-separated tasks (paths, or `recents`), runs them on the backend with the window hidden, logs the normal events with `origin: "headless"`, and exits. These numbers exclude IPC serialization and webview rendering.
+- GUI keystroke automation (System Events) was aborted mid-run: global keystrokes landed in the active user's applications while they were working. Do not drive this demo through synthetic keystrokes while the machine is in use.
+
+### Reading
+
+- The backend is not the bottleneck. Even 50,000 stat-included enumerations fit in ~200–300 ms; ordinary directories are microseconds. The large-directory risk concentrates in the IPC payload and DOM rendering, which this run does not cover.
+- Cached-first-paint Recents (#10) is confirmed viable: a background refresh costs ~70 ms.
+
+### Still unmeasured (input to the performance contract, #12)
+
+Frontend render cost of large listings, sustained-scroll CPU, `10k` first render, cross-Space and full-screen activation, per-show focus confirmation, icon and preview costs (absent from this demo), network volumes (none available), and a true post-reboot cold start.
