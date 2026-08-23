@@ -807,6 +807,17 @@ mod tests {
             // components deep, with file-name length varying by the counters.
             for a in 0..2500u32 {
                 let top = index.add_dir(0, &format!("project{a:04}"), model::Tier::Normal, 0);
+                // Cyrillic slice for the live worst case (a pasted two-token Cyrillic query):
+                // every 100th project gets an `приемки` subdir holding a few
+                // `процедура_{n}.txt` files. The query «процедура приемки» then lands a bounded
+                // hit set (25 dirs × 5 files = 125, well under the 4096 candidate cap) yet
+                // still full-scans the whole index to find them — the ancestor-walk worst case.
+                if a % 100 == 0 {
+                    let priemki = index.add_dir(top, "приемки", model::Tier::Normal, 0);
+                    for n in 0..5u32 {
+                        index.add_file(priemki, &format!("процедура_{n}.txt"), model::Tier::Normal);
+                    }
+                }
                 for b in 0..5u32 {
                     let mid = index.add_dir(top, &format!("module{b}"), model::Tier::Normal, 0);
                     for c in 0..5u32 {
@@ -870,6 +881,17 @@ mod tests {
         // selects the project-1999 files by name and "module2" narrows to that module by its
         // ancestor dir — a full scan that lands a few hundred hits.
         bench("two-token (full scan)", "file_1999 module2");
+        // The live worst case this ticket targets: a pasted cold two-token Cyrillic query.
+        // "процедура" prefix-matches the file names; "приемки" misses every name and falls to
+        // the parent-path check, so before the per-dir mask cache each entry re-walked shared
+        // ancestor chains. It full-scans (125 hits < cap) — the direct token set then the
+        // layout-corrected one, ~4 path checks per entry across the whole index, now one bit
+        // test per check against a mask built once per directory.
+        bench("cyrillic two-token (full)", "процедура приемки");
+        // The same words typed on the wrong (EN) layout: the RU letters of «процедура приемки»
+        // map through the physical keys to this ASCII string (derived via `map_layout` RU→EN).
+        // The direct tokens match nothing, so the layout-corrected token set carries the hits.
+        bench("wrong-layout two-token", "ghjwtlehf ghbtvrb");
 
         // Typing-extension reuse: extend a query four times. Without reuse each keystroke
         // full-scans; with reuse each rescans only the previous match set.
