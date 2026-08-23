@@ -230,11 +230,29 @@ struct Prepared {
     /// Each layout-corrected variant, tokenized the same way — populated only for a
     /// multi-token query. Space maps to space, so a variant carries the same token count.
     corrected_tokens: Vec<Vec<String>>,
-    /// Lowercased components of the index root, so a token may match the whole path string
-    /// (the root prefix included) without reconstructing it — populated only for multi-token.
+    /// Flat needle list for the per-dir path mask (multi-token only): the direct token set
+    /// followed by each corrected variant's token set, in order. Bit `i` of a dir mask means
+    /// `path_needles[i]` occurs in some component of that dir's path. Duplicates across sets
+    /// are kept so a flat index maps straight back to a token position.
+    path_needles: Vec<String>,
+    /// Flat-list offset of each corrected variant's token set in [`Prepared::path_needles`]
+    /// (the direct set sits at offset 0). `corrected_offsets[k]` is where variant `k`'s tokens
+    /// begin, so [`score_multi`] can turn a per-set token position into a flat needle index.
+    corrected_offsets: Vec<usize>,
+    /// Whether the path check uses the per-dir bit-mask cache: multi-token and at most 64
+    /// needles (a `u64` mask). A pasted wall of text can exceed 64 needles; that overflow
+    /// falls back to the uncached ancestor walk instead (same component-wise test).
+    use_path_mask: bool,
+    /// Lowercased `Normal` components of the index root, for the overflow-fallback path check
+    /// only — the mask path folds the root's bits into `mask(0)`. Populated only for
+    /// multi-token queries.
     root_lower: Vec<String>,
     known: HashSet<PathBuf>,
 }
+
+/// A `u64` mask holds one bit per path needle, so beyond this many needles the per-dir mask
+/// cache cannot represent the answer and the scan falls back to the uncached ancestor walk.
+const MAX_PATH_NEEDLES: usize = 64;
 
 impl Prepared {
     fn new(index: &IndexData, trimmed: &str, query_lower: &str) -> Self {
@@ -260,11 +278,23 @@ impl Prepared {
             tokenize(query_lower)
         };
         let multi = tokens.len() > 1;
-        let corrected_tokens = if multi {
+        let corrected_tokens: Vec<Vec<String>> = if multi {
             corrected.iter().map(|variant| tokenize(variant)).collect()
         } else {
             Vec::new()
         };
+        // Flatten the direct token set and every corrected set into one needle list, recording
+        // where each corrected set begins so a (set, position) pair maps to a flat bit index.
+        let mut path_needles = Vec::new();
+        let mut corrected_offsets = Vec::new();
+        if multi {
+            path_needles.extend(tokens.iter().cloned());
+            for set in &corrected_tokens {
+                corrected_offsets.push(path_needles.len());
+                path_needles.extend(set.iter().cloned());
+            }
+        }
+        let use_path_mask = multi && path_needles.len() <= MAX_PATH_NEEDLES;
         let root_lower = if multi {
             root_components_lower(&index.root)
         } else {
@@ -277,10 +307,107 @@ impl Prepared {
             corrected,
             tokens,
             corrected_tokens,
+            path_needles,
+            corrected_offsets,
+            use_path_mask,
             root_lower,
             known,
         }
     }
+}
+
+/// Scan-local memo answering, per directory, the one bit a multi-token path check needs:
+/// "does needle `i` occur (case-insensitive) in some component of this dir's path?". Bit `i`
+/// of a dir's mask is set iff [`Prepared::path_needles`]`[i]` occurs in some component of that
+/// dir's path, the index root's own components included:
+///   `mask(d) = mask(parent) | bits_of(name(d))`, with `mask(0)` the bits of the root path's
+///   `Normal` components (the old `root_components_lower` semantics).
+///
+/// One `Option<u64>` per directory node (`None` until built), sized to `index.nodes.len()` —
+/// ~16 bytes × nodes per shard, a few MB transient on the reference machine, dropped with the
+/// scan. The index is immutable under the read lock for the duration of a search, so a cached
+/// mask never goes stale within the scan; each shard (and the reuse scan) owns one — the cache
+/// is never shared across threads and never stored in [`IndexData`].
+///
+/// Millions of entries share the same few hundred thousand parent directories, so memoizing
+/// the answer per dir turns the per-entry ancestor walk into one `Vec` index and one bit test;
+/// each dir's own name is tested against each needle at most once per scan.
+struct DirMaskCache {
+    masks: Vec<Option<u64>>,
+}
+
+impl DirMaskCache {
+    fn new(node_count: usize) -> Self {
+        Self {
+            masks: vec![None; node_count],
+        }
+    }
+
+    /// The needle-occurrence mask for `dir`, building and memoizing it (and any uncached
+    /// ancestors) on first use.
+    fn mask_for(
+        &mut self,
+        index: &IndexData,
+        dir: DirId,
+        needles: &[String],
+        scratch: &mut String,
+    ) -> u64 {
+        if let Some(mask) = self.masks[dir as usize] {
+            return mask;
+        }
+        let mask = self.build(index, dir, needles, scratch);
+        self.masks[dir as usize] = Some(mask);
+        mask
+    }
+
+    fn build(
+        &mut self,
+        index: &IndexData,
+        dir: DirId,
+        needles: &[String],
+        scratch: &mut String,
+    ) -> u64 {
+        if dir == 0 {
+            // Root: bits of needles occurring in the root path's own `Normal` components.
+            let mut mask = 0u64;
+            for component in index.root.components() {
+                if let Component::Normal(name) = component {
+                    mask |= component_bits(&name.to_string_lossy(), needles, scratch);
+                }
+            }
+            return mask;
+        }
+        let (parent, name) = {
+            let node = &index.nodes[dir as usize];
+            (node.parent, node.name.clone())
+        };
+        // Recurse first, then OR in this dir's own bits: the recursion mutably borrows `self`,
+        // so `name` is copied out of the node above rather than held across the call.
+        let parent_mask = self.mask_for(index, parent, needles, scratch);
+        parent_mask | component_bits(&name, needles, scratch)
+    }
+}
+
+/// A fresh mask cache for one scan, or `None` when the query does not use it: single-token
+/// and path-shaped queries never do the path-mask check, and a multi-token query with more
+/// than 64 needles overflows the `u64` and takes the uncached ancestor-walk fallback instead.
+/// Sizing the cache to the node count is skipped in those cases, so a single-token scan pays
+/// nothing for it.
+fn new_dir_masks(index: &IndexData, prep: &Prepared) -> Option<DirMaskCache> {
+    prep.use_path_mask
+        .then(|| DirMaskCache::new(index.nodes.len()))
+}
+
+/// The bits of `needles` that occur (case-insensitive substring) in one path `component`.
+/// A single component drives one `contains_ci` per needle, allocation-free for ASCII names.
+fn component_bits(component: &str, needles: &[String], scratch: &mut String) -> u64 {
+    let mut bits = 0u64;
+    for (i, needle) in needles.iter().enumerate() {
+        if contains_ci(component, needle, scratch) {
+            bits |= 1u64 << i;
+        }
+    }
+    bits
 }
 
 /// Run a search, returning up to `limit` hits in the §6 ranked, deterministic order — the
@@ -486,6 +613,7 @@ fn scan_range(
 ) -> (Vec<Candidate>, usize, bool) {
     let mut local = Vec::new();
     let mut scratch = String::new();
+    let mut dir_masks = new_dir_masks(index, prep);
     let mut scanned = 0usize;
     let mut since_check = 0usize;
     for slot in lo..hi {
@@ -500,7 +628,9 @@ fn scan_range(
             continue;
         };
         scanned += 1;
-        if let Some((score, path)) = score_entry(index, entry, prep, ctx, &mut scratch) {
+        if let Some((score, path)) =
+            score_entry(index, entry, prep, ctx, &mut dir_masks, &mut scratch)
+        {
             local.push(Candidate {
                 score,
                 path,
@@ -528,6 +658,7 @@ fn scan_reuse(
 ) -> (Vec<Candidate>, usize, bool, bool) {
     let mut local = Vec::new();
     let mut scratch = String::new();
+    let mut dir_masks = new_dir_masks(index, prep);
     let mut scanned = 0usize;
     let mut since_check = 0usize;
     for &slot in slots {
@@ -542,7 +673,9 @@ fn scan_reuse(
             continue;
         };
         scanned += 1;
-        if let Some((score, path)) = score_entry(index, entry, prep, ctx, &mut scratch) {
+        if let Some((score, path)) =
+            score_entry(index, entry, prep, ctx, &mut dir_masks, &mut scratch)
+        {
             local.push(Candidate {
                 score,
                 path,
@@ -568,12 +701,13 @@ fn score_entry(
     entry: &Entry,
     prep: &Prepared,
     ctx: &RankContext,
+    dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<(i64, String)> {
     if prep.path_shaped {
         score_path_shaped(index, entry, &prep.segments, &prep.known, ctx, scratch)
     } else if prep.tokens.len() > 1 {
-        score_multi(index, entry, prep, ctx, scratch)
+        score_multi(index, entry, prep, ctx, dir_masks, scratch)
     } else {
         score_plain(
             index,
@@ -643,20 +777,25 @@ fn score_multi(
     entry: &Entry,
     prep: &Prepared,
     ctx: &RankContext,
+    dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<(i64, String)> {
+    // The direct token set is the flat needle prefix (offset 0); each corrected set follows at
+    // its recorded offset, so a per-set token position maps to a flat bit index.
     let (mut score, corrected_match) = if let Some(band) =
-        match_token_set(index, entry, &prep.tokens, &prep.root_lower, scratch)
+        match_token_set(index, entry, &prep.tokens, 0, prep, dir_masks, scratch)
     {
         (band, false)
     } else {
         let mut best: Option<i64> = None;
-        for set in &prep.corrected_tokens {
+        for (k, set) in prep.corrected_tokens.iter().enumerate() {
             // A corrected token of the other script never matches a same-script name or
             // path; `quality_match`/`contains_ci` reject that mismatch before any copy, so
             // this fallback stays cheap across a whole-index scan (e.g. a Cyrillic corrected
             // token over millions of ASCII names).
-            if let Some(band) = match_token_set(index, entry, set, &prep.root_lower, scratch) {
+            let offset = prep.corrected_offsets[k];
+            if let Some(band) = match_token_set(index, entry, set, offset, prep, dir_masks, scratch)
+            {
                 best = Some(best.map_or(band, |current| current.max(band)));
             }
         }
@@ -685,70 +824,66 @@ fn match_token_set(
     index: &IndexData,
     entry: &Entry,
     tokens: &[String],
-    root_lower: &[String],
+    offset: usize,
+    prep: &Prepared,
+    dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<i64> {
     let mut band = i64::MAX;
-    for token in tokens {
-        band = band.min(token_quality(index, entry, token, root_lower, scratch)?);
+    for (j, token) in tokens.iter().enumerate() {
+        // `offset + j` is this token's index in `Prepared::path_needles`, i.e. its bit in a
+        // dir mask.
+        band = band.min(token_quality(
+            index,
+            entry,
+            token,
+            offset + j,
+            prep,
+            dir_masks,
+            scratch,
+        )?);
     }
     (band != i64::MAX).then_some(band)
 }
 
 /// The quality of one token against one entry: its name-match tier when the token occurs in
-/// the name, else [`QUAL_PATH`] when the token occurs anywhere in the entry's path (an
-/// ancestor component or a root component), else `None`. The name is preferred because it is
-/// the stronger, higher band; the path is only consulted when the name does not match, so a
-/// full-index scan pays for the path walk only on entries whose name already missed.
+/// the name, else [`QUAL_PATH`] when the token occurs (case-insensitive) in some component of
+/// the entry's directory path — an ancestor component or a root component — else `None`. The
+/// name is preferred because it is the stronger, higher band; the path is only consulted when
+/// the name does not match, so a full-index scan pays for the path check only on entries whose
+/// name already missed.
+///
+/// `flat_index` is the token's index in [`Prepared::path_needles`]. When the mask cache is
+/// present the path check is one memoized `Vec` index plus one bit test (`mask & 1<<flat_index`);
+/// the `dir_masks == None` branch is the overflow fallback (>64 needles) — the same
+/// component-wise test done by an uncached ancestor walk plus the root components, not a second
+/// semantics.
 fn token_quality(
     index: &IndexData,
     entry: &Entry,
     token: &str,
-    root_lower: &[String],
+    flat_index: usize,
+    prep: &Prepared,
+    dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<i64> {
     if let Some(quality) = quality_match(&entry.name, token, scratch) {
         return Some(quality);
     }
-    // A plain token never contains `/` (a slash makes the whole query path-shaped, scored
-    // elsewhere), so it can only fall inside a single path component — checking components
-    // one by one is equivalent to substring-searching the joined path string, without
-    // rebuilding that string per entry (the walk stays allocation-free for ASCII names).
-    if ancestor_contains(index, entry.parent, token, scratch)
-        || root_lower.iter().any(|component| component.contains(token))
-    {
-        return Some(QUAL_PATH);
-    }
-    None
-}
-
-/// Whether `needle` occurs (case-insensitive substring) in any ancestor directory component
-/// name from `dir` up to the root. Allocation-free for ASCII component names.
-fn ancestor_contains(
-    index: &IndexData,
-    mut dir: DirId,
-    needle: &str,
-    scratch: &mut String,
-) -> bool {
-    while dir != 0 {
-        let node = &index.nodes[dir as usize];
-        if contains_ci(&node.name, needle, scratch) {
-            return true;
+    let in_path = match dir_masks {
+        Some(cache) => {
+            let mask = cache.mask_for(index, entry.parent, &prep.path_needles, scratch);
+            mask & (1u64 << flat_index) != 0
         }
-        dir = node.parent;
-    }
-    false
-}
-
-/// The lowercased `Normal` components of the index root (e.g. `["users", "kiri110k"]`), so a
-/// token may match the root prefix of the path string as well as the indexed components.
-fn root_components_lower(root: &Path) -> Vec<String> {
-    root.components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
-        .collect()
+        None => {
+            ancestor_contains(index, entry.parent, token, scratch)
+                || prep
+                    .root_lower
+                    .iter()
+                    .any(|component| component.contains(token))
+        }
+    };
+    in_path.then_some(QUAL_PATH)
 }
 
 /// Split a plain query on whitespace: runs of spaces collapse and leading/trailing space is
@@ -811,6 +946,38 @@ fn ancestors_match(index: &IndexData, parent: DirId, segments: &[String]) -> boo
         }
     }
     true
+}
+
+/// Whether `needle` occurs (case-insensitive substring) in any ancestor directory component
+/// name from `dir` up to the root. Allocation-free for ASCII component names. This is the
+/// overflow-fallback path check (>64 needles), used together with the root components in
+/// [`token_quality`]; the mask cache folds the same tests into a memoized per-dir bitmask.
+fn ancestor_contains(
+    index: &IndexData,
+    mut dir: DirId,
+    needle: &str,
+    scratch: &mut String,
+) -> bool {
+    while dir != 0 {
+        let node = &index.nodes[dir as usize];
+        if contains_ci(&node.name, needle, scratch) {
+            return true;
+        }
+        dir = node.parent;
+    }
+    false
+}
+
+/// The lowercased `Normal` components of the index root (e.g. `["users", "kiri110k"]`), so a
+/// token may match the root prefix of the path as well as the indexed components. Feeds
+/// `mask(0)` in the mask cache and the overflow-fallback check in [`token_quality`].
+fn root_components_lower(root: &Path) -> Vec<String> {
+    root.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Lowercased component names from the root down to (and including) `dir`.
