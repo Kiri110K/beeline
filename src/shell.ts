@@ -18,7 +18,7 @@ const unlistenSchema = z.custom<UnlistenFn>(
   (value) => typeof value === "function",
 );
 
-type ShellError =
+export type ShellError =
   | { code: "invalid-boundary-payload"; operation: string; cause: z.ZodError }
   | { code: "tauri-request-failed"; operation: string; cause: unknown };
 
@@ -39,7 +39,7 @@ function requestError(operation: string, cause: unknown): ShellError {
 
 // One wrapper for every crossing out of TypeScript: a rejected promise becomes a
 // Result error, and the resolved payload is parsed before it is trusted as `T`.
-function fromTauri<T>(
+export function fromTauri<T>(
   operation: string,
   schema: z.ZodType<T>,
   call: () => Promise<unknown>,

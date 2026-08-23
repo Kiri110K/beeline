@@ -1,3 +1,4 @@
+mod listing;
 mod telemetry;
 
 use std::{
@@ -14,6 +15,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
+use listing::list_location;
 use telemetry::Telemetry;
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -199,6 +201,14 @@ fn frontend_ready(app: AppHandle, state: State<'_, ShellState>) -> Result<(), St
 }
 
 #[tauri::command]
+fn home_directory(app: AppHandle) -> Result<String, String> {
+    app.path()
+        .home_dir()
+        .map(|home| home.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn telemetry_event(
     name: String,
     fields: Map<String, Value>,
@@ -224,7 +234,12 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![frontend_ready, telemetry_event])
+        .invoke_handler(tauri::generate_handler![
+            frontend_ready,
+            home_directory,
+            list_location,
+            telemetry_event
+        ])
         .setup(move |app| {
             let telemetry = Telemetry::new(&app.path().app_data_dir()?, process_started)?;
             telemetry.record(
