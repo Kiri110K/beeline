@@ -1,4 +1,0 @@
-{"event":"process_start","monotonic_ms":0.0011250000000000001,"pid":22412,"unix_ms":1787296388920.383}
-{"event":"backend_ready","log_path":"/Users/kiri110k/Library/Application Support/com.kiri.visual-files-tauri-benchmark/benchmark.ndjson","monotonic_ms":2.202917,"shortcut":"CommandOrControl+Shift+9","unix_ms":1787296388922.585}
-{"event":"frontend_ready","monotonic_ms":137.336875,"unix_ms":1787296389057.72}
-{"duration_ms":101.806333,"event":"recents_loaded","item_count":289,"monotonic_ms":239.6105,"unix_ms":1787296389159.995}

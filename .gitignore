@@ -1,7 +1,5 @@
 node_modules/
-target/
 dist/
-out/
-build/
-.build/
+target/
+*.log
 .DS_Store

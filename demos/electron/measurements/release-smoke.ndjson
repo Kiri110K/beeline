@@ -1,5 +1,0 @@
-{"event":"process_start","monotonicMs":0.285416,"wallTime":"2026-08-21T07:13:14.138Z","pid":22463,"electron":"37.10.3","chrome":"138.0.7204.251"}
-{"event":"shortcut_registration","monotonicMs":213.787541,"wallTime":"2026-08-21T07:13:14.351Z","pid":22463,"shortcut":"CommandOrControl+Shift+E","registered":true}
-{"event":"backend_ready","monotonicMs":214.037625,"wallTime":"2026-08-21T07:13:14.352Z","pid":22463,"shortcut":"CommandOrControl+Shift+E","shortcutRegistered":true,"logPath":"/Users/kiri110k/Library/Application Support/Visual Files Electron Demo/events.ndjson"}
-{"event":"frontend_ready","monotonicMs":422.196583,"wallTime":"2026-08-21T07:13:14.560Z","pid":22463}
-{"event":"recents_loaded","monotonicMs":518.885541,"wallTime":"2026-08-21T07:13:14.657Z","pid":22463,"durationMs":95.55679099999998,"itemCount":289}

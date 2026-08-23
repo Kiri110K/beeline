@@ -11,7 +11,7 @@ An implementer must not invent product behavior. Anything genuinely unspecified 
 - Host: Tauri v2. React (current version, React Compiler enabled) in the WKWebView owns the UI; Rust owns the filesystem, the Name Index, Spotlight queries, the Visit Journal, and system integration (ADR-0001, ADR-0002).
 - Small native macOS bridges are allowed where public Tauri APIs fall short. Expected candidates: an owned `QLPreviewPanel` for Quick Look, precise window activation, and (post-v1) iCloud placeholder state (ADR-0001).
 - Bundle id `com.kiri110k.beeline`. Beeline is the version-1 working name; the final name is decided before any public release (the bare name is crowded publicly — App Store, the Apache Hive `beeline` CLI, the RU telecom brand). UI language: English. Localization is a desired post-v1 addition, so do not hard-code strings in components.
-- The visual style of the selected mockup (`prototypes/navigation-search-preview/design-a-browser.html`) is the compositional reference, not final styling; a style rework is planned as the first post-v1 update.
+- The visual style of the selected mockup (`prototypes/navigation-search-preview/design-a-browser.html` at git tag `planning-end`; prototypes are deleted from the working tree) is the compositional reference, not final styling; a style rework is planned as the first post-v1 update.
 
 ## 2. Window and lifecycle
 
@@ -104,7 +104,7 @@ Three classes: **Instant** ≤50 ms (indicators forbidden), **Fast** ≤150 ms (
 - Below 150 ms nothing is indicated; no blocking overlays or modal waits exist. Any navigation or keystroke cancels in-flight work of the previous state; a stale result never overwrites newer state. One caching pattern: show cached instantly, revalidate in background, update in place without moving the focused row.
 - Slow storage (network volumes, undownloaded iCloud) is exempt from the numbers, not the rules: never block, in-place loading past 150 ms, leaving cancels, no hard timeouts.
 - Energy: the hidden resident does no periodic work (filesystem events only; idle CPU 0% is a requirement; Activity Monitor energy impact negligible). Heavy work runs at background QoS. On battery, lazy Junk rescans defer until power or a targeting query; the one-time initial crawl runs regardless.
-- Verification: production carries local NDJSON telemetry (same shape as the demo). Budgets are checked on the reference machine; no CI perf rig. Before acceptance, measure what #7 could not: large-list render, sustained scroll, activation across Spaces and full-screen, per-show focus confirmation, icon and preview costs, post-reboot start. Framework parity evidence: `prototypes/framework-bench/` (ADR-0002).
+- Verification: production carries local NDJSON telemetry (same shape as the demo). Budgets are checked on the reference machine; no CI perf rig. Before acceptance, measure what #7 could not: large-list render, sustained scroll, activation across Spaces and full-screen, per-show focus confirmation, icon and preview costs, post-reboot start. Framework parity evidence: `prototypes/framework-bench/` at git tag `planning-end` (ADR-0002).
 
 ## 11. Persistence inventory
 
