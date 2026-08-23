@@ -23,7 +23,9 @@ use std::{
 use crate::name_index::model::{DirNode, Entry, IndexData, Tier, NO_DIR};
 
 const MAGIC: &[u8; 4] = b"BLNI";
-const VERSION: u32 = 1;
+/// v1 files are bloated with duplicate subtree entries from the FSEvents reconcile bug
+/// (each dir event re-added the whole subtree); rejecting them forces one clean full crawl.
+const VERSION: u32 = 2;
 
 fn put_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_le_bytes());

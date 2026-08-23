@@ -11,7 +11,7 @@
 //!   simple.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -188,6 +188,11 @@ pub fn initial_crawl(
 /// Index a subtree rooted at an already-existing directory node, operating directly on
 /// a borrowed [`IndexData`] (used by the incremental apply, which is already inside a
 /// single directory's fs read). Single-phase: Junk is indexed inline.
+///
+/// Invariant: `dir_id` must be a freshly created, empty directory node. Every file is
+/// added with an unchecked `add_file`, so running this over an already-populated
+/// directory duplicates its whole subtree. An FSEvent on an existing dir reconciles
+/// direct children instead (see [`reconcile_dir_children`]).
 fn index_subtree_into(data: &mut IndexData, dir_id: DirId, path: &Path, junk: &JunkPatterns) {
     let root = data.root.clone();
     for child in read_children(path, &root, junk) {
@@ -232,8 +237,19 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.is_dir() {
-                let id = data.add_dir(parent, &name, tier, mtime_ms(&metadata));
-                index_subtree_into(data, id, path, junk);
+                // FSEvents on a dir means its direct children changed. Reconcile an
+                // already-indexed dir in place; re-running index_subtree_into (unchecked
+                // add_file) would duplicate the whole subtree on every event.
+                let existing = data.nodes[parent as usize]
+                    .child_dirs
+                    .get(name.as_str())
+                    .copied();
+                if let Some(dir_id) = existing {
+                    reconcile_dir_children(data, dir_id, path, mtime_ms(&metadata), junk);
+                } else {
+                    let id = data.add_dir(parent, &name, tier, mtime_ms(&metadata));
+                    index_subtree_into(data, id, path, junk);
+                }
             } else if !data.has_child(parent, &name) {
                 data.add_file(parent, &name, tier);
             }
@@ -242,6 +258,65 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
             data.remove_child(parent, &name);
         }
     }
+}
+
+/// Reconcile one already-indexed directory's DIRECT children against disk, in place on a
+/// borrowed [`IndexData`]. Scope is direct children only: an FSEvent on a directory means
+/// its own children changed, and deeper changes arrive as their own events. Index children
+/// gone from disk are removed; disk children missing from the index are added (a fresh
+/// subdir's subtree is genuinely new, so it is crawled via [`index_subtree_into`]); the
+/// stored mtime is refreshed.
+fn reconcile_dir_children(
+    data: &mut IndexData,
+    dir_id: DirId,
+    path: &Path,
+    mtime: i64,
+    junk: &JunkPatterns,
+) {
+    let root = data.root.clone();
+    let disk = read_children(path, &root, junk);
+    let on_disk: HashSet<&str> = disk.iter().map(|child| child.name.as_str()).collect();
+
+    // Drop index children no longer present on disk.
+    let indexed: Vec<String> = data.nodes[dir_id as usize]
+        .entries
+        .iter()
+        .filter_map(|&index| {
+            data.entries[index as usize]
+                .as_ref()
+                .map(|entry| entry.name.to_string())
+        })
+        .collect();
+    for name in &indexed {
+        if !on_disk.contains(name.as_str()) {
+            data.remove_child(dir_id, name);
+        }
+    }
+
+    // Add disk children absent from the post-removal index. A HashSet gives O(1)
+    // membership instead of an O(children) `has_child` probe per candidate.
+    let known: HashSet<String> = data.nodes[dir_id as usize]
+        .entries
+        .iter()
+        .filter_map(|&index| {
+            data.entries[index as usize]
+                .as_ref()
+                .map(|entry| entry.name.to_string())
+        })
+        .collect();
+    for child in disk {
+        if known.contains(&child.name) {
+            continue;
+        }
+        if child.is_dir {
+            let id = data.add_dir(dir_id, &child.name, child.tier, child.mtime);
+            index_subtree_into(data, id, &child.path, junk);
+        } else {
+            data.add_file(dir_id, &child.name, child.tier);
+        }
+    }
+
+    data.nodes[dir_id as usize].mtime_ms = mtime;
 }
 
 /// Reconcile one directory's direct children with disk: add appeared items, remove

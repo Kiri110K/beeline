@@ -63,11 +63,24 @@ impl JunkPatterns {
     }
 }
 
-/// The built-in v1 Junk names (SPEC §6). `Caches` covers `~/Library/Caches`. This is the
+/// Junk names added in seed version 2: macOS `~/Library` noise (per-app Containers,
+/// Application Support, Logs, saved window state) that otherwise ranks as `normal` beside
+/// user files. Held as a named list so the settings migration adds exactly these to
+/// existing installs, without re-adding v1 names a user may have deliberately deleted
+/// (SPEC §12).
+pub(crate) const V2_SEED_NAMES: [&str; 5] = [
+    "Containers",
+    "Group Containers",
+    "Application Support",
+    "Logs",
+    "Saved Application State",
+];
+
+/// The built-in Junk names (SPEC §6). `Caches` covers `~/Library/Caches`. This is the
 /// single source of the seed list: [`JunkPatterns::default`] uses it, and the settings store
 /// seeds a fresh install's editable list from it (SPEC §12), so the two never drift.
 pub(crate) fn default_names() -> Vec<String> {
-    [
+    let mut names: Vec<String> = [
         "node_modules",
         ".git",
         "target",
@@ -80,7 +93,9 @@ pub(crate) fn default_names() -> Vec<String> {
     ]
     .iter()
     .map(|name| (*name).to_owned())
-    .collect()
+    .collect();
+    names.extend(V2_SEED_NAMES.iter().map(|name| (*name).to_owned()));
+    names
 }
 
 impl Default for JunkPatterns {

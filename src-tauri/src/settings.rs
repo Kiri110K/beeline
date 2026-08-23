@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 const FILE_NAME: &str = "settings.json";
+/// Current Junk seed version. Bumped when new builtin Junk names ship so existing installs
+/// pick them up via [`migrate_junk_seed`] instead of only fresh installs (SPEC §12).
+const CURRENT_JUNK_SEED_VERSION: u32 = 2;
 /// The legacy Alias Dictionary file (SPEC §6), absorbed into the settings store on the
 /// first launch that has no settings file yet.
 const LEGACY_ALIASES_FILE: &str = "aliases.json";
@@ -90,6 +93,10 @@ pub struct AppSettings {
     pub aliases: Vec<AliasEntry>,
     /// Junk pattern list (SPEC §6). Feeds the Name Index classifier.
     pub junk_patterns: Vec<String>,
+    /// Seed version behind `junk_patterns`. A file predating a builtin bump has no field, so
+    /// it reads as `0` and the load migrates in the missing builtins (SPEC §12).
+    #[serde(default)]
+    pub junk_seed_version: u32,
     /// Whether the one-time first-run guidance has been dismissed (SPEC §13). Internal
     /// persistence, not a user setting — never rendered in the Settings UI.
     pub first_run_dismissed: bool,
@@ -109,6 +116,7 @@ impl Default for AppSettings {
             editor_bundle_id: None,
             aliases: Vec::new(),
             junk_patterns: crate::name_index::builtin_junk_names(),
+            junk_seed_version: CURRENT_JUNK_SEED_VERSION,
             first_run_dismissed: false,
         }
     }
@@ -185,13 +193,35 @@ pub fn read(app_data_dir: &Path) -> (AppSettings, bool) {
             return (AppSettings::default(), true);
         }
     };
-    match serde_json::from_str(&text) {
-        Ok(settings) => (settings, true),
+    match serde_json::from_str::<AppSettings>(&text) {
+        Ok(mut settings) => {
+            migrate_junk_seed(&mut settings);
+            (settings, true)
+        }
         Err(error) => {
             eprintln!("settings file is corrupt, ignoring: {error}");
             (AppSettings::default(), true)
         }
     }
+}
+
+/// Bring a loaded settings' Junk list up to the current seed version: union in any new
+/// builtin names it is missing, then stamp the version. Runs only when the stored version
+/// predates the current one, so user edits to other entries — including v1 builtins a user
+/// deleted — survive, and a new name already present is never duplicated (SPEC §12).
+fn migrate_junk_seed(settings: &mut AppSettings) {
+    if settings.junk_seed_version >= CURRENT_JUNK_SEED_VERSION {
+        return;
+    }
+    let existing: std::collections::HashSet<&str> =
+        settings.junk_patterns.iter().map(String::as_str).collect();
+    let additions: Vec<String> = crate::name_index::junk_seed_v2_names()
+        .into_iter()
+        .filter(|name| !existing.contains(name.as_str()))
+        .collect();
+    drop(existing);
+    settings.junk_patterns.extend(additions);
+    settings.junk_seed_version = CURRENT_JUNK_SEED_VERSION;
 }
 
 /// Read the legacy `aliases.json` (a flat `{ "word": "path" }` object) into settings-shaped
@@ -289,6 +319,47 @@ mod tests {
         let (loaded, existed) = read(&dir);
         assert!(existed);
         assert_eq!(loaded, settings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn junk_seed_migration_adds_new_builtins_once() {
+        let dir =
+            std::env::temp_dir().join(format!("beeline_settings_junk_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // An old file: no junkSeedVersion field, a custom entry, and one new v2 name already
+        // present (which must not be duplicated). Other fields fill from defaults.
+        fs::write(
+            dir.join(FILE_NAME),
+            r#"{"junkPatterns":["node_modules","my_custom","Logs"]}"#.as_bytes(),
+        )
+        .unwrap();
+
+        let (settings, existed) = read(&dir);
+        assert!(existed);
+        assert_eq!(settings.junk_seed_version, CURRENT_JUNK_SEED_VERSION);
+        // User/custom entries survive the migration.
+        assert!(settings
+            .junk_patterns
+            .iter()
+            .any(|name| name == "my_custom"));
+        assert!(settings
+            .junk_patterns
+            .iter()
+            .any(|name| name == "node_modules"));
+        // Every v2 builtin is present exactly once, including the pre-existing "Logs".
+        for name in crate::name_index::junk_seed_v2_names() {
+            assert_eq!(
+                settings
+                    .junk_patterns
+                    .iter()
+                    .filter(|entry| entry.as_str() == name.as_str())
+                    .count(),
+                1,
+                "expected exactly one {name}"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

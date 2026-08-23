@@ -217,6 +217,35 @@ function isEditableTarget(target: EventTarget | null): boolean {
   );
 }
 
+// The app-level Cmd shortcuts that stay live while an editable target (the search input)
+// has focus: tab management and app navigation. Editing combos (Cmd+C/V/X/A/Z, Cmd+Delete)
+// are deliberately absent so they keep reaching the input's own text handling.
+function isEditablePassThroughShortcut(event: KeyboardEvent): boolean {
+  if (!event.metaKey) {
+    return false;
+  }
+  const digit = Number.parseInt(event.key, 10);
+  if (!Number.isNaN(digit) && digit >= 1 && digit <= 9) {
+    return true; // Cmd+1–8: activate tab N; Cmd+9: the last tab.
+  }
+  switch (event.key) {
+    case "t":
+    case "T": // Cmd+T: new Temporary Tab.
+    case "w":
+    case "W": // Cmd+W: close active tab.
+    case "k":
+    case "K": // Cmd+K: Action Menu.
+    case "l":
+    case "L": // Cmd+L: select the retained query (no editing meaning in an input).
+    case "[": // Cmd+[: back.
+    case "]": // Cmd+]: forward.
+    case ",": // Cmd+,: Settings.
+      return true;
+    default:
+      return false;
+  }
+}
+
 function tabById(state: TabsState, id: TabId): Tab | undefined {
   return state.tabs.find((tab) => tab.id === id);
 }
@@ -2186,7 +2215,13 @@ export function useTabs(
         return;
       }
 
-      if (isEditableTarget(event.target)) {
+      // In an editable target (the search input) only the allowlisted app shortcuts are
+      // intercepted; every other key — plain text, arrows, and editing combos like
+      // Cmd+C/V/X/A/Z and Cmd+Delete — falls through to the input untouched.
+      if (
+        isEditableTarget(event.target) &&
+        !isEditablePassThroughShortcut(event)
+      ) {
         return;
       }
 

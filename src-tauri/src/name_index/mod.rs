@@ -46,6 +46,15 @@ pub(crate) fn builtin_junk_names() -> Vec<String> {
     junk::default_names()
 }
 
+/// The Junk names introduced in seed version 2, applied to existing installs by the
+/// settings migration (SPEC §12) so they gain the new builtins without losing user edits.
+pub(crate) fn junk_seed_v2_names() -> Vec<String> {
+    junk::V2_SEED_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
 /// A swappable Junk-patterns handle. Search, the watcher, and the Junk drain each take a
 /// cheap snapshot (`.read().clone()`); `apply_settings` swaps the inner `Arc` so a Settings
 /// change reaches every future classification without re-crawling (Junk refreshes lazily,
@@ -538,6 +547,72 @@ mod tests {
             crawl::apply_fs_event(&mut index, &added, &junk);
         }
         assert_eq!(tier_of(&shared, "added.txt"), None);
+    }
+
+    #[test]
+    fn dir_event_on_existing_dir_does_not_duplicate() {
+        // Regression: a directory FSEvent must reconcile direct children, not re-index the
+        // subtree — two events on an unchanged dir leave the entry count untouched.
+        let dir = TempDir::new();
+        touch(&dir.path().join("sub/a.txt"));
+        touch(&dir.path().join("sub/b.txt"));
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+        let baseline = shared.read().unwrap().len();
+
+        let subdir = dir.path().join("sub");
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &subdir, &junk);
+            crawl::apply_fs_event(&mut index, &subdir, &junk);
+        }
+        assert_eq!(shared.read().unwrap().len(), baseline);
+    }
+
+    #[test]
+    fn dir_event_indexes_only_the_added_file() {
+        // A file that appears on disk between two events yields exactly one new entry.
+        let dir = TempDir::new();
+        touch(&dir.path().join("sub/a.txt"));
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+        let baseline = shared.read().unwrap().len();
+
+        let subdir = dir.path().join("sub");
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &subdir, &junk);
+        }
+        touch(&subdir.join("c.txt"));
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &subdir, &junk);
+        }
+        assert_eq!(shared.read().unwrap().len(), baseline + 1);
+        assert_eq!(tier_of(&shared, "c.txt"), Some("normal"));
+    }
+
+    #[test]
+    fn dir_event_removes_the_deleted_file() {
+        // A file deleted on disk loses its entry on the next event over its parent dir.
+        let dir = TempDir::new();
+        touch(&dir.path().join("sub/a.txt"));
+        touch(&dir.path().join("sub/b.txt"));
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+        let baseline = shared.read().unwrap().len();
+
+        let subdir = dir.path().join("sub");
+        fs::remove_file(subdir.join("a.txt")).unwrap();
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &subdir, &junk);
+        }
+        assert_eq!(shared.read().unwrap().len(), baseline - 1);
+        assert_eq!(tier_of(&shared, "a.txt"), None);
     }
 
     #[test]
