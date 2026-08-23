@@ -119,13 +119,26 @@ trait TrashBin {
     fn trash(&self, path: &Path) -> Result<(), String>;
 }
 
-/// The real Trash adapter over the `trash` crate.
+/// The real Trash adapter over the `trash` crate. On macOS the crate's default
+/// delete method drives Finder via AppleScript, which needs an Apple-Events TCC
+/// grant and hangs the whole batch while the permission dialog waits (observed
+/// live: "Moving to Trash 0/1" stuck behind a queued TCC prompt). NSFileManager's
+/// trashItemAtURL needs no permission and no Finder; the trade-off — Finder may
+/// not offer automatic "Put Back" for these items — is recorded on ticket #28.
 struct SystemTrash;
 
 impl TrashBin for SystemTrash {
     fn trash(&self, path: &Path) -> Result<(), String> {
-        trash::delete(path)
-            .map_err(|error| format!("Could not move to Trash: {} ({error})", path.display()))
+        #[cfg(target_os = "macos")]
+        let result = {
+            use trash::macos::{DeleteMethod, TrashContextExtMacos};
+            let mut context = trash::TrashContext::default();
+            context.set_delete_method(DeleteMethod::NsFileManager);
+            context.delete(path)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = trash::delete(path);
+        result.map_err(|error| format!("Could not move to Trash: {} ({error})", path.display()))
     }
 }
 

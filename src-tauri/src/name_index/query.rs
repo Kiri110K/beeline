@@ -65,6 +65,10 @@ const QUAL_EXACT: i64 = 5 * Q;
 const QUAL_PREFIX: i64 = 4 * Q;
 /// The query occurs inside the name.
 const QUAL_SUBSTRING: i64 = 2 * Q;
+/// A token of a multi-token query found only in the entry's *path* (not its name). One full
+/// band below the weakest name match, so an all-tokens-in-name hit always outranks a hit
+/// where any token only appears in the path (SPEC §6 token contract, part 3).
+const QUAL_PATH: i64 = Q;
 
 /// An existing absolute path typed as the query ranks its target first (guarantee a).
 const EXISTING_PATH: i64 = 100 * Q;
@@ -215,7 +219,20 @@ struct Prepared {
     query_lower: String,
     path_shaped: bool,
     segments: Vec<String>,
+    /// Whole-query layout-corrected variants (a plain query). For a single-token query these
+    /// are the needles [`score_plain`] falls back to; for a multi-token query they are only
+    /// the source of [`Prepared::corrected_tokens`].
     corrected: Vec<String>,
+    /// The plain query split on whitespace (SPEC §6 token contract). One element is a
+    /// single-token query (scored byte-identically to before tokenization); two or more is a
+    /// multi-token AND query. Empty for a path-shaped query (slashes stay literal).
+    tokens: Vec<String>,
+    /// Each layout-corrected variant, tokenized the same way — populated only for a
+    /// multi-token query. Space maps to space, so a variant carries the same token count.
+    corrected_tokens: Vec<Vec<String>>,
+    /// Lowercased components of the index root, so a token may match the whole path string
+    /// (the root prefix included) without reconstructing it — populated only for multi-token.
+    root_lower: Vec<String>,
     known: HashSet<PathBuf>,
 }
 
@@ -235,11 +252,32 @@ impl Prepared {
         } else {
             layout_variants(query_lower)
         };
+        // A plain query tokenizes on whitespace; a path-shaped one keeps spaces literal
+        // (paths can contain spaces), so it is never tokenized.
+        let tokens = if path_shaped {
+            Vec::new()
+        } else {
+            tokenize(query_lower)
+        };
+        let multi = tokens.len() > 1;
+        let corrected_tokens = if multi {
+            corrected.iter().map(|variant| tokenize(variant)).collect()
+        } else {
+            Vec::new()
+        };
+        let root_lower = if multi {
+            root_components_lower(&index.root)
+        } else {
+            Vec::new()
+        };
         Self {
             query_lower: query_lower.to_owned(),
             path_shaped,
             segments,
             corrected,
+            tokens,
+            corrected_tokens,
+            root_lower,
             known,
         }
     }
@@ -534,6 +572,8 @@ fn score_entry(
 ) -> Option<(i64, String)> {
     if prep.path_shaped {
         score_path_shaped(index, entry, &prep.segments, &prep.known, ctx, scratch)
+    } else if prep.tokens.len() > 1 {
+        score_multi(index, entry, prep, ctx, scratch)
     } else {
         score_plain(
             index,
@@ -589,6 +629,133 @@ fn score_plain(
         score += KNOWN_PLACE_BOOST;
     }
     Some((score, path_str))
+}
+
+/// Score a multi-token plain query against one entry (SPEC §6 token contract): the entry
+/// matches only if EVERY token matches it independently, on the name (prefix/substring/exact,
+/// exactly the single-needle tiers) or, weaker, anywhere in its path. The hit's quality band
+/// is the MINIMUM per-token quality — so a hit where all tokens land in the name outranks one
+/// where a token only appears in the path. Structure mirrors [`score_plain`]: the direct
+/// token set is tried first and, only if it does not match, the layout-corrected token sets
+/// (with the same [`CORRECTION_PENALTY`]). Tokens need not be adjacent and order is irrelevant.
+fn score_multi(
+    index: &IndexData,
+    entry: &Entry,
+    prep: &Prepared,
+    ctx: &RankContext,
+    scratch: &mut String,
+) -> Option<(i64, String)> {
+    let (mut score, corrected_match) = if let Some(band) =
+        match_token_set(index, entry, &prep.tokens, &prep.root_lower, scratch)
+    {
+        (band, false)
+    } else {
+        let mut best: Option<i64> = None;
+        for set in &prep.corrected_tokens {
+            // A corrected token of the other script never matches a same-script name or
+            // path; `quality_match`/`contains_ci` reject that mismatch before any copy, so
+            // this fallback stays cheap across a whole-index scan (e.g. a Cyrillic corrected
+            // token over millions of ASCII names).
+            if let Some(band) = match_token_set(index, entry, set, &prep.root_lower, scratch) {
+                best = Some(best.map_or(band, |current| current.max(band)));
+            }
+        }
+        (best?, true)
+    };
+
+    if corrected_match {
+        score -= CORRECTION_PENALTY;
+    }
+    score -= tier_penalty(entry.tier);
+
+    let path = index.entry_path(entry);
+    let path_str = path.to_string_lossy().into_owned();
+    score += ctx.journal.boost(&path_str);
+    if prep.known.contains(&path) {
+        score += KNOWN_PLACE_BOOST;
+    }
+    Some((score, path_str))
+}
+
+/// The quality band of an entry against a whole token set: the minimum per-token quality, or
+/// `None` if any token matches neither the name nor the path (the AND fails). Token sets are
+/// never empty (a multi-token query has ≥2 tokens, and a corrected variant preserves the
+/// count), so `None` here always means an unmatched token, not an empty set.
+fn match_token_set(
+    index: &IndexData,
+    entry: &Entry,
+    tokens: &[String],
+    root_lower: &[String],
+    scratch: &mut String,
+) -> Option<i64> {
+    let mut band = i64::MAX;
+    for token in tokens {
+        band = band.min(token_quality(index, entry, token, root_lower, scratch)?);
+    }
+    (band != i64::MAX).then_some(band)
+}
+
+/// The quality of one token against one entry: its name-match tier when the token occurs in
+/// the name, else [`QUAL_PATH`] when the token occurs anywhere in the entry's path (an
+/// ancestor component or a root component), else `None`. The name is preferred because it is
+/// the stronger, higher band; the path is only consulted when the name does not match, so a
+/// full-index scan pays for the path walk only on entries whose name already missed.
+fn token_quality(
+    index: &IndexData,
+    entry: &Entry,
+    token: &str,
+    root_lower: &[String],
+    scratch: &mut String,
+) -> Option<i64> {
+    if let Some(quality) = quality_match(&entry.name, token, scratch) {
+        return Some(quality);
+    }
+    // A plain token never contains `/` (a slash makes the whole query path-shaped, scored
+    // elsewhere), so it can only fall inside a single path component — checking components
+    // one by one is equivalent to substring-searching the joined path string, without
+    // rebuilding that string per entry (the walk stays allocation-free for ASCII names).
+    if ancestor_contains(index, entry.parent, token, scratch)
+        || root_lower.iter().any(|component| component.contains(token))
+    {
+        return Some(QUAL_PATH);
+    }
+    None
+}
+
+/// Whether `needle` occurs (case-insensitive substring) in any ancestor directory component
+/// name from `dir` up to the root. Allocation-free for ASCII component names.
+fn ancestor_contains(
+    index: &IndexData,
+    mut dir: DirId,
+    needle: &str,
+    scratch: &mut String,
+) -> bool {
+    while dir != 0 {
+        let node = &index.nodes[dir as usize];
+        if contains_ci(&node.name, needle, scratch) {
+            return true;
+        }
+        dir = node.parent;
+    }
+    false
+}
+
+/// The lowercased `Normal` components of the index root (e.g. `["users", "kiri110k"]`), so a
+/// token may match the root prefix of the path string as well as the indexed components.
+fn root_components_lower(root: &Path) -> Vec<String> {
+    root.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Split a plain query on whitespace: runs of spaces collapse and leading/trailing space is
+/// trimmed (SPEC §6 token contract, part 1). A query with no interior whitespace yields a
+/// single token equal to the query itself, so single-token search is unchanged.
+fn tokenize(query_lower: &str) -> Vec<String> {
+    query_lower.split_whitespace().map(str::to_owned).collect()
 }
 
 /// Score a path-shaped query. The last segment matches the entry name; any preceding
@@ -666,6 +833,13 @@ fn quality_match(name: &str, needle: &str, scratch: &mut String) -> Option<i64> 
     if name.is_ascii() && needle.is_ascii() {
         return quality_ascii(name.as_bytes(), needle.as_bytes());
     }
+    // A non-ASCII needle (e.g. a layout-corrected Cyrillic token) can never occur in an
+    // ASCII name, so reject before copying the name into `scratch`. This is what keeps the
+    // corrected-token fallback of a multi-token scan cheap across a whole-index scan of
+    // ASCII names (the same short-circuit `score_plain` applies inline before its loop).
+    if !needle.is_ascii() && name.is_ascii() {
+        return None;
+    }
     lower_into(name, scratch);
     quality_of(scratch, needle)
 }
@@ -706,6 +880,34 @@ fn quality_ascii(name: &[u8], needle: &[u8]) -> Option<i64> {
 /// Whether two equal-length ASCII byte slices are equal ignoring case.
 fn ascii_ci_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Whether the already-lowercased `needle` occurs in `haystack`, case-insensitively. Like
+/// [`quality_match`] it takes an allocation-free ASCII byte path (the common case for path
+/// components) and only Unicode-lowercases into `scratch` for a non-ASCII haystack.
+fn contains_ci(haystack: &str, needle: &str, scratch: &mut String) -> bool {
+    if haystack.is_ascii() && needle.is_ascii() {
+        return ascii_contains_ci(haystack.as_bytes(), needle.as_bytes());
+    }
+    // A non-ASCII needle can never occur in an ASCII haystack — skip before touching scratch.
+    if !needle.is_ascii() && haystack.is_ascii() {
+        return false;
+    }
+    lower_into(haystack, scratch);
+    scratch.contains(needle)
+}
+
+/// Case-insensitive ASCII substring test of `needle` (already lowercase) in `haystack` bytes.
+fn ascii_contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| ascii_ci_eq(window, needle))
 }
 
 fn tier_penalty(tier: Tier) -> i64 {
@@ -1111,6 +1313,91 @@ mod tests {
         let reused = super::run(&index, &ctx, "cat", 50, Some(&base.candidate_entries), None);
         assert_eq!(reused.hits, full.hits);
         assert!(reused.hits.iter().any(|hit| hit.name == "сфе.txt"));
+    }
+
+    #[test]
+    fn multi_token_finds_separator_joined_name() {
+        // The #26 repro: a space-separated query finds a name whose words are joined by a
+        // separator (here `_`), and ranks it above a hit where a token only matches the path.
+        let mut index = index();
+        let work = index.add_dir(0, "work", Tier::Normal, 0);
+        let vault = index.add_dir(work, "vault", Tier::Normal, 0);
+        let reports = index.add_dir(vault, "reports", Tier::Normal, 0);
+        // Target: both tokens occur in the name (band = substring quality).
+        index.add_file(reports, "ПМИ_процедура_приемки.html", Tier::Normal);
+        // Decoy A: "процедура" in the name, "приемки" only in an ancestor dir (weaker band).
+        let priemki = index.add_dir(work, "приемки", Tier::Normal, 0);
+        index.add_file(priemki, "процедура.txt", Tier::Normal);
+        // Decoy B: only one of the two tokens occurs anywhere — the AND excludes it.
+        index.add_file(work, "процедура_отчет.txt", Tier::Normal);
+
+        let hits = run(&index, "процедура приемки");
+        assert_eq!(hits[0].name, "ПМИ_процедура_приемки.html");
+        assert!(hits.iter().any(|hit| hit.name == "процедура.txt")); // present, ranked lower
+        assert!(!hits.iter().any(|hit| hit.name == "процедура_отчет.txt")); // one token: excluded
+    }
+
+    #[test]
+    fn multi_token_finds_via_wrong_layout() {
+        // The same query typed on the EN layout (physical keys of «процедура приемки») still
+        // finds the target, corrected whole-query-then-tokenized (space maps to space).
+        let mut index = index();
+        let reports = index.add_dir(0, "reports", Tier::Normal, 0);
+        index.add_file(reports, "ПМИ_процедура_приемки.html", Tier::Normal);
+
+        let typed = map_layout("процедура приемки", false); // RU letters → the EN keys under them
+        assert!(typed.is_ascii() && typed.contains(' '));
+        let hits = run(&index, &typed);
+        assert_eq!(hits[0].name, "ПМИ_процедура_приемки.html");
+    }
+
+    #[test]
+    fn multi_token_one_token_matches_path_only() {
+        // A token that never occurs in the name still matches through the path (an ancestor
+        // directory), while the other token matches the name.
+        let mut index = index();
+        let invoices = index.add_dir(0, "invoices", Tier::Normal, 0);
+        index.add_file(invoices, "report_2024.txt", Tier::Normal);
+
+        let hits = run(&index, "invoices report");
+        assert!(hits.iter().any(|hit| hit.name == "report_2024.txt"));
+    }
+
+    #[test]
+    fn multi_token_order_is_irrelevant() {
+        let mut index = index();
+        let invoices = index.add_dir(0, "invoices", Tier::Normal, 0);
+        index.add_file(invoices, "report_2024.txt", Tier::Normal);
+
+        assert_eq!(
+            run(&index, "invoices report"),
+            run(&index, "report invoices")
+        );
+    }
+
+    #[test]
+    fn multi_token_finds_real_spaced_name_and_separator_variant() {
+        // A file whose name really contains a space is still found by its spaced substring,
+        // and the same query now also finds the underscore-joined variant (the #26 fix).
+        let mut index = index();
+        index.add_file(0, "annual report final.pdf", Tier::Normal);
+        index.add_file(0, "annual_report_draft.pdf", Tier::Normal);
+
+        let hits = run(&index, "annual report");
+        assert!(hits.iter().any(|hit| hit.name == "annual report final.pdf"));
+        assert!(hits.iter().any(|hit| hit.name == "annual_report_draft.pdf"));
+    }
+
+    #[test]
+    fn single_token_scoring_is_unchanged_by_tokenization() {
+        // A one-word query has exactly one token and must route through the untouched plain
+        // scorer: prefix before substring, shorter path first — byte-identical to before.
+        let mut index = index();
+        index.add_file(0, "report.txt", Tier::Normal);
+        index.add_file(0, "annual-report.txt", Tier::Normal);
+        let hits = run(&index, "report");
+        assert_eq!(hits[0].name, "report.txt"); // prefix beats substring
+        assert_eq!(hits[1].name, "annual-report.txt");
     }
 
     #[test]

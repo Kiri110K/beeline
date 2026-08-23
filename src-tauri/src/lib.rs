@@ -235,6 +235,7 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
     window
         .show()
         .map_err(|error| format!("failed to show main window: {error}"))?;
+    activate_app(app);
     window
         .set_focus()
         .map_err(|error| format!("failed to focus main window: {error}"))?;
@@ -261,6 +262,54 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
             },
         )
         .map_err(|error| format!("failed to emit window shown event: {error}"))
+}
+
+// The single window must appear on whatever Space the user is on, including over
+// another app's full-screen Space (observed live: activation succeeded — menu bar
+// switched — while the window stayed on the desktop Space). The launcher pattern:
+// join all Spaces and allow display over full screen (§10 lists activation across
+// Spaces and full-screen as required behavior).
+fn install_space_behavior(window: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSWindowCollectionBehavior;
+        if let Ok(ns_window_ptr) = window.ns_window() {
+            // SAFETY: tauri hands back the live NSWindow pointer for this window; we
+            // only set its collection behavior on the main thread (setup runs there).
+            let ns_window = unsafe { &*ns_window_ptr.cast::<objc2_app_kit::NSWindow>() };
+            ns_window.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+}
+
+// An Accessory app that has never been active does not come frontmost from
+// `set_focus` alone (observed live: window visible, `focused:false`, another app
+// still frontmost). Activate NSApplication explicitly on the main thread — the
+// "precise window activation" bridge ADR-0001 anticipated.
+fn activate_app(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.run_on_main_thread({
+            let app = app.clone();
+            move || {
+                let Some(marker) = objc2_foundation::MainThreadMarker::new() else {
+                    return;
+                };
+                let ns_app = objc2_app_kit::NSApplication::sharedApplication(marker);
+                #[allow(deprecated)] // activate() defers to the system; ignoringOtherApps
+                // is what a user-initiated global shortcut wants.
+                ns_app.activateIgnoringOtherApps(true);
+                let _ = app;
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 // The single hide path: stamp the background clock, hide, and record telemetry.
@@ -485,6 +534,37 @@ pub fn run() {
             trash_items
         ])
         .setup(move |app| {
+            // Replace tauri's default macOS menu with a minimal one. The default File >
+            // Close Window swallowed Cmd+W before the webview (observed live: Cmd+W hid
+            // the window through CloseRequested instead of closing the Tab, §4). Removing
+            // the menu entirely is worse: a menu-less app can never own the menu bar, so
+            // macOS refuses to make it the active application (observed live too). So:
+            // an app submenu whose Quit has NO accelerator (a hidden resident must not
+            // die to a stray Cmd+Q; Quit lives in the Action Menu, §5/§12) plus a
+            // standard Edit submenu so text-field Cmd+C/V/A stay reliable on any layout.
+            {
+                use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+                let quit = MenuItemBuilder::with_id("quit", "Quit Beeline").build(app)?;
+                let app_submenu = SubmenuBuilder::new(app, "Beeline").item(&quit).build()?;
+                let edit = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
+                let menu = MenuBuilder::new(app)
+                    .items(&[&app_submenu, &edit])
+                    .build()?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    if event.id() == "quit" {
+                        app.exit(0);
+                    }
+                });
+            }
             let telemetry = Telemetry::new(&app.path().app_data_dir()?, process_started)?;
             telemetry.record(
                 "process_start",
@@ -503,6 +583,7 @@ pub fn run() {
                 .get_webview_window(MAIN_WINDOW_LABEL)
                 .ok_or("main window is missing")?;
             install_center_snap(&window);
+            install_space_behavior(&window);
             install_close_to_hide(&window);
 
             // Register the global shortcut from the persisted settings (SPEC §2, §12). The
@@ -554,11 +635,22 @@ pub fn run() {
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
     app.run(|app_handle, event| {
-        // Persist the Name Index on graceful shutdown (never periodically, §11).
-        if let tauri::RunEvent::Exit = event {
-            if let Some(name_index) = app_handle.try_state::<NameIndex>() {
-                name_index.persist();
+        match event {
+            // Persist the Name Index on graceful shutdown (never periodically, §11).
+            tauri::RunEvent::Exit => {
+                if let Some(name_index) = app_handle.try_state::<NameIndex>() {
+                    name_index.persist();
+                }
             }
+            // Opening the app again (Finder, `open`, Dock) reopens the hidden
+            // resident: show and focus the single window (§2).
+            tauri::RunEvent::Reopen { .. } => {
+                let state = app_handle.state::<ShellState>();
+                if let Err(error) = show_and_focus(app_handle, &state, ShowOrigin::Launch) {
+                    eprintln!("reopen show failed: {error}");
+                }
+            }
+            _ => {}
         }
     });
 }

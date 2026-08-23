@@ -235,19 +235,44 @@ struct Executed {
 }
 
 /// Whether `next_lower` is safe to answer by rescanning `prev_lower`'s exhaustive candidate
-/// set. It must strictly extend `prev_lower` — which guarantees the match set only shrinks
-/// (prefix/substring/exact matching is monotone under extension) — *and* introduce no new
-/// `/`: a new slash re-shapes a plain query into a path-shaped one (or adds a path segment),
-/// changing the scan's scope entirely, so we fall back to a full scan. A leading `~` cannot
-/// appear via extension (the prefix is shared), so path-shapedness is otherwise preserved.
-/// Layout correction survives too: the corrected variant of the extended query extends the
-/// corrected variant of the prefix (the key map is per-character), so every corrected match
-/// of `next_lower` is already in `prev_lower`'s cached set.
+/// set. It must strictly extend `prev_lower` — which keeps the match set a subset — *and*
+/// preserve the scan's matching semantics, so the cache stays a superset of the new matches.
+///
+/// Two ways an extension can break the superset property, each a fall-back to a full scan.
+/// First, a new `/` re-shapes a plain query into a path-shaped one (or adds a path segment),
+/// changing the scan's scope entirely. (A leading `~` cannot appear via extension, since the
+/// prefix is shared, so path-shapedness is otherwise preserved.) Second, crossing the
+/// single-token → multi-token boundary: a single-token query matches names only (unchanged
+/// pre-tokenization behavior), whereas every token of a multi-token query may ALSO match the
+/// path (SPEC §6 token contract), so the single-token cache holds only name-matched entries
+/// and is NOT a superset of the multi-token set. Within multi-token, appending either extends
+/// the last token or, after a space, adds a token; both only narrow the AND, so the cache
+/// stays a superset. A trailing space is already trimmed off `next_lower`, so it never reaches
+/// here as a spurious new token.
+///
+/// Layout correction survives either preserved case: the corrected variant of the extended
+/// query extends the corrected variant of the prefix (the key map is per-character), so every
+/// corrected match of `next_lower` is already in `prev_lower`'s cached set.
 fn can_extend(prev_lower: &str, next_lower: &str) -> bool {
-    !prev_lower.is_empty()
-        && next_lower.len() > prev_lower.len()
-        && next_lower.starts_with(prev_lower)
-        && !next_lower[prev_lower.len()..].contains('/')
+    if prev_lower.is_empty()
+        || next_lower.len() <= prev_lower.len()
+        || !next_lower.starts_with(prev_lower)
+        || next_lower[prev_lower.len()..].contains('/')
+    {
+        return false;
+    }
+    // The single→multi boundary only matters for plain queries; a path-shaped `next` (which,
+    // given the shared prefix and the no-new-`/` check above, means `prev` was already
+    // path-shaped) keeps spaces literal and is unaffected by tokenization.
+    let next_path_shaped = next_lower.contains('/') || next_lower.starts_with('~');
+    if !next_path_shaped {
+        let prev_multi = prev_lower.contains(char::is_whitespace);
+        let next_multi = next_lower.contains(char::is_whitespace);
+        if !prev_multi && next_multi {
+            return false;
+        }
+    }
+    true
 }
 
 /// Shared search core: drain targeted Junk, then scan under one read lock, optionally
@@ -689,6 +714,79 @@ mod tests {
         assert!(response.revision >= 1);
     }
 
+    #[test]
+    fn reuse_falls_back_across_token_boundary() {
+        // Extending a single-token query into a multi-token one changes matching semantics:
+        // a multi-token token may match on the PATH, which the single-token cache (name
+        // matches only) never captured. can_extend must refuse reuse and run a full scan, so
+        // the result equals a cold full scan — proving the superset property is preserved by
+        // falling back exactly at the «процед» → «процедура п» boundary (#26).
+        let dir = TempDir::new();
+        let root = dir.path();
+        let shared = new_index(root);
+        {
+            let mut index = shared.write().unwrap();
+            let proc_dir = index.add_dir(0, "процедура", model::Tier::Normal, 0);
+            index.add_file(proc_dir, "приемки.txt", model::Tier::Normal);
+        }
+        let (_journal_dir, journal) = empty_journal();
+        let junk = Arc::new(JunkPatterns::default());
+        let aliases = AliasDictionary::empty();
+
+        // Single-token «процед» matches only the directory entry, by name.
+        let base = execute_search(
+            &shared,
+            &junk,
+            root,
+            &journal,
+            &aliases,
+            "процед",
+            50,
+            None,
+            None,
+        );
+        assert!(base.outcome.exhaustive);
+        let cache = ReuseCache {
+            query_lower: "процед".to_owned(),
+            revision: base.revision,
+            entries: base.outcome.candidate_entries.clone(),
+        };
+
+        // The file matches «процедура приемки» only via its path (token1 is its ancestor
+        // dir), so a naive reuse of the name-only cache would miss it entirely.
+        let cold = execute_search(
+            &shared,
+            &junk,
+            root,
+            &journal,
+            &aliases,
+            "процедура приемки",
+            50,
+            None,
+            None,
+        );
+        let reused = execute_search(
+            &shared,
+            &junk,
+            root,
+            &journal,
+            &aliases,
+            "процедура приемки",
+            50,
+            Some(&cache),
+            None,
+        );
+
+        assert!(!reused.reused, "single→multi must fall back to a full scan");
+        assert!(!can_extend("процед", "процедура приемки"));
+        assert_eq!(reused.outcome.hits, cold.outcome.hits);
+        assert!(cold
+            .outcome
+            .hits
+            .iter()
+            .any(|hit| hit.name == "приемки.txt"));
+    }
+
     // Benchmark-style timing on a synthetic 5M-entry index shaped like the reference
     // machine's home: paths four components deep, mixed name lengths. Ignored by default (it
     // builds a large in-memory tree); run with `cargo test --release -- --ignored --nocapture`
@@ -766,6 +864,12 @@ mod tests {
         bench("long rare (full scan)", "file_1999_4_4_079");
         // A query that matches nothing still full-scans; the true worst case.
         bench("miss (full scan)", "zzz_no_such_entry_zz");
+        // Two-token AND query (#26): every token is matched independently against the name
+        // and (on a name miss) the path, so the scan costs up to ~2 needles/entry. The ASCII
+        // fast path must keep this inside the §10 Instant budget (≤50 ms). Here "file_1999"
+        // selects the project-1999 files by name and "module2" narrows to that module by its
+        // ancestor dir — a full scan that lands a few hundred hits.
+        bench("two-token (full scan)", "file_1999 module2");
 
         // Typing-extension reuse: extend a query four times. Without reuse each keystroke
         // full-scans; with reuse each rescans only the previous match set.
