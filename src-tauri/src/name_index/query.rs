@@ -24,6 +24,8 @@
 use std::{
     collections::HashSet,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
 };
 
 use serde::Serialize;
@@ -38,6 +40,17 @@ use crate::name_index::{
 /// we scan) caps the sort and path-reconstruction cost so search stays within the §10
 /// Instant budget (≤50 ms) even when a query matches a large fraction of the index.
 const MAX_CANDIDATES: usize = 4096;
+
+/// Below this many index slots a full scan runs on the calling thread; above it the scan is
+/// split across cores. The threshold keeps the tiny indexes in tests (and a cold,
+/// nearly-empty index) from paying thread-spawn overhead for no gain.
+const PAR_THRESHOLD: usize = 50_000;
+
+/// How many index slots each shard scans between stale-query checks. A few thousand entries
+/// is frequent enough to abort a superseded scan promptly (well under a millisecond of extra
+/// work at ~tens of millions of entries/s) yet rare enough that the atomic load never shows
+/// up in the scan cost.
+const ABORT_STRIDE: usize = 4096;
 
 // --- weights (the entire tuning surface, SPEC §6) --------------------------------------
 // `Q` is the match-quality unit. Quality bands are multiples of `Q`; every penalty and
@@ -151,66 +164,177 @@ struct Candidate {
     name: String,
     is_directory: bool,
     tier: Tier,
+    /// Slot index into [`IndexData::entries`] this candidate came from, so an exhaustive
+    /// scan's match set can be cached and re-scanned when the query is later extended.
+    slot: u32,
 }
 
-/// Run a search, returning up to `limit` hits in the §6 ranked, deterministic order.
+/// A best-effort cancellation token: the search's own generation stamp and the shared
+/// counter that a newer `search_name_index` bumps. A shard consults it every
+/// [`ABORT_STRIDE`] entries and aborts once the counter has moved past `mine` (SPEC §10: a
+/// newer keystroke cancels in-flight work of the previous state).
+#[derive(Clone, Copy)]
+pub struct Cancel<'a> {
+    current: &'a AtomicU64,
+    mine: u64,
+}
+
+impl<'a> Cancel<'a> {
+    /// A token for the search stamped `mine`, watching `current` for a newer stamp.
+    pub(crate) fn new(current: &'a AtomicU64, mine: u64) -> Self {
+        Self { current, mine }
+    }
+
+    fn superseded(&self) -> bool {
+        // Relaxed is enough: we only need to eventually observe a newer stamp; correctness
+        // never depends on *when* the abort is seen, only that a superseded scan is dropped.
+        self.current.load(Ordering::Relaxed) != self.mine
+    }
+}
+
+/// The full result of one scan: the ranked hits plus the metadata the streaming layer needs
+/// to cancel, reuse, and report on it.
+pub struct SearchOutcome {
+    /// Ranked, deterministic hits (empty when the scan was aborted).
+    pub hits: Vec<SearchHit>,
+    /// The whole match set was collected — no candidate cap hit, no abort. Only an
+    /// exhaustive scan's candidate set is safe to reuse for an extended query.
+    pub exhaustive: bool,
+    /// A newer query superseded this one mid-scan; `hits` is empty and must be discarded.
+    pub aborted: bool,
+    /// How many live entries the scan scored — small for a reuse scan, up to the whole
+    /// index for a cold full scan; surfaced as search telemetry.
+    pub scanned: usize,
+    /// Slot indices of the matched entries (only populated when `exhaustive`), cached so an
+    /// extended query can rescan just this set instead of the whole index.
+    pub candidate_entries: Vec<u32>,
+}
+
+/// Everything derived once from the query text, shared read-only across scan shards.
+struct Prepared {
+    query_lower: String,
+    path_shaped: bool,
+    segments: Vec<String>,
+    corrected: Vec<String>,
+    known: HashSet<PathBuf>,
+}
+
+impl Prepared {
+    fn new(index: &IndexData, trimmed: &str, query_lower: &str) -> Self {
+        let known = known_places(&index.root);
+        let path_shaped = is_path_shaped(trimmed);
+        let segments = if path_shaped {
+            path_segments(query_lower)
+        } else {
+            Vec::new()
+        };
+        // Layout correction applies to plain queries; a path-shaped query already carries
+        // structure that the wrong layout would not have produced.
+        let corrected = if path_shaped {
+            Vec::new()
+        } else {
+            layout_variants(query_lower)
+        };
+        Self {
+            query_lower: query_lower.to_owned(),
+            path_shaped,
+            segments,
+            corrected,
+            known,
+        }
+    }
+}
+
+/// Run a search, returning up to `limit` hits in the §6 ranked, deterministic order — the
+/// whole-index full-scan entry the ranker-contract tests exercise. Production searches go
+/// through [`run`] (via `mod.rs`), which adds cancellation and reuse.
+#[cfg(test)]
 pub fn search(index: &IndexData, ctx: &RankContext, query: &str, limit: usize) -> Vec<SearchHit> {
+    run(index, ctx, query, limit, None, None).hits
+}
+
+/// Run a search with optional stale-cancellation and optional candidate reuse.
+///
+/// `reuse` restricts the scan to a previous exhaustive scan's match set (typing-extension
+/// reuse); `None` scans the whole index in parallel. The ranked order is byte-identical to a
+/// full scan for the same query either way, because prefix/substring/exact matching only
+/// *shrinks* the match set under query extension: a reuse scan therefore sees a complete
+/// superset of the extended query's matches (the reuse gate that guarantees this lives at
+/// the `can_extend` call site in `mod.rs`).
+pub fn run(
+    index: &IndexData,
+    ctx: &RankContext,
+    query: &str,
+    limit: usize,
+    reuse: Option<&[u32]>,
+    cancel: Option<&Cancel>,
+) -> SearchOutcome {
+    // A reuse scan touches at most `MAX_CANDIDATES` entries, so it never pays for threads; a
+    // full scan splits across cores only once the index is large enough to be worth it.
+    let shards = if reuse.is_some() {
+        1
+    } else {
+        resolve_shards(index.entries.len())
+    };
+    run_impl(index, ctx, query, limit, reuse, cancel, shards)
+}
+
+/// The scan core, with an explicit shard count (the benchmark forces `1` for a sequential
+/// baseline; production resolves it from the core count). Sharding never changes the output:
+/// the candidate cap keeps the first `MAX_CANDIDATES` matches *in index order* regardless of
+/// how the range was split, and the final total-order sort is independent of merge order.
+pub(crate) fn run_impl(
+    index: &IndexData,
+    ctx: &RankContext,
+    query: &str,
+    limit: usize,
+    reuse: Option<&[u32]>,
+    cancel: Option<&Cancel>,
+    shards: usize,
+) -> SearchOutcome {
     let trimmed = query.trim();
     let query_lower = trimmed.to_lowercase();
     if query_lower.is_empty() || limit == 0 {
-        return Vec::new();
+        return SearchOutcome {
+            hits: Vec::new(),
+            exhaustive: true,
+            aborted: false,
+            scanned: 0,
+            candidate_entries: Vec::new(),
+        };
     }
 
-    let known = known_places(&index.root);
-    let path_shaped = is_path_shaped(trimmed);
-    let segments = if path_shaped {
-        path_segments(&query_lower)
+    let prep = Prepared::new(index, trimmed, &query_lower);
+    let (mut candidates, scanned, aborted, capped) = match reuse {
+        Some(slots) => scan_reuse(index, &prep, ctx, slots, cancel),
+        None => scan_full(index, &prep, ctx, cancel, shards),
+    };
+
+    // A superseded scan returns nothing; the streaming layer turns this into the stale
+    // signal the frontend's seq-guard already drops.
+    if aborted {
+        return SearchOutcome {
+            hits: Vec::new(),
+            exhaustive: false,
+            aborted: true,
+            scanned,
+            candidate_entries: Vec::new(),
+        };
+    }
+
+    let exhaustive = !capped;
+    // The reusable match set is the scanned candidates *before* any injection: the existing
+    // path and alias injections below are functions of the query, not the scan (guarantee a
+    // / g stay outside the parallel region), and are re-derived fresh on every search.
+    let candidate_entries = if exhaustive {
+        candidates.iter().map(|candidate| candidate.slot).collect()
     } else {
         Vec::new()
     };
-    // Layout correction applies to plain queries; a path-shaped query already carries
-    // structure that the wrong layout would not have produced.
-    let corrected = if path_shaped {
-        Vec::new()
-    } else {
-        layout_variants(&query_lower)
-    };
-
-    let mut scratch = String::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for slot in &index.entries {
-        let Some(entry) = slot else { continue };
-        let scored = if path_shaped {
-            score_path_shaped(index, entry, &segments, &known, ctx, &mut scratch)
-        } else {
-            score_plain(
-                index,
-                entry,
-                &query_lower,
-                &corrected,
-                &known,
-                ctx,
-                &mut scratch,
-            )
-        };
-        let Some((score, path)) = scored else {
-            continue;
-        };
-        candidates.push(Candidate {
-            score,
-            path,
-            name: entry.name.to_string(),
-            is_directory: entry.is_directory,
-            tier: entry.tier,
-        });
-        if candidates.len() >= MAX_CANDIDATES {
-            break;
-        }
-    }
 
     // Guarantee (a): an existing typed absolute path ranks its target first. The fs
     // existence check is only ever done here, for path-shaped queries.
-    if path_shaped {
+    if prep.path_shaped {
         if let Some((target, is_dir)) = existing_typed_path(trimmed, &index.root) {
             inject(&mut candidates, index, &target, EXISTING_PATH, is_dir);
         }
@@ -230,7 +354,7 @@ pub fn search(index: &IndexData, ctx: &RankContext, query: &str, limit: usize) -
     });
     candidates.truncate(limit);
 
-    candidates
+    let hits = candidates
         .into_iter()
         .map(|candidate| SearchHit {
             name: candidate.name,
@@ -238,7 +362,189 @@ pub fn search(index: &IndexData, ctx: &RankContext, query: &str, limit: usize) -
             is_directory: candidate.is_directory,
             tier: candidate.tier.as_str(),
         })
-        .collect()
+        .collect();
+    SearchOutcome {
+        hits,
+        exhaustive,
+        aborted: false,
+        scanned,
+        candidate_entries,
+    }
+}
+
+/// Shard count for a full scan of `n` slots: one (inline) below [`PAR_THRESHOLD`], else the
+/// available core count.
+fn resolve_shards(n: usize) -> usize {
+    if n < PAR_THRESHOLD {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Full-index scan, split across `shards` contiguous ranges. Returns the collected
+/// candidates (capped at [`MAX_CANDIDATES`], in index order), the number of entries scored,
+/// whether the scan was aborted, and whether the candidate cap was hit.
+fn scan_full(
+    index: &IndexData,
+    prep: &Prepared,
+    ctx: &RankContext,
+    cancel: Option<&Cancel>,
+    shards: usize,
+) -> (Vec<Candidate>, usize, bool, bool) {
+    let n = index.entries.len();
+    if shards <= 1 || n < PAR_THRESHOLD {
+        let (mut local, scanned, aborted) = scan_range(index, prep, ctx, 0, n, cancel);
+        let capped = local.len() >= MAX_CANDIDATES;
+        local.truncate(MAX_CANDIDATES);
+        return (local, scanned, aborted, capped);
+    }
+
+    let chunk = n.div_ceil(shards);
+    let parts = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut lo = 0;
+        while lo < n {
+            let hi = (lo + chunk).min(n);
+            handles.push(scope.spawn(move || scan_range(index, prep, ctx, lo, hi, cancel)));
+            lo = hi;
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("search shard panicked"))
+            .collect::<Vec<_>>()
+    });
+
+    // Merge in shard order (== index order), so `take(MAX_CANDIDATES)` keeps exactly the
+    // first matches a single sequential scan would, whatever the core count. Each shard
+    // already stops at its own `MAX_CANDIDATES`, so the concatenation is bounded even when
+    // the query matches millions of entries.
+    let mut all: Vec<Candidate> = Vec::new();
+    let mut scanned = 0usize;
+    let mut aborted = false;
+    for (local, shard_scanned, shard_aborted) in parts {
+        scanned += shard_scanned;
+        aborted |= shard_aborted;
+        all.extend(local);
+    }
+    // `capped` (== not exhaustive) exactly when a sequential scan would have hit the cap,
+    // i.e. total matches ≥ MAX_CANDIDATES — whether concentrated in one shard or spread.
+    let capped = all.len() >= MAX_CANDIDATES;
+    all.truncate(MAX_CANDIDATES);
+    (all, scanned, aborted, capped)
+}
+
+/// Scan the half-open slot range `[lo, hi)`, collecting up to [`MAX_CANDIDATES`] local
+/// matches (in slot order) and aborting early if a newer query supersedes this one.
+fn scan_range(
+    index: &IndexData,
+    prep: &Prepared,
+    ctx: &RankContext,
+    lo: usize,
+    hi: usize,
+    cancel: Option<&Cancel>,
+) -> (Vec<Candidate>, usize, bool) {
+    let mut local = Vec::new();
+    let mut scratch = String::new();
+    let mut scanned = 0usize;
+    let mut since_check = 0usize;
+    for slot in lo..hi {
+        since_check += 1;
+        if since_check >= ABORT_STRIDE {
+            since_check = 0;
+            if cancel.is_some_and(Cancel::superseded) {
+                return (local, scanned, true);
+            }
+        }
+        let Some(entry) = &index.entries[slot] else {
+            continue;
+        };
+        scanned += 1;
+        if let Some((score, path)) = score_entry(index, entry, prep, ctx, &mut scratch) {
+            local.push(Candidate {
+                score,
+                path,
+                name: entry.name.to_string(),
+                is_directory: entry.is_directory,
+                tier: entry.tier,
+                slot: slot as u32,
+            });
+            if local.len() >= MAX_CANDIDATES {
+                break;
+            }
+        }
+    }
+    (local, scanned, false)
+}
+
+/// Rescan only a previous exhaustive scan's match set (typing-extension reuse). Single
+/// threaded: the set is at most [`MAX_CANDIDATES`] entries.
+fn scan_reuse(
+    index: &IndexData,
+    prep: &Prepared,
+    ctx: &RankContext,
+    slots: &[u32],
+    cancel: Option<&Cancel>,
+) -> (Vec<Candidate>, usize, bool, bool) {
+    let mut local = Vec::new();
+    let mut scratch = String::new();
+    let mut scanned = 0usize;
+    let mut since_check = 0usize;
+    for &slot in slots {
+        since_check += 1;
+        if since_check >= ABORT_STRIDE {
+            since_check = 0;
+            if cancel.is_some_and(Cancel::superseded) {
+                return (local, scanned, true, false);
+            }
+        }
+        let Some(entry) = &index.entries[slot as usize] else {
+            continue;
+        };
+        scanned += 1;
+        if let Some((score, path)) = score_entry(index, entry, prep, ctx, &mut scratch) {
+            local.push(Candidate {
+                score,
+                path,
+                name: entry.name.to_string(),
+                is_directory: entry.is_directory,
+                tier: entry.tier,
+                slot,
+            });
+            if local.len() >= MAX_CANDIDATES {
+                break;
+            }
+        }
+    }
+    let capped = local.len() >= MAX_CANDIDATES;
+    local.truncate(MAX_CANDIDATES);
+    (local, scanned, false, capped)
+}
+
+/// Score one entry against the prepared query, dispatching to the path-shaped or plain
+/// scorer. Byte-identical scoring to the pre-parallel inline scan.
+fn score_entry(
+    index: &IndexData,
+    entry: &Entry,
+    prep: &Prepared,
+    ctx: &RankContext,
+    scratch: &mut String,
+) -> Option<(i64, String)> {
+    if prep.path_shaped {
+        score_path_shaped(index, entry, &prep.segments, &prep.known, ctx, scratch)
+    } else {
+        score_plain(
+            index,
+            entry,
+            &prep.query_lower,
+            &prep.corrected,
+            &prep.known,
+            ctx,
+            scratch,
+        )
+    }
 }
 
 /// Score a plain (non-path) query against one entry, or `None` if it does not match.
@@ -545,6 +851,10 @@ fn inject(
         name,
         is_directory,
         tier,
+        // Injection happens after the reusable `candidate_entries` are captured, so this
+        // slot is never read; the sentinel just marks a candidate that came from the query,
+        // not the scan.
+        slot: u32::MAX,
     });
 }
 
@@ -749,5 +1059,101 @@ mod tests {
                 "/home/tester/b/item",
             ]
         );
+    }
+
+    #[test]
+    fn reuse_matches_full_scan_on_extension() {
+        // Extending a query can only shrink the match set (prefix/substring/exact), so
+        // rescanning the previous exhaustive candidate set yields hits byte-identical to a
+        // fresh full scan — the reuse optimization never changes results.
+        let mut index = index();
+        index.add_file(0, "report.txt", Tier::Normal);
+        index.add_file(0, "report-2024.txt", Tier::Normal);
+        index.add_file(0, "quarterly-report.md", Tier::Normal);
+        index.add_file(0, "unrelated.txt", Tier::Normal);
+
+        let ctx = RankContext::empty();
+        let base = super::run(&index, &ctx, "report", 50, None, None);
+        assert!(base.exhaustive);
+
+        let full = super::run(&index, &ctx, "report-", 50, None, None);
+        let reused = super::run(
+            &index,
+            &ctx,
+            "report-",
+            50,
+            Some(&base.candidate_entries),
+            None,
+        );
+        assert!(reused.exhaustive);
+        assert_eq!(reused.hits, full.hits);
+        assert!(!reused.hits.is_empty());
+    }
+
+    #[test]
+    fn reuse_covers_layout_corrected_extension() {
+        // The layout-corrected variant of an extended query extends the prefix's corrected
+        // variant (the key map is per-character), so a corrected match of the extended query
+        // is always present in the prefix's cached candidate set.
+        let mut index = index();
+        index.add_file(0, "сфе.txt", Tier::Normal); // "cat" mapped EN->RU corrects onto this
+        index.add_file(0, "unrelated.txt", Tier::Normal);
+
+        let ctx = RankContext::empty();
+        // "ca" -> corrected "сф"; base matches "сфе.txt" via the corrected substring.
+        let base = super::run(&index, &ctx, "ca", 50, None, None);
+        assert!(base.exhaustive);
+        assert!(base.hits.iter().any(|hit| hit.name == "сфе.txt"));
+
+        // Extend to "cat" -> corrected "сфе"; still matches "сфе.txt", and reusing the "ca"
+        // candidate set finds it just as a full scan does.
+        let full = super::run(&index, &ctx, "cat", 50, None, None);
+        let reused = super::run(&index, &ctx, "cat", 50, Some(&base.candidate_entries), None);
+        assert_eq!(reused.hits, full.hits);
+        assert!(reused.hits.iter().any(|hit| hit.name == "сфе.txt"));
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential() {
+        // A large index forces multi-shard scanning; the ranked output must be identical to a
+        // single-shard (sequential) scan — sharding never reorders or drops results.
+        let mut index = index();
+        for d in 0..70u32 {
+            let dir = index.add_dir(0, &format!("dir{d:03}"), Tier::Normal, 0);
+            for f in 0..1000u32 {
+                index.add_file(dir, &format!("f{d:03}_{f:04}.txt"), Tier::Normal);
+            }
+        }
+        assert!(index.entries.len() > super::PAR_THRESHOLD);
+
+        let ctx = RankContext::empty();
+        // A selective query with matches that fall in a late shard.
+        let sequential = super::run_impl(&index, &ctx, "f069_0500", 50, None, None, 1);
+        let parallel = super::run_impl(&index, &ctx, "f069_0500", 50, None, None, 8);
+        assert_eq!(sequential.hits, parallel.hits);
+        assert!(!sequential.hits.is_empty());
+
+        // A cap-hitting common query (matches everything) is also identical across shard
+        // counts: the cap keeps the first MAX_CANDIDATES in index order either way.
+        let seq_common = super::run_impl(&index, &ctx, "f", 50, None, None, 1);
+        let par_common = super::run_impl(&index, &ctx, "f", 50, None, None, 8);
+        assert_eq!(seq_common.hits, par_common.hits);
+        assert!(!seq_common.exhaustive); // the cap was hit
+    }
+
+    #[test]
+    fn superseded_scan_aborts() {
+        // Enough entries to cross an ABORT_STRIDE checkpoint, where the stale stamp is seen.
+        let mut index = index();
+        for f in 0..(super::ABORT_STRIDE as u32 + 500) {
+            index.add_file(0, &format!("file{f:05}.txt"), Tier::Normal);
+        }
+        let ctx = RankContext::empty();
+        // Stamp the scan behind the shared counter: it is superseded at the first check.
+        let generation = AtomicU64::new(7);
+        let cancel = super::Cancel::new(&generation, 1);
+        let out = super::run_impl(&index, &ctx, "file", 50, None, Some(&cancel), 1);
+        assert!(out.aborted);
+        assert!(out.hits.is_empty());
     }
 }

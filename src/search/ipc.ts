@@ -20,10 +20,13 @@ export const searchHitSchema = z
 export type SearchHit = z.infer<typeof searchHitSchema>;
 
 // The Rust `SearchResponse`: the ranked hits plus the index generation they were
-// computed against (retained for future progressive reconciliation, SPEC §6).
+// computed against (retained for future progressive reconciliation, SPEC §6), and scan
+// metadata (`reused`, `scanned`) passed through to sampled search telemetry (SPEC §10).
 export const searchResponseSchema = z
   .object({
     revision: z.number().int().nonnegative(),
+    reused: z.boolean(),
+    scanned: z.number().int().nonnegative(),
     hits: z.array(searchHitSchema),
   })
   .strict();

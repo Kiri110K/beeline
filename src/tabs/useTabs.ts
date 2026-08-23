@@ -771,7 +771,13 @@ export function useTabs(
   // Sampled search telemetry: record only when a query was slow-ish or on every
   // Nth query, so the hot typing path stays cheap (§10, telemetry point 10).
   const fireSearchTelemetry = useCallback(
-    (queryLen: number, results: number, durationMs: number): void => {
+    (
+      queryLen: number,
+      results: number,
+      durationMs: number,
+      reused: boolean,
+      scanned: number,
+    ): void => {
       searchCountRef.current += 1;
       const duration = Math.round(durationMs);
       if (
@@ -782,6 +788,8 @@ export function useTabs(
           query_len: queryLen,
           results,
           duration_ms: duration,
+          reused,
+          scanned,
         });
       }
     },
@@ -825,6 +833,8 @@ export function useTabs(
             query.length,
             response.hits.length,
             performance.now() - started,
+            response.reused,
+            response.scanned,
           );
           dispatch({
             type: "search",

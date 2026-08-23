@@ -18,7 +18,10 @@ mod watcher;
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -49,6 +52,20 @@ pub(crate) fn builtin_junk_names() -> Vec<String> {
 /// SPEC §6, §10).
 type SharedJunk = Arc<RwLock<Arc<JunkPatterns>>>;
 
+/// One cached exhaustive scan, reused when the next query strictly extends this one under
+/// the same index revision (typing-extension reuse, SPEC §10). Storing entry *slots* (not
+/// scored candidates) keeps it tiny and lets the extended query re-score from scratch.
+#[derive(Clone)]
+struct ReuseCache {
+    /// The trimmed, lowercased query these entries matched.
+    query_lower: String,
+    /// Index revision the slots were collected at; a mismatch means the index changed and
+    /// the slots may be stale, so reuse is skipped.
+    revision: u64,
+    /// Slot indices into `IndexData::entries` of the full (exhaustive) match set.
+    entries: Vec<u32>,
+}
+
 /// Managed Tauri state holding the live index and everything needed to search, drain,
 /// and persist it.
 pub struct NameIndex {
@@ -61,6 +78,13 @@ pub struct NameIndex {
     /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
     /// searches rank against the current aliases.
     aliases: RwLock<Arc<AliasDictionary>>,
+    /// Monotonic query counter (SPEC §10 cancel-on-newer). `search_name_index` bumps it on
+    /// entry; each running scan carries its own stamp and aborts once a newer query moves the
+    /// counter past it.
+    generation: Arc<AtomicU64>,
+    /// The single previous exhaustive scan (the app has one search stream, SPEC §5), so a
+    /// strictly-extending keystroke rescans just that match set instead of the whole index.
+    reuse: Arc<Mutex<Option<ReuseCache>>>,
 }
 
 impl NameIndex {
@@ -139,6 +163,8 @@ impl NameIndex {
             index_file,
             journal,
             aliases,
+            generation: Arc::new(AtomicU64::new(0)),
+            reuse: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -191,11 +217,44 @@ fn now_ms() -> i64 {
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
     pub revision: u64,
+    /// The scan reused the previous query's candidate set instead of walking the whole
+    /// index (typing-extension reuse); passed through to sampled search telemetry (SPEC §10).
+    pub reused: bool,
+    /// How many entries the scan scored — small for a reuse scan, up to the whole index for
+    /// a cold full scan; passed through to sampled search telemetry.
+    pub scanned: usize,
     pub hits: Vec<SearchHit>,
 }
 
-/// Run a search, draining dirty Junk directories first when the query targets Junk.
-fn run_search(
+/// One executed search: the ranked outcome plus the revision it ran against and whether it
+/// reused a cached candidate set.
+struct Executed {
+    revision: u64,
+    reused: bool,
+    outcome: query::SearchOutcome,
+}
+
+/// Whether `next_lower` is safe to answer by rescanning `prev_lower`'s exhaustive candidate
+/// set. It must strictly extend `prev_lower` — which guarantees the match set only shrinks
+/// (prefix/substring/exact matching is monotone under extension) — *and* introduce no new
+/// `/`: a new slash re-shapes a plain query into a path-shaped one (or adds a path segment),
+/// changing the scan's scope entirely, so we fall back to a full scan. A leading `~` cannot
+/// appear via extension (the prefix is shared), so path-shapedness is otherwise preserved.
+/// Layout correction survives too: the corrected variant of the extended query extends the
+/// corrected variant of the prefix (the key map is per-character), so every corrected match
+/// of `next_lower` is already in `prev_lower`'s cached set.
+fn can_extend(prev_lower: &str, next_lower: &str) -> bool {
+    !prev_lower.is_empty()
+        && next_lower.len() > prev_lower.len()
+        && next_lower.starts_with(prev_lower)
+        && !next_lower[prev_lower.len()..].contains('/')
+}
+
+/// Shared search core: drain targeted Junk, then scan under one read lock, optionally
+/// reusing `reuse`'s candidate set (when the query extends it under the same revision) and
+/// honoring `cancel`.
+#[allow(clippy::too_many_arguments)]
+fn execute_search(
     data: &Arc<RwLock<IndexData>>,
     junk: &Arc<JunkPatterns>,
     root: &Path,
@@ -203,7 +262,9 @@ fn run_search(
     aliases: &AliasDictionary,
     query: &str,
     limit: usize,
-) -> SearchResponse {
+    reuse: Option<&ReuseCache>,
+    cancel: Option<&query::Cancel>,
+) -> Executed {
     let query_lower = query.trim().to_lowercase();
     if junk.query_targets_junk(&query_lower) {
         crawl::drain_junk_dirty(data, root, junk);
@@ -214,27 +275,67 @@ fn run_search(
         aliases,
     };
     let index = data.read().expect("name index lock poisoned");
+    let revision = index.revision;
+    // Reuse only when the cache was built against this exact index revision (slots still
+    // valid) and the query strictly extends the cached one without re-shaping its scope.
+    let reuse_slots = reuse.and_then(|cache| {
+        (cache.revision == revision && can_extend(&cache.query_lower, &query_lower))
+            .then_some(cache.entries.as_slice())
+    });
+    let reused = reuse_slots.is_some();
+    let outcome = query::run(&index, &ctx, query, limit, reuse_slots, cancel);
+    Executed {
+        revision,
+        reused,
+        outcome,
+    }
+}
+
+/// Run a search with no cancellation or reuse (the direct path the tests exercise).
+/// Production searches go through `search_name_index`, which adds stale-cancellation and
+/// typing-extension reuse on top of the same `execute_search` core.
+#[cfg(test)]
+fn run_search(
+    data: &Arc<RwLock<IndexData>>,
+    junk: &Arc<JunkPatterns>,
+    root: &Path,
+    journal: &VisitJournal,
+    aliases: &AliasDictionary,
+    query: &str,
+    limit: usize,
+) -> SearchResponse {
+    let executed = execute_search(data, junk, root, journal, aliases, query, limit, None, None);
     SearchResponse {
-        revision: index.revision,
-        hits: query::search(&index, &ctx, query, limit),
+        revision: executed.revision,
+        reused: executed.reused,
+        scanned: executed.outcome.scanned,
+        hits: executed.outcome.hits,
     }
 }
 
 /// Query the Name Index. Runs off the async runtime's core threads (like `list_location`)
-/// so the read scan and any Junk drain never block IPC.
+/// so the read scan and any Junk drain never block IPC. Every call bumps the query
+/// generation so any still-running older scan aborts (SPEC §10 cancel-on-newer), and a
+/// strictly-extending query reuses the previous exhaustive scan's candidate set.
 #[tauri::command]
 pub async fn search_name_index(
     query: String,
     limit: u32,
     state: State<'_, NameIndex>,
 ) -> Result<SearchResponse, String> {
+    // Bump on entry so any older scan still in flight sees itself superseded and aborts.
+    let my_gen = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let data = state.data.clone();
     let junk = state.junk_snapshot();
     let root = state.root.clone();
     let journal = state.journal.clone();
     let aliases = state.aliases_snapshot();
+    let generation = state.generation.clone();
+    let reuse = state.reuse.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        run_search(
+        let cached = reuse.lock().expect("reuse cache lock poisoned").clone();
+        let cancel = query::Cancel::new(&generation, my_gen);
+        let executed = execute_search(
             &data,
             &junk,
             &root,
@@ -242,10 +343,38 @@ pub async fn search_name_index(
             &aliases,
             &query,
             limit as usize,
-        )
+            cached.as_ref(),
+            Some(&cancel),
+        );
+        // Superseded: return an explicit error. The frontend's per-Tab seq-guard already
+        // drops it — a newer query on the single search stream is by definition in flight —
+        // so it never reaches the UI (SPEC §6 progressive/stale handling).
+        if executed.outcome.aborted {
+            return Err("search superseded".to_owned());
+        }
+        // Cache the match set only when the scan was exhaustive; a capped scan (or one whose
+        // reuse is no longer valid) clears the slot so the next query starts from a full scan.
+        {
+            let mut slot = reuse.lock().expect("reuse cache lock poisoned");
+            if executed.outcome.exhaustive {
+                *slot = Some(ReuseCache {
+                    query_lower: query.trim().to_lowercase(),
+                    revision: executed.revision,
+                    entries: executed.outcome.candidate_entries,
+                });
+            } else {
+                *slot = None;
+            }
+        }
+        Ok(SearchResponse {
+            revision: executed.revision,
+            reused: executed.reused,
+            scanned: executed.outcome.scanned,
+            hits: executed.outcome.hits,
+        })
     })
     .await
-    .map_err(|_| "name index search task failed".to_owned())
+    .map_err(|_| "name index search task failed".to_owned())?
 }
 
 /// Record a visit into the Visit Journal (SPEC §6). The frontend wires this into
@@ -560,41 +689,140 @@ mod tests {
         assert!(response.revision >= 1);
     }
 
-    // Benchmark-style timing on a synthetic 1M-entry index. Ignored by default (it builds
-    // a large in-memory tree); run with `cargo test -- --ignored --nocapture` to see the
-    // per-query cost against the §10 Instant budget (≤50 ms).
+    // Benchmark-style timing on a synthetic 5M-entry index shaped like the reference
+    // machine's home: paths four components deep, mixed name lengths. Ignored by default (it
+    // builds a large in-memory tree); run with `cargo test --release -- --ignored --nocapture`
+    // to see per-query cost against the §10 Instant budget (≤50 ms for first results). Reports
+    // sequential-vs-parallel full scan, typing-extension reuse, and a superseded-scan abort
+    // (#26).
     #[test]
     #[ignore]
-    fn million_entry_query_timing() {
+    fn five_million_entry_query_timing() {
         use std::time::Instant;
 
         let root = PathBuf::from("/home/bench");
         let shared = new_index(&root);
+        let build_started = Instant::now();
         {
             let mut index = shared.write().unwrap();
-            // 1000 directories × 1000 files = 1,000,000 entries.
-            for d in 0..1000u32 {
-                let dir = index.add_dir(0, &format!("dir{d:04}"), model::Tier::Normal, 0);
-                for f in 0..1000u32 {
-                    index.add_file(dir, &format!("file{d:04}_{f:04}.txt"), model::Tier::Normal);
+            // 2500 top dirs × 5 modules × 5 src dirs × 80 files = 5,000,000 files, four
+            // components deep, with file-name length varying by the counters.
+            for a in 0..2500u32 {
+                let top = index.add_dir(0, &format!("project{a:04}"), model::Tier::Normal, 0);
+                for b in 0..5u32 {
+                    let mid = index.add_dir(top, &format!("module{b}"), model::Tier::Normal, 0);
+                    for c in 0..5u32 {
+                        let leaf = index.add_dir(mid, &format!("src{c}"), model::Tier::Normal, 0);
+                        for f in 0..80u32 {
+                            index.add_file(
+                                leaf,
+                                &format!("file_{a:04}_{b}_{c}_{f:03}.rs"),
+                                model::Tier::Normal,
+                            );
+                        }
+                    }
                 }
             }
+            println!(
+                "built {} entries in {:.2} s",
+                index.len(),
+                build_started.elapsed().as_secs_f64()
+            );
         }
 
         let index = shared.read().unwrap();
         let ctx = RankContext::empty();
-        // Warm one selective query, then time several representative queries.
-        let _ = query::search(&index, &ctx, "file0500_0500", 50);
+        let cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        println!(
+            "scanning {} entries across {cores} shards\n",
+            index.entries.len()
+        );
 
-        for query in ["file0500_0500", "file", "dir0999", "readme"] {
-            let started = Instant::now();
-            let hits = query::search(&index, &ctx, query, 50);
-            let micros = started.elapsed().as_micros();
+        // Warm the allocator / caches with one selective query.
+        let _ = query::run_impl(&index, &ctx, "file_2499_0_0_000", 50, None, None, cores);
+
+        let bench = |label: &str, q: &str| {
+            let seq_started = Instant::now();
+            let seq = query::run_impl(&index, &ctx, q, 50, None, None, 1);
+            let seq_ms = seq_started.elapsed().as_secs_f64() * 1000.0;
+            let par_started = Instant::now();
+            let par = query::run_impl(&index, &ctx, q, 50, None, None, cores);
+            let par_ms = par_started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(seq.hits, par.hits, "sharding must not change results");
             println!(
-                "query {query:?}: {} hits in {micros} µs ({:.2} ms)",
-                hits.len(),
-                micros as f64 / 1000.0
+                "{label:<26} q={q:<22?} {:>3} hits, scanned {:>8} | seq {seq_ms:7.2} ms  par {par_ms:7.2} ms",
+                par.hits.len(),
+                par.scanned
             );
+        };
+
+        // Short common query: matches nearly everything, hits the candidate cap and exits
+        // early (no full scan).
+        bench("short common (cap hit)", "file");
+        // Long rare query: matches a handful, so it full-scans the whole index — the §10
+        // worst case this ticket targets (≤25 ms parallel).
+        bench("long rare (full scan)", "file_1999_4_4_079");
+        // A query that matches nothing still full-scans; the true worst case.
+        bench("miss (full scan)", "zzz_no_such_entry_zz");
+
+        // Typing-extension reuse: extend a query four times. Without reuse each keystroke
+        // full-scans; with reuse each rescans only the previous match set.
+        let extensions = ["file_0007", "file_0007_", "file_0007_2", "file_0007_2_"];
+        let full_started = Instant::now();
+        for q in extensions {
+            let _ = query::run_impl(&index, &ctx, q, 50, None, None, cores);
         }
+        let full_ms = full_started.elapsed().as_secs_f64() * 1000.0;
+
+        // Reuse chain: one full scan to seed, then each extension rescans only the previous
+        // match set. Timed on its own; the equality checks against full scans run untimed
+        // afterwards so they never pollute the measurement.
+        let reuse_started = Instant::now();
+        let base = query::run_impl(&index, &ctx, extensions[0], 50, None, None, cores);
+        let mut slots = base.candidate_entries.clone();
+        let mut collected = Vec::new();
+        for q in &extensions[1..] {
+            let out = query::run_impl(&index, &ctx, q, 50, Some(&slots), None, 1);
+            slots = out.candidate_entries.clone();
+            collected.push((*q, out));
+        }
+        let reuse_ms = reuse_started.elapsed().as_secs_f64() * 1000.0;
+
+        assert!(
+            base.exhaustive,
+            "base query must be exhaustive to seed reuse"
+        );
+        for (q, out) in &collected {
+            assert!(out.exhaustive);
+            // A reuse result is byte-identical to a full scan for the same query.
+            let full = query::run_impl(&index, &ctx, q, 50, None, None, cores);
+            assert_eq!(out.hits, full.hits);
+        }
+        println!(
+            "\ntyping sequence (4 queries):  full-scan each {full_ms:7.2} ms  |  reuse chain {reuse_ms:7.2} ms"
+        );
+
+        // Superseded-scan abort: a scan whose stamp is already behind the shared counter
+        // aborts at the first checkpoint instead of walking all 5M entries.
+        let generation = AtomicU64::new(9);
+        let cancel = query::Cancel::new(&generation, 1);
+        let abort_started = Instant::now();
+        let aborted = query::run_impl(
+            &index,
+            &ctx,
+            "zzz_no_such_entry_zz",
+            50,
+            None,
+            Some(&cancel),
+            cores,
+        );
+        let abort_ms = abort_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(aborted.aborted, "a superseded scan must abort");
+        println!(
+            "superseded abort:             scanned {:>8} entries then aborted in {abort_ms:7.2} ms",
+            aborted.scanned
+        );
     }
 }
