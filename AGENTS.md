@@ -10,3 +10,4 @@ Repo for Beeline (working name for version 1; formerly Visual Files) — a perso
 
 - Issue tracker: GitHub Issues — conventions in `docs/agents/issue-tracker.md`.
 - Domain docs: single context — `CONTEXT.md` and `docs/adr/` at the repo root; consumer rules in `docs/agents/domain.md`.
+- TypeScript: read `docs/agents/typescript.md` before writing or reviewing any TypeScript — required patterns (discriminated unions, exhaustive match, parse-don't-validate, Result) on top of the strict tsconfig and lint.
