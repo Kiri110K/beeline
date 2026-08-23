@@ -56,7 +56,7 @@ function invokeCommand(
   return fromTauri(command, unitSchema, () => invoke(command, args));
 }
 
-function recordTelemetry(
+export function recordTelemetry(
   name: string,
   fields: Record<string, unknown>,
 ): ResultAsync<null, ShellError> {
@@ -67,7 +67,7 @@ function hideCurrentWindow(): ResultAsync<null, ShellError> {
   return fromTauri("window.hide", unitSchema, () => getCurrentWindow().hide());
 }
 
-function reportShellError(error: ShellError): void {
+export function reportShellError(error: ShellError): void {
   console.error("Beeline shell operation failed", error);
 }
 

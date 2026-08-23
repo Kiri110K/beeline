@@ -7,7 +7,7 @@ import { strings } from "./strings";
 // SPEC §3 layout skeleton, top to bottom: Tab strip zone, Navigation Input,
 // dense file table, reserved Preview Panel column, Status Strip zone.
 export default function App(): ReactElement {
-  const { state, focusIndex, activate } = useBrowse();
+  const { state, select, activate, onScrollTop } = useBrowse();
   return (
     <div className="flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
       <div
@@ -29,8 +29,12 @@ export default function App(): ReactElement {
           load={state.load}
           location={state.location}
           focusedIndex={state.focusedIndex}
-          onFocusIndex={focusIndex}
+          selected={state.selected}
+          pendingScrollTop={state.pendingScrollTop}
+          scrollGeneration={state.scrollGeneration}
+          onSelect={select}
           onActivate={activate}
+          onScrollTop={onScrollTop}
         />
         <div
           className="w-[300px] shrink-0 border-l border-neutral-800"

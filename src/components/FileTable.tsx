@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { match } from "ts-pattern";
 
-import type { LoadState } from "../browse/state";
+import type { LoadState, SelectMode } from "../browse/state";
 import type { Item, ListErrorPayload } from "../location/schema";
 import { strings } from "../strings";
 import { FileRow } from "./FileRow";
@@ -11,8 +11,12 @@ interface FileTableProps {
   load: LoadState;
   location: string;
   focusedIndex: number;
-  onFocusIndex: (index: number) => void;
+  selected: ReadonlySet<number>;
+  pendingScrollTop: number;
+  scrollGeneration: number;
+  onSelect: (index: number, mode: SelectMode) => void;
   onActivate: (item: Item) => void;
+  onScrollTop: (top: number) => void;
 }
 
 function errorText(error: ListErrorPayload, location: string): string {
@@ -34,8 +38,12 @@ export function FileTable({
   load,
   location,
   focusedIndex,
-  onFocusIndex,
+  selected,
+  pendingScrollTop,
+  scrollGeneration,
+  onSelect,
   onActivate,
+  onScrollTop,
 }: FileTableProps): ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -71,6 +79,19 @@ export function FileTable({
     }
   }, [focusedIndex, load.status]);
 
+  // Restore the saved scroll offset once per landed listing (history back/forward
+  // and fresh entries). Runs after the focus-into-view effect so it wins.
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (element === null) {
+      return;
+    }
+    element.scrollTop = pendingScrollTop;
+    setScrollTop(pendingScrollTop);
+    onScrollTop(pendingScrollTop);
+    // Keyed on the generation so a same-value offset still re-applies.
+  }, [scrollGeneration, pendingScrollTop, onScrollTop]);
+
   const content: ReactNode = match(load)
     .with({ status: "idle" }, () => null)
     .with({ status: "loading" }, () => null)
@@ -97,7 +118,8 @@ export function FileTable({
                 item={item}
                 index={index}
                 isFocused={index === focusedIndex}
-                onFocusIndex={onFocusIndex}
+                isSelected={selected.has(index)}
+                onSelect={onSelect}
                 onActivate={onActivate}
               />
             );
@@ -123,6 +145,7 @@ export function FileTable({
           const element = scrollRef.current;
           if (element !== null) {
             setScrollTop(element.scrollTop);
+            onScrollTop(element.scrollTop);
           }
         }}
         className="min-h-0 flex-1 overflow-auto"

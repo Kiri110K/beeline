@@ -59,6 +59,10 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   перед замером файл удалить.
 - cargo-зависимости качать до запуска песочных агентов (у них нет сети):
   `cargo add ... && cargo fetch --manifest-path src-tauri/Cargo.toml`.
+- Длинные прогоны `claude -p` оборачивать в `caffeinate -i ...` — прецедент
+  23.08: Мак уснул, прогон Опуса умер на середине («computer went to sleep»).
+- `opener:default` не даёт open-path: для открытия файлов нужен
+  `opener:allow-open-path` в src-tauri/capabilities/default.json.
 
 ## Как проверить, что сделанное работает
 
