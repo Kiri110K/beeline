@@ -10,7 +10,7 @@ An implementer must not invent product behavior. Anything genuinely unspecified 
 
 - Host: Tauri v2. React (current version, React Compiler enabled) in the WKWebView owns the UI; Rust owns the filesystem, the Name Index, Spotlight queries, the Visit Journal, and system integration (ADR-0001, ADR-0002).
 - Small native macOS bridges are allowed where public Tauri APIs fall short. Expected candidates: an owned `QLPreviewPanel` for Quick Look, precise window activation, and (post-v1) iCloud placeholder state (ADR-0001).
-- Bundle id `com.kiri110k.beeline`. UI language: English. Localization is a desired post-v1 addition, so do not hard-code strings in components.
+- Bundle id `com.kiri110k.beeline`. Beeline is the version-1 working name; the final name is decided before any public release (the bare name is crowded publicly — App Store, the Apache Hive `beeline` CLI, the RU telecom brand). UI language: English. Localization is a desired post-v1 addition, so do not hard-code strings in components.
 - The visual style of the selected mockup (`prototypes/navigation-search-preview/design-a-browser.html`) is the compositional reference, not final styling; a style rework is planned as the first post-v1 update.
 
 ## 2. Window and lifecycle

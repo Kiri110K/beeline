@@ -1,6 +1,6 @@
-# Visual Files
+# Beeline
 
-A personal file-browsing context for reaching and operating on files without falling back to Finder.
+A personal file-browsing context for reaching and operating on files without falling back to Finder. Beeline is the version-1 working name (formerly Visual Files); the final name is decided before any public release.
 
 ## Language
 
