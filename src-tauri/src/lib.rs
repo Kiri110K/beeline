@@ -2,7 +2,9 @@ mod listing;
 mod name_index;
 mod operations;
 mod pinned_tabs;
+mod preview;
 mod qos;
+mod quick_look;
 mod recents;
 mod settings;
 mod telemetry;
@@ -31,6 +33,10 @@ use operations::{
     rename_item, resolve_installed_bundle, reveal_in_finder, trash_items, Operations,
 };
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
+use preview::{preview_metadata, preview_text_excerpt, preview_thumbnail, ThumbnailTracker};
+use quick_look::{
+    quick_look_hide, quick_look_is_open, quick_look_show, quick_look_update, QuickLook,
+};
 use recents::{get_recents, RecentsCache};
 use settings::{load_app_settings, save_app_settings};
 use telemetry::Telemetry;
@@ -326,6 +332,13 @@ pub fn run() {
             open_in_app,
             paste_copy,
             paste_move,
+            preview_metadata,
+            preview_text_excerpt,
+            preview_thumbnail,
+            quick_look_hide,
+            quick_look_is_open,
+            quick_look_show,
+            quick_look_update,
             quit_app,
             record_visit,
             rename_item,
@@ -346,6 +359,8 @@ pub fn run() {
             app.manage(telemetry);
             app.manage(ShellState::new(!hidden_launch));
             app.manage(Operations::new());
+            app.manage(QuickLook::new());
+            app.manage(ThumbnailTracker::new());
             // Load the last-success Recents cache so the first get_recents paints from it
             // instantly; the refresh is triggered lazily by that first call (§7, §11).
             app.manage(RecentsCache::load(&app.path().app_data_dir()?));
