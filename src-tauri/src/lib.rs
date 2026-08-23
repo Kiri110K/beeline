@@ -355,6 +355,23 @@ fn snap_to_center_if_near(
     Ok(dx <= GUIDE_DISTANCE_PX && dy <= GUIDE_DISTANCE_PX)
 }
 
+// The close button must never destroy the single window (SPEC §2: exactly one
+// application window, ever) — it hides through the one hide path instead, so the
+// background clock is stamped and the shortcut can summon the window back.
+fn install_close_to_hide(window: &WebviewWindow) {
+    let target = window.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let app = target.app_handle();
+            let state = app.state::<ShellState>();
+            if let Err(error) = perform_hide(app, &target, &state, "close-button") {
+                eprintln!("close-button hide failed: {error}");
+            }
+        }
+    });
+}
+
 fn install_center_snap(window: &WebviewWindow) {
     let snap_target = window.clone();
     let was_near = AtomicBool::new(false);
@@ -486,6 +503,7 @@ pub fn run() {
                 .get_webview_window(MAIN_WINDOW_LABEL)
                 .ok_or("main window is missing")?;
             install_center_snap(&window);
+            install_close_to_hide(&window);
 
             // Register the global shortcut from the persisted settings (SPEC §2, §12). The
             // plugin (with its handler) is already installed above; here we claim the actual
