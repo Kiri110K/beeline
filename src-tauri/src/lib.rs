@@ -11,6 +11,7 @@ mod telemetry;
 
 use std::{
     env,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
@@ -24,7 +25,7 @@ use tauri::{
     plugin::TauriPlugin, AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow,
     WindowEvent, Wry,
 };
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use listing::list_location;
 use name_index::{record_visit, search_name_index, NameIndex};
@@ -38,11 +39,12 @@ use quick_look::{
     quick_look_hide, quick_look_is_open, quick_look_show, quick_look_update, QuickLook,
 };
 use recents::{get_recents, RecentsCache};
-use settings::{load_app_settings, save_app_settings};
+use settings::get_settings;
 use telemetry::Telemetry;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_SHOWN_EVENT: &str = "beeline://window-shown";
+const SETTINGS_CHANGED_EVENT: &str = "beeline://settings-changed";
 const SNAP_DISTANCE_PX: u64 = 12;
 
 // Wall-clock ms since the Unix epoch, used to measure continuous background time
@@ -54,11 +56,108 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn default_shortcut() -> Shortcut {
-    Shortcut::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER),
-        Code::KeyF,
-    )
+// Build a global-shortcut `Shortcut` from the persisted spec (SPEC §2). The spec's `code`
+// is a W3C `KeyboardEvent.code` (`"KeyF"`), which `Code::from_str` accepts verbatim, so the
+// frontend capture field and the plugin share one representation. `None` when the code is
+// unrecognized (a malformed spec keeps the old shortcut, see `set_settings`).
+fn to_shortcut(spec: &settings::ShortcutSpec) -> Option<Shortcut> {
+    let code = Code::from_str(&spec.code).ok()?;
+    let mut modifiers = Modifiers::empty();
+    if spec.control {
+        modifiers |= Modifiers::CONTROL;
+    }
+    if spec.alt {
+        modifiers |= Modifiers::ALT;
+    }
+    if spec.shift {
+        modifiers |= Modifiers::SHIFT;
+    }
+    if spec.meta {
+        modifiers |= Modifiers::SUPER;
+    }
+    Some(Shortcut::new(Some(modifiers), code))
+}
+
+/// The result of a settings write (SPEC §12): whether the global shortcut is registered.
+/// `false` means the new shortcut could not be claimed and the old one was kept, so the
+/// frontend surfaces a Status Strip problem and the persisted shortcut stays unchanged.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSettingsOutcome {
+    shortcut_registered: bool,
+}
+
+// Persist the whole settings surface (SPEC §12) and apply its live consumers: re-register
+// the global shortcut when it changed, refresh the Name Index's Junk patterns and aliases,
+// and emit `beeline://settings-changed` so every frontend consumer re-pulls. A shortcut that
+// cannot be registered is rolled back to the previous one, which stays live.
+#[tauri::command]
+fn set_settings(
+    app: AppHandle,
+    settings: settings::AppSettings,
+) -> Result<SetSettingsOutcome, String> {
+    let path = settings::path_for(&app)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "settings path has no parent".to_owned())?;
+    let (old, _) = settings::read(dir);
+    let mut next = settings;
+
+    let mut shortcut_registered = true;
+    if next.global_shortcut != old.global_shortcut {
+        shortcut_registered =
+            reregister_shortcut(&app, &old.global_shortcut, &next.global_shortcut);
+        if !shortcut_registered {
+            // Keep the old shortcut both live (handled in reregister_shortcut) and persisted.
+            next.global_shortcut = old.global_shortcut.clone();
+        }
+    }
+
+    settings::write(&path, &next)?;
+
+    if let Some(index) = app.try_state::<NameIndex>() {
+        let aliases = next
+            .aliases
+            .iter()
+            .map(|entry| (entry.word.clone(), entry.path.clone()))
+            .collect();
+        index.apply_settings(next.junk_patterns.clone(), aliases);
+    }
+
+    app.emit(SETTINGS_CHANGED_EVENT, ())
+        .map_err(|error| format!("failed to emit settings changed event: {error}"))?;
+
+    Ok(SetSettingsOutcome {
+        shortcut_registered,
+    })
+}
+
+// Swap the live global shortcut: unregister the old, register the new, and on failure put
+// the old one back so the app is never left without a working shortcut (SPEC §2). Returns
+// whether the new shortcut is now registered.
+fn reregister_shortcut(
+    app: &AppHandle,
+    old: &settings::ShortcutSpec,
+    new: &settings::ShortcutSpec,
+) -> bool {
+    let Some(new_shortcut) = to_shortcut(new) else {
+        eprintln!("new global shortcut spec is invalid; keeping the old one");
+        return false;
+    };
+    let shortcuts = app.global_shortcut();
+    if let Some(old_shortcut) = to_shortcut(old) {
+        let _ = shortcuts.unregister(old_shortcut);
+    }
+    match shortcuts.register(new_shortcut) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("global shortcut re-registration failed: {error}");
+            if let Some(old_shortcut) = to_shortcut(old) {
+                let _ = shortcuts.register(old_shortcut);
+            }
+            false
+        }
+    }
 }
 
 struct ShellState {
@@ -213,11 +312,11 @@ fn hide_window(app: AppHandle, state: State<'_, ShellState>, origin: String) -> 
     perform_hide(&app, &window, &state, &origin)
 }
 
-fn global_shortcut_plugin(
-    shortcut: Shortcut,
-) -> Result<TauriPlugin<Wry>, tauri_plugin_global_shortcut::Error> {
-    Ok(tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut(shortcut)?
+// The global-shortcut plugin carries only the handler; the actual shortcut is registered at
+// runtime from the persisted settings (SPEC §2, §12), so a Settings change can unregister
+// and re-register it live without rebuilding the plugin.
+fn global_shortcut_plugin() -> TauriPlugin<Wry> {
+    tauri_plugin_global_shortcut::Builder::new()
         .with_handler(|app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 if let Err(error) = toggle_main_window(app) {
@@ -225,7 +324,7 @@ fn global_shortcut_plugin(
                 }
             }
         })
-        .build())
+        .build()
 }
 
 fn snap_to_center_if_near(
@@ -318,16 +417,17 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .plugin(tauri_plugin_opener::init())
+        .plugin(global_shortcut_plugin())
         .invoke_handler(tauri::generate_handler![
             cancel_operation,
             create_folder,
             delete_items_permanently,
             frontend_ready,
             get_recents,
+            get_settings,
             hide_window,
             home_directory,
             list_location,
-            load_app_settings,
             load_pinned_tabs,
             open_in_app,
             paste_copy,
@@ -344,9 +444,9 @@ pub fn run() {
             rename_item,
             resolve_installed_bundle,
             reveal_in_finder,
-            save_app_settings,
             save_pinned_tabs,
             search_name_index,
+            set_settings,
             telemetry_event,
             trash_items
         ])
@@ -370,25 +470,31 @@ pub fn run() {
                 .ok_or("main window is missing")?;
             install_center_snap(&window);
 
-            let shortcut = default_shortcut();
-            let shortcut_registration = global_shortcut_plugin(shortcut)
-                .map_err(|error| error.to_string())
-                .and_then(|plugin| {
-                    app.handle()
-                        .plugin(plugin)
-                        .map_err(|error| error.to_string())
-                });
-            let shortcut_registered = shortcut_registration.is_ok();
-            if let Err(error) = shortcut_registration {
-                eprintln!("global shortcut registration failed: {error}");
-            }
+            // Register the global shortcut from the persisted settings (SPEC §2, §12). The
+            // plugin (with its handler) is already installed above; here we claim the actual
+            // combination, so a Settings change can re-register it live.
+            let (app_settings, _) = settings::read(&app.path().app_data_dir()?);
+            let shortcut = to_shortcut(&app_settings.global_shortcut);
+            let shortcut_registered = match &shortcut {
+                Some(shortcut) => match app.global_shortcut().register(*shortcut) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("global shortcut registration failed: {error}");
+                        false
+                    }
+                },
+                None => {
+                    eprintln!("persisted global shortcut spec is invalid");
+                    false
+                }
+            };
 
             let telemetry = app.state::<Telemetry>();
             telemetry.record(
                 "backend_ready",
                 json!({
                     "log_path": telemetry.path().display().to_string(),
-                    "shortcut": shortcut.to_string(),
+                    "shortcut": shortcut.map(|shortcut| shortcut.to_string()),
                     "shortcut_registered": shortcut_registered,
                 }),
             )?;

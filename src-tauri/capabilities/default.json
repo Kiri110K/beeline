@@ -7,7 +7,11 @@
     "core:default",
     "core:window:allow-hide",
     "autostart:default",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
     "opener:default",
-    "opener:allow-open-path"
+    "opener:allow-open-path",
+    "opener:allow-open-url"
   ]
 }

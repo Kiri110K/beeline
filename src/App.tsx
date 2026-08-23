@@ -9,18 +9,23 @@ import { StatusStrip } from "./components/StatusStrip";
 import { TabStrip } from "./components/TabStrip";
 import { isPreviewPanelVisible, previewTargetFor } from "./preview/model";
 import { PreviewPanel } from "./preview/PreviewPanel";
+import { FirstRunBanner } from "./settings/FirstRunBanner";
+import { SettingsView } from "./settings/SettingsView";
+import { useSettingsStore } from "./settings/store";
 import { useTabs } from "./tabs/useTabs";
 
 // SPEC §3 layout, top to bottom: Tab strip, Navigation Input, dense file table,
 // reserved Preview Panel column, Status Strip zone. In Search Mode the Search
-// Results overlay floats over the file table without disturbing Browse state.
+// Results overlay floats over the file table without disturbing Browse state. The Settings
+// view (§12) and the first-run guidance (§13) overlay the whole window when active.
 export default function App(): ReactElement {
-  const tabs = useTabs();
+  const { settings, save } = useSettingsStore();
+  const tabs = useTabs(settings, save);
   const browse = tabs.activeBrowse;
   const search = tabs.activeSearch;
   const rename = tabs.ops.rename;
   // The Preview Panel follows the Focused Item in Browse and Search Results (SPEC §9). The
-  // column is removed entirely when the Settings seam is off — no animation.
+  // column is removed entirely when Settings turns it off — no animation.
   const previewTarget = previewTargetFor(browse, search);
   return (
     <div className="flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
@@ -53,11 +58,23 @@ export default function App(): ReactElement {
             />
           ) : null}
         </div>
-        {isPreviewPanelVisible() ? <PreviewPanel target={previewTarget} /> : null}
+        {isPreviewPanelVisible(settings) ? (
+          <PreviewPanel target={previewTarget} />
+        ) : null}
       </div>
       <ConfirmBar controller={tabs} />
       <StatusStrip controller={tabs} />
       <ActionMenu controller={tabs} />
+      {settings.firstRunDismissed ? null : (
+        <FirstRunBanner settings={settings} save={save} />
+      )}
+      {tabs.settingsOpen ? (
+        <SettingsView
+          settings={settings}
+          save={save}
+          onClose={tabs.closeSettings}
+        />
+      ) : null}
     </div>
   );
 }

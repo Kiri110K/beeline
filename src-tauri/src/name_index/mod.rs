@@ -18,7 +18,7 @@ mod watcher;
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -37,19 +37,30 @@ use visit_journal::{VisitJournal, VisitKind};
 /// The volume key for the home root. Mounted volumes get their own keys later.
 const HOME_VOLUME_KEY: &str = "home";
 
+/// The built-in Junk seed list (SPEC §6), re-exported so the settings store can seed a
+/// fresh install's editable list from the same source (SPEC §12).
+pub(crate) fn builtin_junk_names() -> Vec<String> {
+    junk::default_names()
+}
+
+/// A swappable Junk-patterns handle. Search, the watcher, and the Junk drain each take a
+/// cheap snapshot (`.read().clone()`); `apply_settings` swaps the inner `Arc` so a Settings
+/// change reaches every future classification without re-crawling (Junk refreshes lazily,
+/// SPEC §6, §10).
+type SharedJunk = Arc<RwLock<Arc<JunkPatterns>>>;
+
 /// Managed Tauri state holding the live index and everything needed to search, drain,
 /// and persist it.
 pub struct NameIndex {
     data: Arc<RwLock<IndexData>>,
-    junk: Arc<JunkPatterns>,
+    junk: SharedJunk,
     root: PathBuf,
     index_file: PathBuf,
     /// Local, ranking-only record of visits (SPEC §6, §11).
     journal: Arc<VisitJournal>,
-    /// Directory holding the app's persisted data (aliases, journal, index).
-    app_data_dir: PathBuf,
-    /// The Alias Dictionary, loaded lazily on first search (hot-reload not required).
-    aliases: OnceLock<Arc<AliasDictionary>>,
+    /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
+    /// searches rank against the current aliases.
+    aliases: RwLock<Arc<AliasDictionary>>,
 }
 
 impl NameIndex {
@@ -72,7 +83,21 @@ impl NameIndex {
             .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
         let index_file = persist::index_path(&app_data_dir, HOME_VOLUME_KEY);
 
-        let junk = Arc::new(JunkPatterns::default());
+        // Seed the Junk classifier and Alias Dictionary from the persisted settings store
+        // (SPEC §12): a fresh install's defaults carry the built-in Junk list and any
+        // migrated aliases, so both consumers start from the user's configuration.
+        let (settings, _) = crate::settings::read(&app_data_dir);
+        let junk: SharedJunk = Arc::new(RwLock::new(Arc::new(JunkPatterns::from_names(
+            settings.junk_patterns,
+        ))));
+        let aliases = RwLock::new(Arc::new(AliasDictionary::from_pairs(
+            settings
+                .aliases
+                .into_iter()
+                .map(|entry| (entry.word, entry.path)),
+            &root,
+        )));
+
         let loaded = persist::load(&index_file, &root);
         let had_persisted = loaded.is_some();
         let data = Arc::new(RwLock::new(
@@ -81,7 +106,7 @@ impl NameIndex {
 
         {
             let data = data.clone();
-            let junk = junk.clone();
+            let junk = junk.read().expect("junk lock poisoned").clone();
             let root = root.clone();
             let app = app.clone();
             let index_file = index_file.clone();
@@ -113,20 +138,28 @@ impl NameIndex {
             root,
             index_file,
             journal,
-            app_data_dir,
-            aliases: OnceLock::new(),
+            aliases,
         })
     }
 
-    /// The Alias Dictionary, loaded from `aliases.json` on first use (SPEC §6). Returns a
-    /// cheap `Arc` clone so the search can move it into the blocking task.
-    fn aliases(&self) -> Arc<AliasDictionary> {
-        self.aliases
-            .get_or_init(|| {
-                let path = self.app_data_dir.join("aliases.json");
-                Arc::new(AliasDictionary::load(&path, &self.root))
-            })
-            .clone()
+    /// A cheap snapshot of the current Junk patterns (SPEC §6), for a search or drain.
+    fn junk_snapshot(&self) -> Arc<JunkPatterns> {
+        self.junk.read().expect("junk lock poisoned").clone()
+    }
+
+    /// A cheap snapshot of the current Alias Dictionary (SPEC §6), for a search.
+    fn aliases_snapshot(&self) -> Arc<AliasDictionary> {
+        self.aliases.read().expect("aliases lock poisoned").clone()
+    }
+
+    /// Swap in Junk patterns and aliases from a Settings change (SPEC §12). Future
+    /// classifications and searches read the new values immediately; already-indexed items
+    /// keep their tier until the tree is next rescanned (Junk refreshes lazily, SPEC §6).
+    pub fn apply_settings(&self, junk_patterns: Vec<String>, aliases: Vec<(String, String)>) {
+        let next_junk = Arc::new(JunkPatterns::from_names(junk_patterns));
+        let next_aliases = Arc::new(AliasDictionary::from_pairs(aliases, &self.root));
+        *self.junk.write().expect("junk lock poisoned") = next_junk;
+        *self.aliases.write().expect("aliases lock poisoned") = next_aliases;
     }
 
     /// Persist the current index atomically. Called on graceful shutdown (never
@@ -196,10 +229,10 @@ pub async fn search_name_index(
     state: State<'_, NameIndex>,
 ) -> Result<SearchResponse, String> {
     let data = state.data.clone();
-    let junk = state.junk.clone();
+    let junk = state.junk_snapshot();
     let root = state.root.clone();
     let journal = state.journal.clone();
-    let aliases = state.aliases();
+    let aliases = state.aliases_snapshot();
     tauri::async_runtime::spawn_blocking(move || {
         run_search(
             &data,
@@ -466,7 +499,7 @@ mod tests {
         // Canonicalize: macOS temp dirs live under the `/var` → `/private/var` symlink,
         // and FSEvents reports canonical paths (matches the init-time canonicalization).
         let root = fs::canonicalize(dir.path()).unwrap();
-        let junk = Arc::new(JunkPatterns::default());
+        let junk = Arc::new(RwLock::new(Arc::new(JunkPatterns::default())));
         let shared = new_index(&root);
         watcher::spawn(shared.clone(), root.clone(), junk);
 

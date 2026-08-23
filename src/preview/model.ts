@@ -1,5 +1,6 @@
 import type { BrowseState } from "../browse/state";
 import { displayedHits, type SearchState } from "../search/state";
+import type { Settings } from "../settings/schema";
 
 // The Focused Item the Preview Panel and Quick Look act on, reduced to what both a directory
 // listing `Item` and a `SearchHit` can supply (SPEC §9: the panel follows the Focused Item in
@@ -91,9 +92,8 @@ export function classifyPreview(name: string): PreviewKind {
 export const PREVIEW_TEXT_MAX_BYTES = 4096;
 export const PREVIEW_THUMBNAIL_MAX_PX = 512;
 
-// The Settings seam (SPEC §12: Preview Panel on/off, default on). This one function is the
-// whole toggle for chunk B; the Settings ticket (#30) replaces it with a persisted flag.
-// When off, the column is removed entirely — no animation (SPEC §9).
-export function isPreviewPanelVisible(): boolean {
-  return true;
+// The Preview Panel toggle (SPEC §9, §12: on/off, default on), read from Settings. When off
+// the column is removed entirely — no animation (SPEC §9).
+export function isPreviewPanelVisible(settings: Settings): boolean {
+  return settings.previewPanelVisible;
 }

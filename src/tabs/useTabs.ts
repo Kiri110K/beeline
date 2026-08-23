@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { type ResultAsync } from "neverthrow";
 
 import { openPath, primaryActionFor } from "../browse/actions";
 import { afterEffectFor, type AfterActionId } from "../operations/afterAction";
@@ -20,12 +28,11 @@ import {
 } from "../operations/ipc";
 import {
   EDITOR_BUNDLE_IDS,
-  loadAppSettings,
-  saveAppSettings,
   TERMINAL_BUNDLE_IDS,
-  type AppSettings,
   type Slot,
 } from "../operations/settings";
+import type { SetSettingsOutcome } from "../settings/ipc";
+import type { Settings } from "../settings/schema";
 import {
   initialOpsState,
   opsReducer,
@@ -74,12 +81,14 @@ import {
   requestQuit,
   subscribeRecentsUpdated,
   subscribeWindowShown,
+  type ShellError,
 } from "../shell";
-import { defaultEntryPoint } from "./entryPoint";
+import { entryPointLocation } from "./entryPoint";
 import {
   BACKGROUND_RESET_MS,
   excursionsToReset,
   expiredTemporaryIds,
+  lifetimeMs,
 } from "./lifecycle";
 import {
   folderName,
@@ -194,6 +203,11 @@ export interface Tabs {
   cancelDelete: () => void;
   // Dismiss one Status Strip problem (§8, §13).
   dismissProblem: (id: number) => void;
+  // The in-app Settings view (§12): whether it is open, and its open/close controls. Opened
+  // from the Action Menu's Settings item and Cmd+, ; closed by Escape or its own control.
+  settingsOpen: boolean;
+  openSettings: () => void;
+  closeSettings: () => void;
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -292,10 +306,35 @@ function nextEnabledIndex(
   return from;
 }
 
-export function useTabs(): Tabs {
+export function useTabs(
+  settings: Settings,
+  saveSettings: (next: Settings) => ResultAsync<SetSettingsOutcome, ShellError>,
+): Tabs {
   // The opening Tab is stamped at 0; the first show (or navigation) re-stamps it,
   // and it is the active Tab so lifetime expiry never touches it meanwhile.
   const [state, dispatch] = useReducer(tabsReducer, 0, createInitialTabsState);
+
+  // The live settings (SPEC §12), kept in a ref so event handlers and callbacks read the
+  // current values without re-subscribing when they change. The store re-pulls on the
+  // `settings-changed` event, so this stays current across a Settings edit.
+  const settingsRef = useRef(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  // Whether the in-app Settings view is open (§12). A ref mirror lets the capture-phase
+  // keyboard handler read it synchronously (it owns Escape while Settings is up).
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsOpenRef = useRef(settingsOpen);
+  useEffect(() => {
+    settingsOpenRef.current = settingsOpen;
+  }, [settingsOpen]);
+  const openSettings = useCallback((): void => {
+    setSettingsOpen(true);
+  }, []);
+  const closeSettings = useCallback((): void => {
+    setSettingsOpen(false);
+  }, []);
 
   // Operations state (§8): clipboard, batch jobs, Status Strip problems, the Action Menu,
   // inline rename, and the delete confirm. Its own reducer so the Tab machinery stays clean.
@@ -317,18 +356,6 @@ export function useTabs(): Tabs {
   // Space/arrow keys read it synchronously in the keydown handler, and its truth is owned by
   // the backend mirror + closed event, not by a render (SPEC §5, §9).
   const quickLookRef = useRef<QuickLookSession | null>(null);
-
-  // The two auto-seeded application slots (§8): loaded once, updated in place when a slot
-  // is first resolved so a later Open in Terminal/Editor never re-probes.
-  const appSettingsRef = useRef<AppSettings>({
-    terminalBundleId: null,
-    editorBundleId: null,
-  });
-  useEffect(() => {
-    void loadAppSettings().match((loaded) => {
-      appSettingsRef.current = loaded;
-    }, reportShellError);
-  }, []);
 
   // Per-Tab Recents paging: the full cached count and whether a page fetch is in flight,
   // so scroll-to-load never over-requests (§7). Loaded count is the view's item length.
@@ -554,10 +581,10 @@ export function useTabs(): Tabs {
     );
   }, []);
 
-  // The single After Action policy (§12): consult the defaults table and hide the window
-  // when the action calls for it. Settings replaces the fixed table later (#30).
+  // The single After Action policy (§12): consult the live table from Settings and hide the
+  // window when the action calls for it.
   const afterAction = useCallback((action: AfterActionId): void => {
-    const effect = afterEffectFor(action);
+    const effect = afterEffectFor(settingsRef.current.afterAction, action);
     fireTelemetry("after_action", { action, effect });
     if (effect === "hide") {
       void requestHide("after-action").match(() => undefined, reportShellError);
@@ -579,9 +606,34 @@ export function useTabs(): Tabs {
     [afterAction],
   );
 
+  // Open the Action Menu on a specific Item (the "Show Action Menu" primary action, §5):
+  // select the Item first when it is not already selected, then open the menu below the
+  // Navigation Input (keyboard-style position, no anchor point).
+  const openItemMenu = useCallback((item: Item): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined || active.browse.load.status !== "ready") {
+      return;
+    }
+    const index = active.browse.load.items.findIndex(
+      (candidate) => candidate.path === item.path,
+    );
+    if (index === -1) {
+      return;
+    }
+    if (!active.browse.selected.has(index)) {
+      dispatch({
+        type: "browse",
+        tabId: active.id,
+        action: { type: "select", index, mode: "plain" },
+      });
+    }
+    opsDispatch({ type: "openMenu", via: "row_button", x: null, y: null, focusedIndex: 0 });
+    fireTelemetry("action_menu_opened", { via: "row_button" });
+  }, []);
+
   const activateItem = useCallback(
     (item: Item): void => {
-      const action = primaryActionFor(item);
+      const action = primaryActionFor(item, settingsRef.current);
       switch (action.kind) {
         case "enter":
           navigate(
@@ -593,9 +645,12 @@ export function useTabs(): Tabs {
         case "open":
           openFile(action.path);
           break;
+        case "menu":
+          openItemMenu(item);
+          break;
       }
     },
-    [navigate, openFile],
+    [navigate, openFile, openItemMenu],
   );
 
   const select = useCallback((index: number, mode: SelectMode): void => {
@@ -1055,7 +1110,7 @@ export function useTabs(): Tabs {
       nowMs,
     });
     scrollTopRef.current = 0;
-    navigate(id, defaultEntryPoint(), "replace");
+    navigate(id, entryPointLocation(settingsRef.current.defaultEntryPoint), "replace");
     // A new Temporary Tab starts with the Navigation Input active (§4, point 8).
     dispatch({ type: "search", tabId: id, action: { type: "activate" } });
     focusInput();
@@ -1084,7 +1139,11 @@ export function useTabs(): Tabs {
     // Closing the last Tab installs the clean replacement, which needs a listing.
     if (current.tabs.length === 1) {
       scrollTopRef.current = 0;
-      navigate(replacement.id, defaultEntryPoint(), "replace");
+      navigate(
+        replacement.id,
+        entryPointLocation(settingsRef.current.defaultEntryPoint),
+        "replace",
+      );
     }
     fireTelemetry("tab_closed", { kind: tab.kind });
     seqRef.current.delete(id);
@@ -1429,31 +1488,36 @@ export function useTabs(): Tabs {
   // Resolve a Terminal/Editor slot (§8): the persisted bundle id if seeded, otherwise the
   // first installed app in the priority list — persisted on first resolve. null means none
   // is installed, so the caller routes to a Status Strip problem (Settings UI is #30).
-  const resolveSlot = useCallback(async (slot: Slot): Promise<string | null> => {
-    const settings = appSettingsRef.current;
-    const existing =
-      slot === "terminal" ? settings.terminalBundleId : settings.editorBundleId;
-    if (existing !== null) {
-      return existing;
-    }
-    const ids = slot === "terminal" ? TERMINAL_BUNDLE_IDS : EDITOR_BUNDLE_IDS;
-    const resolved = await resolveInstalledBundle([...ids]).match(
-      (value) => value,
-      (error) => {
-        reportShellError(error);
-        return null;
-      },
-    );
-    if (resolved !== null) {
-      const next: AppSettings =
-        slot === "terminal"
-          ? { ...settings, terminalBundleId: resolved }
-          : { ...settings, editorBundleId: resolved };
-      appSettingsRef.current = next;
-      void saveAppSettings(next).match(() => undefined, reportShellError);
-    }
-    return resolved;
-  }, []);
+  const resolveSlot = useCallback(
+    async (slot: Slot): Promise<string | null> => {
+      const current = settingsRef.current;
+      const existing =
+        slot === "terminal" ? current.terminalBundleId : current.editorBundleId;
+      if (existing !== null) {
+        return existing;
+      }
+      const ids = slot === "terminal" ? TERMINAL_BUNDLE_IDS : EDITOR_BUNDLE_IDS;
+      const resolved = await resolveInstalledBundle([...ids]).match(
+        (value) => value,
+        (error) => {
+          reportShellError(error);
+          return null;
+        },
+      );
+      if (resolved !== null) {
+        // Persist the auto-seeded slot through the settings store so a later Open in
+        // Terminal/Editor never re-probes (SPEC §8). The changed event re-pulls settingsRef.
+        const next: Settings =
+          slot === "terminal"
+            ? { ...current, terminalBundleId: resolved }
+            : { ...current, editorBundleId: resolved };
+        settingsRef.current = next;
+        void saveSettings(next).match(() => undefined, reportShellError);
+      }
+      return resolved;
+    },
+    [saveSettings],
+  );
 
   // Open in Terminal (§8): a directory opens itself; a file opens its containing Location.
   const openInTerminal = useCallback((): void => {
@@ -1469,11 +1533,8 @@ export function useTabs(): Tabs {
     void (async () => {
       const bundle = await resolveSlot("terminal");
       if (bundle === null) {
-        opsDispatch({
-          type: "pushProblem",
-          path: target,
-          cause: strings.operations.status.noTerminal,
-        });
+        // A configured-but-missing (or unset) app routes to Settings on invocation (§8).
+        openSettings();
         return;
       }
       void openInApp(target, bundle).match(
@@ -1489,7 +1550,7 @@ export function useTabs(): Tabs {
         },
       );
     })();
-  }, [afterAction, resolveSlot]);
+  }, [afterAction, resolveSlot, openSettings]);
 
   // Open in Editor (§8): a file opens as a file; a directory opens as a project. `open -b`
   // hands the path to the editor, which treats a directory argument as a project root.
@@ -1506,11 +1567,8 @@ export function useTabs(): Tabs {
     void (async () => {
       const bundle = await resolveSlot("editor");
       if (bundle === null) {
-        opsDispatch({
-          type: "pushProblem",
-          path: target,
-          cause: strings.operations.status.noEditor,
-        });
+        // A configured-but-missing (or unset) app routes to Settings on invocation (§8).
+        openSettings();
         return;
       }
       void openInApp(target, bundle).match(
@@ -1526,7 +1584,7 @@ export function useTabs(): Tabs {
         },
       );
     })();
-  }, [afterAction, resolveSlot]);
+  }, [afterAction, resolveSlot, openSettings]);
 
   const revealSelection = useCallback((): void => {
     const active = tabById(stateRef.current, stateRef.current.activeId);
@@ -1685,7 +1743,7 @@ export function useTabs(): Tabs {
         { id: "newTab", label: menu.newTab, disabled: false, run: newTemporaryTab },
         { id: "pastePath", label: menu.pastePath, disabled: false, run: pastePath },
         { id: "refresh", label: menu.refresh, disabled: false, run: refresh },
-        { id: "settings", label: menu.settings, disabled: true, run: () => undefined },
+        { id: "settings", label: menu.settings, disabled: false, run: openSettings },
         { id: "quit", label: menu.quit, disabled: false, run: quit },
       ];
     }
@@ -1747,6 +1805,7 @@ export function useTabs(): Tabs {
     pastePath,
     refresh,
     quit,
+    openSettings,
     openSelected,
     copyPath,
     copySelection,
@@ -1867,7 +1926,11 @@ export function useTabs(): Tabs {
         // Keep the initial Temporary Tab; send it to the Default Entry Point (Recents,
         // §4/§7) and start with the Navigation Input active (§4, fresh Temporary Tab).
         const activeId = stateRef.current.activeId;
-        navigate(activeId, defaultEntryPoint(), "replace");
+        navigate(
+          activeId,
+          entryPointLocation(settingsRef.current.defaultEntryPoint),
+          "replace",
+        );
         dispatch({ type: "search", tabId: activeId, action: { type: "activate" } });
         focusInput();
         hydratedRef.current = true;
@@ -1936,7 +1999,12 @@ export function useTabs(): Tabs {
           fireTelemetry("excursions_reset", { count: resets.length });
         }
       }
-      const expired = expiredTemporaryIds(current.tabs, current.activeId, nowMs);
+      const expired = expiredTemporaryIds(
+        current.tabs,
+        current.activeId,
+        nowMs,
+        lifetimeMs(settingsRef.current.temporaryTabLifetime),
+      );
       if (expired.length > 0) {
         dispatch({ type: "removeExpired", ids: expired });
         for (const id of expired) {
@@ -2093,6 +2161,21 @@ export function useTabs(): Tabs {
         return;
       }
 
+      // The Settings view (§12) is a modal overlay above the Browse surface. Its Escape is
+      // handled here — before the editable-target early-return, so it closes even while a
+      // Settings field has focus, and above Search Results / the window hide in the Escape
+      // order (SPEC §5). It sits below Quick Look / Action Menu / confirm only in code; those
+      // never coexist with Settings. Every other key falls through to the form untouched,
+      // while app shortcuts are swallowed so Settings stays modal.
+      if (settingsOpenRef.current) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeSettings();
+        }
+        return;
+      }
+
       if (isEditableTarget(event.target)) {
         return;
       }
@@ -2164,6 +2247,11 @@ export function useTabs(): Tabs {
             // Cmd+L activates Search Mode and selects the retained query (§5).
             event.preventDefault();
             activateSearch();
+            return;
+          case ",":
+            // Cmd+, opens the Settings view (§12), the macOS convention.
+            event.preventDefault();
+            openSettings();
             return;
           case "t":
           case "T":
@@ -2291,6 +2379,8 @@ export function useTabs(): Tabs {
     openQuickLook,
     moveQuickLook,
     closeQuickLook,
+    openSettings,
+    closeSettings,
   ]);
 
   const activeTab = useMemo(() => {
@@ -2338,5 +2428,8 @@ export function useTabs(): Tabs {
     confirmDelete,
     cancelDelete,
     dismissProblem,
+    settingsOpen,
+    openSettings,
+    closeSettings,
   };
 }

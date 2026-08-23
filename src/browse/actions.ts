@@ -3,18 +3,27 @@ import { type ResultAsync } from "neverthrow";
 import { z } from "zod";
 
 import type { Item } from "../location/schema";
+import type { Settings } from "../settings/schema";
 import { fromTauri, type ShellError } from "../shell";
 
-// The primary action of an Item, resolved by kind. One small chokepoint so
-// Settings (later chunk) can replace the hardcoded per-kind defaults (§5).
+// The primary action of an Item, resolved by kind from Settings (SPEC §5, §12). A directory
+// is entered or shows the Action Menu; a file opens or shows the Action Menu — the one
+// chokepoint the whole app consults.
 export type PrimaryAction =
   | { kind: "enter"; path: string }
-  | { kind: "open"; path: string };
+  | { kind: "open"; path: string }
+  | { kind: "menu" };
 
-// v1 defaults: a directory is entered, a file opens in the system default app.
-export function primaryActionFor(item: Item): PrimaryAction {
-  return item.isDirectory
-    ? { kind: "enter", path: item.path }
+// Resolve an Item's primary action against the configured per-kind choice (SPEC §5 defaults:
+// directory → Enter Location, file → Open with Default App; either may be Show Action Menu).
+export function primaryActionFor(item: Item, settings: Settings): PrimaryAction {
+  if (item.isDirectory) {
+    return settings.primaryActionDirectory === "menu"
+      ? { kind: "menu" }
+      : { kind: "enter", path: item.path };
+  }
+  return settings.primaryActionFile === "menu"
+    ? { kind: "menu" }
     : { kind: "open", path: item.path };
 }
 

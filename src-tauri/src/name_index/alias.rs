@@ -3,11 +3,11 @@
 //! target surfaces as a top result — and never filters other results (the ranker adds
 //! the target as one more candidate; it removes nothing).
 //!
-//! Storage: `aliases.json` in the app data dir, a flat `{ "word": "location" }` object
-//! (e.g. `{ "загрузки": "~/Downloads" }`). It is user-editable via Settings in a later
-//! chunk and loaded lazily — hot-reload is not required, so the file is read once on the
-//! first search that needs it. A leading `~` in a target expands to the index root
-//! (home); other targets are taken verbatim.
+//! Storage: the Alias Dictionary lives in the settings store (SPEC §12); the Name Index is
+//! handed word → Location pairs at init and again on each Settings change, so the dictionary
+//! is rebuilt in place rather than read from a file here. A leading `~` in a target expands
+//! to the index root (home); other targets are taken verbatim. (The legacy standalone
+//! `aliases.json` is absorbed into the settings store on first run — see `settings.rs`.)
 
 use std::{
     collections::HashMap,
@@ -20,7 +20,8 @@ pub struct AliasDictionary {
 }
 
 impl AliasDictionary {
-    /// An empty dictionary (no aliases). Used before any file is loaded and in tests.
+    /// An empty dictionary (no aliases). Used by the ranker tests.
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             map: HashMap::new(),
@@ -44,18 +45,6 @@ impl AliasDictionary {
             })
             .collect();
         Self { map }
-    }
-
-    /// Load `aliases.json`, returning an empty dictionary if the file is absent or
-    /// malformed (a broken alias file must never take Search down).
-    pub fn load(path: &Path, home: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(path) else {
-            return Self::empty();
-        };
-        let Ok(raw) = serde_json::from_slice::<HashMap<String, String>>(&bytes) else {
-            return Self::empty();
-        };
-        Self::from_pairs(raw, home)
     }
 
     /// Resolve a whole query to its recommended Location, if it names an alias word.

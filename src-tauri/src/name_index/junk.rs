@@ -63,19 +63,28 @@ impl JunkPatterns {
     }
 }
 
+/// The built-in v1 Junk names (SPEC §6). `Caches` covers `~/Library/Caches`. This is the
+/// single source of the seed list: [`JunkPatterns::default`] uses it, and the settings store
+/// seeds a fresh install's editable list from it (SPEC §12), so the two never drift.
+pub(crate) fn default_names() -> Vec<String> {
+    [
+        "node_modules",
+        ".git",
+        "target",
+        ".build",
+        "dist",
+        ".cache",
+        "Caches",
+        ".claude",
+        ".codex",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect()
+}
+
 impl Default for JunkPatterns {
     fn default() -> Self {
-        // Built-in v1 list (SPEC §6). `Caches` covers `~/Library/Caches`.
-        Self::from_names([
-            "node_modules",
-            ".git",
-            "target",
-            ".build",
-            "dist",
-            ".cache",
-            "Caches",
-            ".claude",
-            ".codex",
-        ])
+        Self::from_names(default_names())
     }
 }

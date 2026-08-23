@@ -26,8 +26,9 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Start watching the index root recursively and apply changes incrementally. The
 /// watcher and its receiver are owned by the spawned thread, which keeps them alive for
-/// the process lifetime.
-pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<JunkPatterns>) {
+/// the process lifetime. The Junk patterns are held behind a shared handle so a Settings
+/// change reaches the next classified burst (SPEC §6, §12).
+pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<RwLock<Arc<JunkPatterns>>>) {
     thread::spawn(move || {
         set_background_qos();
 
@@ -65,9 +66,12 @@ pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<JunkPatter
                 }
             }
 
+            // Snapshot the current Junk patterns once per burst so a live Settings change
+            // classifies newly-seen paths without re-locking per path.
+            let patterns = junk.read().expect("junk lock poisoned").clone();
             for path in changed {
                 let mut index = shared.write().expect("name index lock poisoned");
-                apply_fs_event(&mut index, &path, &junk);
+                apply_fs_event(&mut index, &path, &patterns);
             }
         }
     });

@@ -92,8 +92,6 @@ export const strings = {
       trashing: "Moving to Trash",
       deleting: "Deleting",
       dismiss: "Dismiss",
-      noTerminal: "No Terminal application is installed",
-      noEditor: "No editor application is installed",
     },
     // The always-on confirm for Delete Permanently (SPEC §8: no "don't ask again").
     confirm: {
@@ -104,6 +102,97 @@ export const strings = {
       confirm: "Delete",
       cancel: "Cancel",
     },
+  },
+  // The in-app Settings view (SPEC §12) and the one-time first-run guidance (SPEC §13).
+  settings: {
+    title: "Settings",
+    close: "Close",
+    done: "Done",
+    shortcut: {
+      label: "Global shortcut",
+      hint: "Click and press a key combination",
+      recording: "Press a combination…",
+      edit: "Change",
+      unavailable: "That combination is unavailable — the previous one is kept",
+      noModifier: "Add at least one modifier (⌃ ⌥ ⇧ ⌘)",
+    },
+    entryPoint: {
+      label: "Default entry point",
+      recents: "Recents",
+      directory: "Folder",
+      pathPlaceholder: "/Users/…",
+    },
+    lifetime: {
+      label: "Temporary tab lifetime",
+      never: "Never",
+      minutes: (minutes: number): string =>
+        minutes % 60 === 0
+          ? `${String(minutes / 60)} h`
+          : `${String(minutes)} min`,
+    },
+    primaryAction: {
+      directoryLabel: "When opening a folder",
+      fileLabel: "When opening a file",
+      enter: "Enter folder",
+      open: "Open in default app",
+      menu: "Show action menu",
+    },
+    afterAction: {
+      heading: "After an action",
+      hide: "Hide window",
+      keep: "Keep open",
+      labels: {
+        open_file: "Open file",
+        open_terminal: "Open in Terminal",
+        open_editor: "Open in Editor",
+        copy_path: "Copy Path",
+        copy_file: "Copy File",
+        trash: "Move to Trash",
+        delete_permanently: "Delete Permanently",
+        enter_directory: "Enter folder",
+        navigation: "Navigation",
+        paste: "Paste",
+        move_paste: "Move Here",
+        rename: "Rename",
+        new_folder: "New Folder",
+        reveal: "Reveal in Finder",
+        open_in_new_tab: "Open in New Tab",
+      },
+    },
+    preview: {
+      label: "Preview panel",
+      on: "Show the preview panel",
+    },
+    slots: {
+      heading: "Applications",
+      terminalLabel: "Terminal",
+      editorLabel: "Editor",
+      notInstalled: "not installed",
+      none: "None detected",
+    },
+    aliases: {
+      heading: "Aliases",
+      hint: "A typed word recommends a folder in search — it never hides other results",
+      wordPlaceholder: "word",
+      pathPlaceholder: "/Users/…",
+      add: "Add alias",
+      remove: "Remove",
+    },
+    junk: {
+      heading: "Junk patterns",
+      hint: "Folder names classified as Junk: searchable, but ranked far down",
+      placeholder: "folder name",
+      add: "Add pattern",
+      remove: "Remove",
+      reset: "Reset to default",
+    },
+  },
+  firstRun: {
+    title: "Welcome to Beeline",
+    body: "Beeline works best with Full Disk Access and starting at login. Both are optional — you can change them later in Settings.",
+    fullDiskAccess: "Grant Full Disk Access",
+    loginItem: "Start at login",
+    dismiss: "Dismiss",
   },
   tabs: {
     untitled: "Untitled",
