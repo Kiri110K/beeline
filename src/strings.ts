@@ -35,6 +35,21 @@ export const strings = {
     previewPanel: "Preview panel",
     statusStrip: "Status",
   },
+  // The Preview Panel (SPEC §9): header labels for the Focused Item's metadata and the
+  // fallbacks its lightweight body can show.
+  preview: {
+    empty: "No selection",
+    kind: "Kind",
+    size: "Size",
+    created: "Created",
+    modified: "Modified",
+    itemsLabel: "Items",
+    items: (count: number): string =>
+      count === 1 ? "1 item" : `${String(count)} items`,
+    // Appended to a text excerpt whose file continued past the byte budget (SPEC §9).
+    truncationMark: "…",
+    unavailable: "This item is no longer available",
+  },
   operations: {
     // The one Action Menu (SPEC §5): item-scope file actions and app-scope actions.
     menu: {

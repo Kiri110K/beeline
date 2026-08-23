@@ -9,11 +9,16 @@
 //! dispatch itself is the ≤50 ms Quick Look budget, never the panel work. `quick_look_is_open`
 //! is answered from a `Send` atomic mirror so it needs no main-thread hop at all.
 //!
-//! Close truthfulness (the ticket's contract): the panel handles its own Escape and steals
-//! key focus while open, so the frontend never sees that Escape. When the panel closes by
-//! the user we observe `NSWindowWillCloseNotification`, flip the mirror, and emit
-//! `beeline://quick-look-closed` so the frontend's Escape-order state (SPEC §5) stays honest.
-//! A programmatic hide flips the mirror itself first, so the observer never double-reports it.
+//! Frontend-driven navigation (SPEC §9, chunk B): the panel is ordered front without taking
+//! key focus, so the app window keeps the keyboard and the frontend moves the Focused Item and
+//! re-points the panel via `quick_look_update` on Up/Down. The app closes the panel with
+//! `quick_look_hide` on Space-again or its Escape order (SPEC §5).
+//!
+//! Close truthfulness (the ticket's contract): when the user closes the panel by its own close
+//! control instead of through the app, we observe `NSWindowWillCloseNotification`, flip the
+//! mirror, and emit `beeline://quick-look-closed` so the frontend's Escape-order state (SPEC
+//! §5) stays honest. A programmatic hide flips the mirror itself first, so the observer never
+//! double-reports it.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -320,12 +325,14 @@ mod imp {
         let data_source = ProtocolObject::from_ref(&*controller);
         // SAFETY: wiring the shared panel to our data source and showing it — the standard
         // Quick Look presentation. `reloadData` before `setCurrentPreviewItemIndex` so the
-        // panel knows the new count before we position it.
+        // panel knows the new count before we position it. `orderFront` (not
+        // `makeKeyAndOrderFront`) keeps key focus on the app window, so the frontend keeps
+        // receiving Space/Up/Down/Escape and drives navigation itself (SPEC §9, chunk B).
         unsafe {
             panel.setDataSource(Some(data_source));
             panel.reloadData();
             panel.setCurrentPreviewItemIndex(target);
-            panel.makeKeyAndOrderFront(None);
+            panel.orderFront(None);
         }
     }
 

@@ -64,6 +64,10 @@ export type NavKind = "enter" | "back" | "forward" | "replace" | "reset";
 
 export type BrowseAction =
   | { type: "focusDelta"; delta: number; extend: boolean }
+  // Move the Focused Item to a specific row without touching the Selected Items — used to
+  // keep the Focused Item in sync with Quick Look navigation while preserving the original
+  // selection on close (SPEC §9).
+  | { type: "refocus"; index: number }
   | { type: "select"; index: number; mode: SelectMode }
   | { type: "clearSelection" }
   | {
@@ -259,6 +263,19 @@ export function browseReducer(
         anchorIndex: next,
         selected: new Set<number>([next]),
       };
+    }
+    case "refocus": {
+      if (state.load.status !== "ready") {
+        return state;
+      }
+      const count = state.load.items.length;
+      if (count === 0) {
+        return state;
+      }
+      const index = clamp(action.index, 0, count - 1);
+      // Focus (and the range anchor) move to the row; the Selected Items stand, so closing
+      // Quick Look restores the original selection with the Focused Item on the last file.
+      return { ...state, focusedIndex: index, anchorIndex: index };
     }
     case "select":
       return applySelect(state, action.index, action.mode);

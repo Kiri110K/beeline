@@ -60,6 +60,12 @@ import {
   type SearchState,
 } from "../search/state";
 import {
+  quickLookHide,
+  quickLookShow,
+  quickLookUpdate,
+  subscribeQuickLookClosed,
+} from "../preview/quickLook";
+import {
   copyToClipboard,
   readClipboardText,
   recordTelemetry,
@@ -110,6 +116,34 @@ const RECENTS_BATCH = 100;
 // The kind of Tab a group boundary drop lands in — the signal that a drag
 // crossed the Pinned/Temporary divide and must pin or unpin (§4, point 7).
 export type TabGroup = "pinned" | "temporary";
+
+// The live Quick Look session: the files-only list the panel was opened on, the current
+// position within it, and the parallel Browse row index of each file so Up/Down can move the
+// app's Focused Item in sync (SPEC §9). `null` whenever the panel is closed — the honest
+// mirror the Escape order reads (kept truthful by the closed event, SPEC §5).
+interface QuickLookSession {
+  paths: string[];
+  rows: number[];
+  index: number;
+}
+
+// The files-only rows of a Browse listing, in the given row order — the Quick Look list and
+// its Focused-Item mapping (SPEC §9: "files only"). Directories are skipped.
+function fileRowsOf(
+  items: readonly Item[],
+  rowOrder: readonly number[],
+): { paths: string[]; rows: number[] } {
+  const paths: string[] = [];
+  const rows: number[] = [];
+  for (const index of rowOrder) {
+    const item = items[index];
+    if (item !== undefined && !item.isDirectory) {
+      paths.push(item.path);
+      rows.push(index);
+    }
+  }
+  return { paths, rows };
+}
 
 export interface Tabs {
   state: TabsState;
@@ -278,6 +312,11 @@ export function useTabs(): Tabs {
     opsRef.current = ops;
   }, [ops]);
   const scrollTopRef = useRef(0);
+
+  // The live Quick Look session (null when closed). A ref, not state: the Escape order and the
+  // Space/arrow keys read it synchronously in the keydown handler, and its truth is owned by
+  // the backend mirror + closed event, not by a render (SPEC §5, §9).
+  const quickLookRef = useRef<QuickLookSession | null>(null);
 
   // The two auto-seeded application slots (§8): loaded once, updated in place when a slot
   // is first resolved so a later Open in Terminal/Editor never re-probes.
@@ -577,6 +616,101 @@ export function useTabs(): Tabs {
       tabId: stateRef.current.activeId,
       action: { type: "focusDelta", delta, extend },
     });
+  }, []);
+
+  // ---- Quick Look (§5, §9) ----------------------------------------------------------
+  // Space toggles the native Quick Look panel over the current file list, focused at the
+  // Focused Item; while open the frontend owns navigation and the panel stays front without
+  // taking key focus (chunk A), so Up/Down move the app's Focused Item AND re-point the panel.
+
+  // Open Quick Look on the active Browse Tab's file list (SPEC §9: files only). The list is
+  // the Selected Items when a multi-selection contains files, otherwise every file of the
+  // listing; it is anchored at the Focused Item. A no-op on a directory, an empty listing, or
+  // in Search Mode (the Navigation Input owns Space there). Fire-and-forget — never awaited on
+  // the Space path, so the dispatch stays within the ≤50 ms budget (SPEC §10).
+  const openQuickLook = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (
+      active === undefined ||
+      active.search.mode === "search" ||
+      active.browse.load.status !== "ready"
+    ) {
+      return;
+    }
+    const items = active.browse.load.items;
+    const focusIndex = active.browse.focusedIndex;
+    const focused = items[focusIndex];
+    if (focused === undefined || focused.isDirectory) {
+      return;
+    }
+    const multiSelect = active.browse.selected.size > 1;
+    const order = multiSelect
+      ? [...active.browse.selected].sort((a, b) => a - b)
+      : items.map((_item, index) => index);
+    let list = fileRowsOf(items, order);
+    // Ensure the Focused Item is part of the list (a multi-selection of only directories, or a
+    // focus outside the selection, falls back to the whole listing's files).
+    if (!list.rows.includes(focusIndex)) {
+      list = fileRowsOf(
+        items,
+        items.map((_item, index) => index),
+      );
+    }
+    if (list.paths.length === 0) {
+      return;
+    }
+    const position = Math.max(0, list.rows.indexOf(focusIndex));
+    quickLookRef.current = {
+      paths: list.paths,
+      rows: list.rows,
+      index: position,
+    };
+    void quickLookShow(list.paths, position).match(() => undefined, (error) => {
+      // The panel never opened, so the mirror must not claim it did.
+      quickLookRef.current = null;
+      reportShellError(error);
+    });
+  }, []);
+
+  // Move through the open Quick Look list (Up/Down, Ctrl+J/K): re-point the panel and move the
+  // app's Focused Item to the same file, leaving the Selected Items untouched so the original
+  // selection is restored on close (SPEC §9). Navigation reuses chunk A's events — no new
+  // telemetry here.
+  const moveQuickLook = useCallback((delta: number): void => {
+    const session = quickLookRef.current;
+    if (session === null) {
+      return;
+    }
+    const next = Math.min(
+      Math.max(session.index + delta, 0),
+      session.paths.length - 1,
+    );
+    if (next === session.index) {
+      return;
+    }
+    session.index = next;
+    void quickLookUpdate(session.paths, next).match(
+      () => undefined,
+      reportShellError,
+    );
+    const row = session.rows[next];
+    if (row !== undefined) {
+      dispatch({
+        type: "browse",
+        tabId: stateRef.current.activeId,
+        action: { type: "refocus", index: row },
+      });
+    }
+  }, []);
+
+  // Close Quick Look programmatically (Space again, or the Escape order). The Focused Item is
+  // already on the last file and the selection preserved, so nothing is restored here.
+  const closeQuickLook = useCallback((): void => {
+    if (quickLookRef.current === null) {
+      return;
+    }
+    quickLookRef.current = null;
+    void quickLookHide().match(() => undefined, reportShellError);
   }, []);
 
   // Sampled search telemetry: record only when a query was slow-ish or on every
@@ -1562,10 +1696,17 @@ export function useTabs(): Tabs {
       ops.clipboard.length > 0 &&
       currentDirPath(browse) !== null;
     const single = selCount === 1;
+    // Quick Look acts on files only (§9): enabled when the Focused Item is a file.
+    const focused = focusedItemOf(browse);
+    const canQuickLook = focused !== undefined && !focused.isDirectory;
     return [
       { id: "open", label: menu.open, disabled: false, run: openSelected },
-      // Quick Look is still absent in chunk B — a disabled placeholder (§9, ticket).
-      { id: "quickLook", label: menu.quickLook, disabled: true, run: () => undefined },
+      {
+        id: "quickLook",
+        label: menu.quickLook,
+        disabled: !canQuickLook,
+        run: openQuickLook,
+      },
       { id: "copyPath", label: menu.copyPath, disabled: false, run: copyPath },
       { id: "copyFile", label: menu.copyFile, disabled: false, run: copySelection },
       { id: "paste", label: menu.paste, disabled: !canPaste, run: pasteIntoLocation },
@@ -1619,6 +1760,7 @@ export function useTabs(): Tabs {
     openInTerminal,
     openInEditor,
     openInNewTab,
+    openQuickLook,
   ]);
 
   // The keyboard handler runs the focused row without re-deriving the menu; keep the latest
@@ -1843,11 +1985,50 @@ export function useTabs(): Tabs {
     };
   }, [navigate, revalidate]);
 
+  // Keep the Quick Look mirror truthful (SPEC §5): when the panel is closed by its own close
+  // control rather than by the app, chunk A emits the closed event; drop the session so the
+  // next Escape falls through to the layer below instead of being swallowed by a stale flag.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void subscribeQuickLookClosed(() => {
+      quickLookRef.current = null;
+    }).match((fn) => {
+      unlisten = fn;
+    }, reportShellError);
+    return () => {
+      if (unlisten !== null) {
+        unlisten();
+      }
+    };
+  }, []);
+
   // Combined keyboard contract: Tab shortcuts plus the Browse-mode keys, in the
   // capture phase so Escape can preventDefault before shell.ts's bubble hide.
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
       if (event.defaultPrevented) {
+        return;
+      }
+
+      // Quick Look is the topmost layer (§5 Escape order): while open it owns Up/Down and
+      // Ctrl+J/K (move through the files), Space and Escape (close), and swallows the rest so
+      // the Browse list underneath never reacts. Its truth is the `quickLookRef` mirror.
+      if (quickLookRef.current !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "Escape" || event.key === " ") {
+          closeQuickLook();
+        } else if (
+          event.key === "ArrowDown" ||
+          (event.ctrlKey && (event.key === "j" || event.key === "J"))
+        ) {
+          moveQuickLook(1);
+        } else if (
+          event.key === "ArrowUp" ||
+          (event.ctrlKey && (event.key === "k" || event.key === "K"))
+        ) {
+          moveQuickLook(-1);
+        }
         return;
       }
 
@@ -2060,6 +2241,11 @@ export function useTabs(): Tabs {
           event.preventDefault();
           activateFocused();
           break;
+        case " ":
+          // Space toggles Quick Look on the Focused Item (§5, §9): a no-op on a directory.
+          event.preventDefault();
+          openQuickLook();
+          break;
         case "ArrowLeft":
           event.preventDefault();
           goBack();
@@ -2102,6 +2288,9 @@ export function useTabs(): Tabs {
     trashSelection,
     requestDeleteSelection,
     openActionMenu,
+    openQuickLook,
+    moveQuickLook,
+    closeQuickLook,
   ]);
 
   const activeTab = useMemo(() => {

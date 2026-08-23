@@ -7,7 +7,8 @@ import { NavigationInput } from "./components/NavigationInput";
 import { SearchResults } from "./components/SearchResults";
 import { StatusStrip } from "./components/StatusStrip";
 import { TabStrip } from "./components/TabStrip";
-import { strings } from "./strings";
+import { isPreviewPanelVisible, previewTargetFor } from "./preview/model";
+import { PreviewPanel } from "./preview/PreviewPanel";
 import { useTabs } from "./tabs/useTabs";
 
 // SPEC §3 layout, top to bottom: Tab strip, Navigation Input, dense file table,
@@ -18,6 +19,9 @@ export default function App(): ReactElement {
   const browse = tabs.activeBrowse;
   const search = tabs.activeSearch;
   const rename = tabs.ops.rename;
+  // The Preview Panel follows the Focused Item in Browse and Search Results (SPEC §9). The
+  // column is removed entirely when the Settings seam is off — no animation.
+  const previewTarget = previewTargetFor(browse, search);
   return (
     <div className="flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
       <TabStrip controller={tabs} />
@@ -49,10 +53,7 @@ export default function App(): ReactElement {
             />
           ) : null}
         </div>
-        <div
-          className="w-[300px] shrink-0 border-l border-neutral-800"
-          aria-label={strings.zones.previewPanel}
-        />
+        {isPreviewPanelVisible() ? <PreviewPanel target={previewTarget} /> : null}
       </div>
       <ConfirmBar controller={tabs} />
       <StatusStrip controller={tabs} />
