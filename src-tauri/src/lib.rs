@@ -46,6 +46,9 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_SHOWN_EVENT: &str = "beeline://window-shown";
 const SETTINGS_CHANGED_EVENT: &str = "beeline://settings-changed";
 const SNAP_DISTANCE_PX: u64 = 12;
+/// The wider radius inside which the frontend shows the center guide lines (SPEC §2).
+const GUIDE_DISTANCE_PX: u64 = 48;
+const CENTER_GUIDE_EVENT: &str = "beeline://center-guide";
 
 // Wall-clock ms since the Unix epoch, used to measure continuous background time
 // (which must count sleep, so a monotonic clock will not do — §2, §9).
@@ -327,12 +330,15 @@ fn global_shortcut_plugin() -> TauriPlugin<Wry> {
         .build()
 }
 
+/// Snap when within [`SNAP_DISTANCE_PX`] of the centered position; report whether the
+/// window is within the wider guide radius so the frontend can draw the center guide
+/// lines (SPEC §2: guide lines give a snap target back to center).
 fn snap_to_center_if_near(
     window: &WebviewWindow,
     position: PhysicalPosition<i32>,
-) -> tauri::Result<()> {
+) -> tauri::Result<bool> {
     let Some(monitor) = window.current_monitor()? else {
-        return Ok(());
+        return Ok(false);
     };
     let window_size = window.outer_size()?;
     let work_area = monitor.work_area();
@@ -341,21 +347,32 @@ fn snap_to_center_if_near(
     let centered_y = i64::from(work_area.position.y)
         + (i64::from(work_area.size.height) - i64::from(window_size.height)) / 2;
 
-    if i64::from(position.x).abs_diff(centered_x) <= SNAP_DISTANCE_PX
-        && i64::from(position.y).abs_diff(centered_y) <= SNAP_DISTANCE_PX
-    {
+    let dx = i64::from(position.x).abs_diff(centered_x);
+    let dy = i64::from(position.y).abs_diff(centered_y);
+    if dx <= SNAP_DISTANCE_PX && dy <= SNAP_DISTANCE_PX {
         window.center()?;
     }
-
-    Ok(())
+    Ok(dx <= GUIDE_DISTANCE_PX && dy <= GUIDE_DISTANCE_PX)
 }
 
 fn install_center_snap(window: &WebviewWindow) {
     let snap_target = window.clone();
+    let was_near = AtomicBool::new(false);
     window.on_window_event(move |event| {
         if let WindowEvent::Moved(position) = event {
-            if let Err(error) = snap_to_center_if_near(&snap_target, *position) {
-                eprintln!("window center snap failed: {error}");
+            match snap_to_center_if_near(&snap_target, *position) {
+                // Emit on every near tick (the frontend's hide timeout re-arms on each)
+                // and once on leaving, so the guides cannot stick after the drag ends.
+                Ok(true) => {
+                    was_near.store(true, Ordering::Relaxed);
+                    let _ = snap_target.emit(CENTER_GUIDE_EVENT, true);
+                }
+                Ok(false) => {
+                    if was_near.swap(false, Ordering::Relaxed) {
+                        let _ = snap_target.emit(CENTER_GUIDE_EVENT, false);
+                    }
+                }
+                Err(error) => eprintln!("window center snap failed: {error}"),
             }
         }
     });

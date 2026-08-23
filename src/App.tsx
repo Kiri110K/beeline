@@ -1,6 +1,7 @@
 import type { ReactElement } from "react";
 
 import { ActionMenu } from "./components/ActionMenu";
+import { CenterGuides } from "./components/CenterGuides";
 import { ConfirmBar } from "./components/ConfirmBar";
 import { FileTable } from "./components/FileTable";
 import { NavigationInput } from "./components/NavigationInput";
@@ -28,7 +29,7 @@ export default function App(): ReactElement {
   // column is removed entirely when Settings turns it off — no animation.
   const previewTarget = previewTargetFor(browse, search);
   return (
-    <div className="flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
+    <div className="relative flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
       <TabStrip controller={tabs} />
       <NavigationInput controller={tabs} />
       <div className="flex min-h-0 flex-1">
@@ -75,6 +76,7 @@ export default function App(): ReactElement {
           onClose={tabs.closeSettings}
         />
       ) : null}
+      <CenterGuides />
     </div>
   );
 }
