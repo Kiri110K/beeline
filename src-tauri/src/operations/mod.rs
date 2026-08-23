@@ -161,7 +161,17 @@ impl UnitOp {
                 let dst = fsops::resolve_collision(target_dir, &name);
                 fsops::move_item(src, &dst).map_err(|error| cause::describe("moving", src, &error))
             }
-            UnitOp::Trash { path } => trash.trash(path),
+            UnitOp::Trash { path } => {
+                // A vanished source is this item's own failure, not a batch-wide refusal
+                // (SPEC §8, §13): trash/delete validate per item, unlike copy/move.
+                if fs::symlink_metadata(path).is_err() {
+                    return Err(format!(
+                        "No longer exists while trashing: {}",
+                        path.display()
+                    ));
+                }
+                trash.trash(path)
+            }
             UnitOp::Delete { path } => {
                 fsops::remove_tree(path).map_err(|error| cause::describe("deleting", path, &error))
             }
@@ -423,11 +433,14 @@ pub async fn paste_move(
 /// per item in the finished event. Returns the batch `job_id`.
 #[tauri::command]
 pub async fn trash_items(paths: Vec<String>, app: AppHandle) -> Result<u64, OpError> {
-    let sources = paths.clone();
-    let srcs = off_thread(move || validate_sources(&sources)).await?;
-    let units = srcs
+    // No pre-dispatch source validation: a vanished source becomes a per-item failure in
+    // the batch, not a whole-batch refusal (SPEC §8, §13 — copy/move keep the strict
+    // refusal, this destructive pair does not).
+    let units = paths
         .into_iter()
-        .map(|path| UnitOp::Trash { path })
+        .map(|path| UnitOp::Trash {
+            path: PathBuf::from(path),
+        })
         .collect();
     Ok(app
         .state::<Operations>()
@@ -442,11 +455,13 @@ pub async fn trash_items(paths: Vec<String>, app: AppHandle) -> Result<u64, OpEr
 /// every invocation of this command.
 #[tauri::command]
 pub async fn delete_items_permanently(paths: Vec<String>, app: AppHandle) -> Result<u64, OpError> {
-    let sources = paths.clone();
-    let srcs = off_thread(move || validate_sources(&sources)).await?;
-    let units = srcs
+    // Like trash_items: a vanished source is a per-item failure (the delete of a missing
+    // path yields a concrete "No longer exists" cause), never a whole-batch refusal.
+    let units = paths
         .into_iter()
-        .map(|path| UnitOp::Delete { path })
+        .map(|path| UnitOp::Delete {
+            path: PathBuf::from(path),
+        })
         .collect();
     Ok(app
         .state::<Operations>()
@@ -532,6 +547,39 @@ pub async fn open_in_app(path: String, bundle_id: String) -> Result<(), OpError>
         run_open(&["-b", &bundle_id, &path])
     })
     .await
+}
+
+/// Resolve the first installed bundle id from a priority list (SPEC §8: Terminal/Editor
+/// slot auto-seeding). The frontend passes its known-app priority list (Ghostty → iTerm2
+/// → Terminal; Zed → VS Code) and persists whichever this returns; `None` means none of
+/// them is installed, so the action routes to Settings on use (#30).
+///
+/// Probes each id with Spotlight (`mdfind kMDItemCFBundleIdentifier == '<id>'`): a hit
+/// prints the app's path, a miss prints nothing. Off the IPC threads like every other
+/// command; the ids come from a fixed frontend list (alphanumeric + dots), never user
+/// text, so the interpolated query needs no escaping.
+#[tauri::command]
+pub async fn resolve_installed_bundle(bundle_ids: Vec<String>) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        bundle_ids
+            .into_iter()
+            .find(|bundle_id| bundle_is_installed(bundle_id))
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Is an application with this bundle id installed? Empty (or Spotlight-unavailable)
+/// output means no; any printed path means yes.
+fn bundle_is_installed(bundle_id: &str) -> bool {
+    if bundle_id.trim().is_empty() {
+        return false;
+    }
+    Command::new("mdfind")
+        .arg(format!("kMDItemCFBundleIdentifier == '{bundle_id}'"))
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// Run `/usr/bin/open` with the given arguments (each a separate arg, never a shell
@@ -715,6 +763,36 @@ mod tests {
         assert_eq!(outcome.failures.len(), 1);
         assert!(outcome.failures[0].cause.contains("fake trash refused"));
         assert_eq!(fake.trashed(), vec![good]);
+    }
+
+    #[test]
+    fn trash_of_missing_source_is_a_per_item_failure() {
+        // The chunk-B amendment (SPEC §8, §13): unlike copy/move, a vanished trash source
+        // does not refuse the whole batch — the present sibling still trashes, the missing
+        // one lands as its own concrete failure.
+        let dir = TempDir::new();
+        let present = dir.path().join("here.txt");
+        fs::write(&present, b"x").unwrap();
+        let missing = dir.path().join("gone.txt"); // never created
+
+        let fake = FakeTrash::new();
+        let units = vec![
+            UnitOp::Trash {
+                path: present.clone(),
+            },
+            UnitOp::Trash {
+                path: missing.clone(),
+            },
+        ];
+        let cancel = no_cancel();
+        let outcome = run_units(units, &fake, &cancel, |_, _, _| {});
+
+        assert_eq!(outcome.ok_count, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].path, missing.display().to_string());
+        assert!(outcome.failures[0].cause.starts_with("No longer exists"));
+        // The present item was trashed; the missing one never reached the Trash seam.
+        assert_eq!(fake.trashed(), vec![present]);
     }
 
     #[test]

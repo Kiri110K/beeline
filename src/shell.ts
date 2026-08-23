@@ -81,6 +81,20 @@ export function copyToClipboard(text: string): ResultAsync<null, ShellError> {
   ).map(() => null);
 }
 
+// Read the system clipboard text (SPEC §8: Paste Path drops clipboard text into the
+// Navigation Input as a query). Wrapped in the shell's Result pattern like every boundary.
+export function readClipboardText(): ResultAsync<string, ShellError> {
+  return ResultAsync.fromPromise(navigator.clipboard.readText(), (cause) =>
+    requestError("clipboard.readText", cause),
+  );
+}
+
+// Quit the whole application through Rust (SPEC §5: the Action Menu's Quit); the resident
+// otherwise only hides.
+export function requestQuit(): ResultAsync<null, ShellError> {
+  return invokeCommand("quit_app", {});
+}
+
 export function reportShellError(error: ShellError): void {
   console.error("Beeline shell operation failed", error);
 }

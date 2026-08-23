@@ -4,6 +4,7 @@ mod operations;
 mod pinned_tabs;
 mod qos;
 mod recents;
+mod settings;
 mod telemetry;
 
 use std::{
@@ -27,10 +28,11 @@ use listing::list_location;
 use name_index::{record_visit, search_name_index, NameIndex};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
-    rename_item, reveal_in_finder, trash_items, Operations,
+    rename_item, resolve_installed_bundle, reveal_in_finder, trash_items, Operations,
 };
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use recents::{get_recents, RecentsCache};
+use settings::{load_app_settings, save_app_settings};
 use telemetry::Telemetry;
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -190,6 +192,13 @@ fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
     }
 }
 
+// Quit the whole application (SPEC §5: the Action Menu's Quit). The resident is an
+// accessory that normally hides rather than closing, so Quit is an explicit exit.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 fn hide_window(app: AppHandle, state: State<'_, ShellState>, origin: String) -> Result<(), String> {
     let window = app
@@ -312,13 +321,17 @@ pub fn run() {
             hide_window,
             home_directory,
             list_location,
+            load_app_settings,
             load_pinned_tabs,
             open_in_app,
             paste_copy,
             paste_move,
+            quit_app,
             record_visit,
             rename_item,
+            resolve_installed_bundle,
             reveal_in_finder,
+            save_app_settings,
             save_pinned_tabs,
             search_name_index,
             telemetry_event,

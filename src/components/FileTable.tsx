@@ -3,6 +3,7 @@ import { match } from "ts-pattern";
 
 import type { LoadState, SelectMode } from "../browse/state";
 import type { Location } from "../location/location";
+import type { MenuVia } from "../operations/state";
 import type { Item, ListErrorPayload } from "../location/schema";
 import { strings } from "../strings";
 import { FileRow } from "./FileRow";
@@ -15,9 +16,16 @@ interface FileTableProps {
   selected: ReadonlySet<number>;
   pendingScrollTop: number;
   scrollGeneration: number;
+  // Inline rename (§8): the path of the row being renamed (null if none) and the engine's
+  // collision message for it.
+  renamePath: string | null;
+  renameError: string | null;
   onSelect: (index: number, mode: SelectMode) => void;
   onActivate: (item: Item) => void;
   onScrollTop: (top: number) => void;
+  onOpenMenu: (index: number, via: MenuVia, x: number, y: number) => void;
+  onCommitRename: (name: string) => void;
+  onCancelRename: () => void;
   // Called when the table nears its end, so a Recents view can load its next page (§7).
   onReachEnd: () => void;
 }
@@ -44,9 +52,14 @@ export function FileTable({
   selected,
   pendingScrollTop,
   scrollGeneration,
+  renamePath,
+  renameError,
   onSelect,
   onActivate,
   onScrollTop,
+  onOpenMenu,
+  onCommitRename,
+  onCancelRename,
   onReachEnd,
 }: FileTableProps): ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -137,8 +150,13 @@ export function FileTable({
                 index={index}
                 isFocused={index === focusedIndex}
                 isSelected={selected.has(index)}
+                renaming={item.path === renamePath}
+                renameError={item.path === renamePath ? renameError : null}
                 onSelect={onSelect}
                 onActivate={onActivate}
+                onOpenMenu={onOpenMenu}
+                onCommitRename={onCommitRename}
+                onCancelRename={onCancelRename}
               />
             );
           })}

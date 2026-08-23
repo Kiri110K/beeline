@@ -2,6 +2,37 @@ import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import { openPath, primaryActionFor } from "../browse/actions";
+import { afterEffectFor, type AfterActionId } from "../operations/afterAction";
+import {
+  createFolder,
+  deleteItemsPermanently,
+  opErrorMessage,
+  openInApp,
+  pasteCopy,
+  pasteMove,
+  renameItem,
+  resolveInstalledBundle,
+  revealInFinder,
+  subscribeOperationFinished,
+  subscribeOperationProgress,
+  trashItems,
+  type JobId,
+} from "../operations/ipc";
+import {
+  EDITOR_BUNDLE_IDS,
+  loadAppSettings,
+  saveAppSettings,
+  TERMINAL_BUNDLE_IDS,
+  type AppSettings,
+  type Slot,
+} from "../operations/settings";
+import {
+  initialOpsState,
+  opsReducer,
+  type MenuItem,
+  type MenuVia,
+  type OpsState,
+} from "../operations/state";
 import {
   hasSelectionBeyondFocus,
   initialBrowseState,
@@ -30,9 +61,11 @@ import {
 } from "../search/state";
 import {
   copyToClipboard,
+  readClipboardText,
   recordTelemetry,
   reportShellError,
   requestHide,
+  requestQuit,
   subscribeRecentsUpdated,
   subscribeWindowShown,
 } from "../shell";
@@ -43,6 +76,7 @@ import {
   expiredTemporaryIds,
 } from "./lifecycle";
 import {
+  folderName,
   freshTabId,
   isOnExcursion,
   isPinned,
@@ -59,6 +93,7 @@ import {
   tabsReducer,
   type TabsState,
 } from "./state";
+import { strings } from "../strings";
 
 // Search tuning (SPEC §6, §10). The overlay shows the top ranked hits; a query is
 // "slow" once it is still in flight after this many ms; telemetry is sampled to
@@ -105,6 +140,26 @@ export interface Tabs {
   copyLocation: (id: TabId) => void;
   reorderTab: (id: TabId, targetIndex: number) => void;
   dropOnGroup: (id: TabId, group: TabGroup, targetIndex: number) => void;
+  // Operations (§8): clipboard, batch jobs, the Action Menu, inline rename, the delete
+  // confirm, and the Status Strip problem list. State is read for rendering; the actions
+  // the components need directly are exposed alongside it.
+  ops: OpsState;
+  menuItems: MenuItem[];
+  // Open the Action Menu from a row (`…` control or context click), selecting the row
+  // first when it is not already in the Selected Items (SPEC §5: one menu, three ways).
+  openRowMenu: (index: number, via: MenuVia, x: number, y: number) => void;
+  focusMenuItem: (index: number) => void;
+  runMenuItem: (item: MenuItem) => void;
+  closeActionMenu: () => void;
+  // Inline rename (§8): commit via the engine, or cancel; the collision message shows
+  // inline in the row (`ops.rename.error`).
+  commitRename: (newName: string) => void;
+  cancelRename: () => void;
+  // The always-on Delete Permanently confirm (§8).
+  confirmDelete: () => void;
+  cancelDelete: () => void;
+  // Dismiss one Status Strip problem (§8, §13).
+  dismissProblem: (id: number) => void;
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -148,10 +203,69 @@ function fireTelemetry(name: string, fields: Record<string, unknown>): void {
   void recordTelemetry(name, fields).match(() => undefined, reportShellError);
 }
 
+// The paths of the Selected Items of a browse view, in row order; empty unless the view is
+// ready (SPEC §8: operations act on Selected Items).
+function selectedPaths(browse: BrowseState): string[] {
+  if (browse.load.status !== "ready") {
+    return [];
+  }
+  const items = browse.load.items;
+  const paths: string[] = [];
+  for (const index of browse.selected) {
+    const item = items[index];
+    if (item !== undefined) {
+      paths.push(item.path);
+    }
+  }
+  return paths;
+}
+
+// The single Focused Item of a browse view (anchors Rename, Reveal, Open in Terminal/Editor,
+// Open in New Tab), or undefined when the view is not ready or empty.
+function focusedItemOf(browse: BrowseState): Item | undefined {
+  if (browse.load.status !== "ready") {
+    return undefined;
+  }
+  return browse.load.items[browse.focusedIndex];
+}
+
+// The directory path a paste / New Folder targets, or null when there is none — a Recents
+// Tab has no target directory, so Paste and New Folder are disabled there (SPEC §8, point 1).
+function currentDirPath(browse: BrowseState): string | null {
+  return browse.location.kind === "directory" && browse.location.path !== ""
+    ? browse.location.path
+    : null;
+}
+
+// The next enabled Action Menu row in `delta` direction, skipping disabled rows and
+// wrapping; returns `from` when nothing else is enabled (SPEC §5 keyboard).
+function nextEnabledIndex(
+  items: readonly MenuItem[],
+  from: number,
+  delta: number,
+): number {
+  const count = items.length;
+  if (count === 0) {
+    return from;
+  }
+  let index = from;
+  for (let step = 0; step < count; step += 1) {
+    index = (index + delta + count) % count;
+    if (items[index]?.disabled === false) {
+      return index;
+    }
+  }
+  return from;
+}
+
 export function useTabs(): Tabs {
   // The opening Tab is stamped at 0; the first show (or navigation) re-stamps it,
   // and it is the active Tab so lifetime expiry never touches it meanwhile.
   const [state, dispatch] = useReducer(tabsReducer, 0, createInitialTabsState);
+
+  // Operations state (§8): clipboard, batch jobs, Status Strip problems, the Action Menu,
+  // inline rename, and the delete confirm. Its own reducer so the Tab machinery stays clean.
+  const [ops, opsDispatch] = useReducer(opsReducer, initialOpsState);
 
   // Latest state and live active-Tab scroll for event handlers that must not
   // close over a stale snapshot.
@@ -159,7 +273,23 @@ export function useTabs(): Tabs {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  const opsRef = useRef(ops);
+  useEffect(() => {
+    opsRef.current = ops;
+  }, [ops]);
   const scrollTopRef = useRef(0);
+
+  // The two auto-seeded application slots (§8): loaded once, updated in place when a slot
+  // is first resolved so a later Open in Terminal/Editor never re-probes.
+  const appSettingsRef = useRef<AppSettings>({
+    terminalBundleId: null,
+    editorBundleId: null,
+  });
+  useEffect(() => {
+    void loadAppSettings().match((loaded) => {
+      appSettingsRef.current = loaded;
+    }, reportShellError);
+  }, []);
 
   // Per-Tab Recents paging: the full cached count and whether a page fetch is in flight,
   // so scroll-to-load never over-requests (§7). Loaded count is the view's item length.
@@ -385,12 +515,30 @@ export function useTabs(): Tabs {
     );
   }, []);
 
-  const openFile = useCallback((path: string): void => {
-    void openPath(path).match(() => {
-      fireTelemetry("file_opened", { path });
-      void recordVisit(path, "opened_file").match(() => undefined, reportShellError);
-    }, reportShellError);
+  // The single After Action policy (§12): consult the defaults table and hide the window
+  // when the action calls for it. Settings replaces the fixed table later (#30).
+  const afterAction = useCallback((action: AfterActionId): void => {
+    const effect = afterEffectFor(action);
+    fireTelemetry("after_action", { action, effect });
+    if (effect === "hide") {
+      void requestHide("after-action").match(() => undefined, reportShellError);
+    }
   }, []);
+
+  const openFile = useCallback(
+    (path: string): void => {
+      void openPath(path).match(() => {
+        fireTelemetry("file_opened", { path });
+        void recordVisit(path, "opened_file").match(
+          () => undefined,
+          reportShellError,
+        );
+        // Opening a file hides the window (§12 After Action default).
+        afterAction("open_file");
+      }, reportShellError);
+    },
+    [afterAction],
+  );
 
   const activateItem = useCallback(
     (item: Item): void => {
@@ -889,6 +1037,655 @@ export function useTabs(): Tabs {
     [pinTab, unpinTab, reorderTab],
   );
 
+  // ---- Operations (§8) --------------------------------------------------------------
+
+  // Cmd+C / Copy File: put the Selected Items on the in-app clipboard as file references
+  // (Finder model) and mirror the paths to the system clipboard as newline-joined text for
+  // interop (§8, point 1). Copy File hides the window (§12 After Action).
+  const copySelection = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const paths = selectedPaths(active.browse);
+    if (paths.length === 0) {
+      return;
+    }
+    opsDispatch({ type: "setClipboard", paths });
+    void copyToClipboard(paths.join("\n")).match(() => undefined, reportShellError);
+    fireTelemetry("clipboard_copied", { count: paths.length });
+    afterAction("copy_file");
+  }, [afterAction]);
+
+  // Copy Path: textual only (§8) — the path(s) to the system clipboard, newline-separated.
+  // Does not touch the in-app file-reference clipboard. Copy Path hides the window (§12).
+  const copyPath = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const paths = selectedPaths(active.browse);
+    if (paths.length === 0) {
+      return;
+    }
+    void copyToClipboard(paths.join("\n")).match(() => {
+      afterAction("copy_path");
+    }, reportShellError);
+  }, [afterAction]);
+
+  // Cmd+V / Paste: paste-copy the clipboard file references into the current Location; a
+  // same-Location paste duplicates (the engine suffixes). No-op without a clipboard or a
+  // target directory (a Recents Tab has neither). Keep the window open (§12).
+  const pasteIntoLocation = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const clip = opsRef.current.clipboard;
+    const dir = currentDirPath(active.browse);
+    if (clip === null || clip.length === 0 || dir === null) {
+      return;
+    }
+    void pasteCopy(clip, dir).match(
+      (jobId) => {
+        opsDispatch({
+          type: "jobStarted",
+          jobId,
+          label: strings.operations.status.copying,
+          total: clip.length,
+        });
+      },
+      (error) => {
+        opsDispatch({ type: "pushProblem", path: dir, cause: opErrorMessage(error) });
+      },
+    );
+    afterAction("paste");
+  }, [afterAction]);
+
+  // Cmd+Opt+V / Move Here: paste-move the clipboard into the current Location and clear the
+  // clipboard (§8, point 1). Keep the window open (§12).
+  const movePasteIntoLocation = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const clip = opsRef.current.clipboard;
+    const dir = currentDirPath(active.browse);
+    if (clip === null || clip.length === 0 || dir === null) {
+      return;
+    }
+    void pasteMove(clip, dir).match(
+      (jobId) => {
+        opsDispatch({
+          type: "jobStarted",
+          jobId,
+          label: strings.operations.status.moving,
+          total: clip.length,
+        });
+        opsDispatch({ type: "setClipboard", paths: null });
+      },
+      (error) => {
+        opsDispatch({ type: "pushProblem", path: dir, cause: opErrorMessage(error) });
+      },
+    );
+    afterAction("move_paste");
+  }, [afterAction]);
+
+  // Cmd+Delete / Move to Trash: no confirmation, ever (§8). Rows disappear only after the
+  // finished event refreshes the listing. Keep the window open (§12).
+  const trashSelection = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const paths = selectedPaths(active.browse);
+    if (paths.length === 0) {
+      return;
+    }
+    void trashItems(paths).match(
+      (jobId) => {
+        opsDispatch({
+          type: "jobStarted",
+          jobId,
+          label: strings.operations.status.trashing,
+          total: paths.length,
+        });
+      },
+      (error) => {
+        opsDispatch({
+          type: "pushProblem",
+          path: paths[0] ?? "",
+          cause: opErrorMessage(error),
+        });
+      },
+    );
+    afterAction("trash");
+  }, [afterAction]);
+
+  // Opt+Cmd+Delete / Delete Permanently: always opens the confirm (§8, no "don't ask
+  // again"); the delete itself runs only on confirm.
+  const requestDeleteSelection = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const paths = selectedPaths(active.browse);
+    if (paths.length === 0) {
+      return;
+    }
+    opsDispatch({ type: "openConfirm", paths });
+  }, []);
+
+  const confirmDelete = useCallback((): void => {
+    const confirm = opsRef.current.confirm;
+    if (confirm === null) {
+      return;
+    }
+    opsDispatch({ type: "closeConfirm" });
+    void deleteItemsPermanently(confirm.paths).match(
+      (jobId) => {
+        opsDispatch({
+          type: "jobStarted",
+          jobId,
+          label: strings.operations.status.deleting,
+          total: confirm.paths.length,
+        });
+      },
+      (error) => {
+        opsDispatch({
+          type: "pushProblem",
+          path: confirm.paths[0] ?? "",
+          cause: opErrorMessage(error),
+        });
+      },
+    );
+    afterAction("delete_permanently");
+  }, [afterAction]);
+
+  const cancelDelete = useCallback((): void => {
+    opsDispatch({ type: "closeConfirm" });
+  }, []);
+
+  // Inline rename (§8): seed the field with the Focused Item's current name.
+  const startRename = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item === undefined) {
+      return;
+    }
+    opsDispatch({ type: "startRename", path: item.path, initialName: item.name });
+  }, []);
+
+  const cancelRename = useCallback((): void => {
+    opsDispatch({ type: "cancelRename" });
+  }, []);
+
+  // Commit an inline rename (§8): a collision surfaces as an inline row message and keeps
+  // the field open; any other failure closes the field and lands in the Status Strip. On
+  // success the listing re-lists and focuses the renamed Item.
+  const commitRename = useCallback(
+    (newName: string): void => {
+      const rename = opsRef.current.rename;
+      if (rename === null) {
+        return;
+      }
+      const trimmed = newName.trim();
+      if (trimmed === "" || trimmed === rename.initialName) {
+        opsDispatch({ type: "cancelRename" });
+        return;
+      }
+      const activeId = stateRef.current.activeId;
+      const location = tabById(stateRef.current, activeId)?.browse.location;
+      void renameItem(rename.path, trimmed).match(
+        (newPath) => {
+          opsDispatch({ type: "cancelRename" });
+          if (location !== undefined) {
+            navigate(activeId, location, "replace", newPath);
+          }
+        },
+        (error) => {
+          if (error.code === "name-collision") {
+            opsDispatch({ type: "renameError", error: opErrorMessage(error) });
+          } else {
+            opsDispatch({ type: "cancelRename" });
+            opsDispatch({
+              type: "pushProblem",
+              path: rename.path,
+              cause: opErrorMessage(error),
+            });
+          }
+        },
+      );
+    },
+    [navigate],
+  );
+
+  // New Folder (§8): create in the current Location, then enter inline rename on the new
+  // row. No-op in a Recents Tab (no target directory). Keep the window open (§12).
+  const newFolder = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const dir = currentDirPath(active.browse);
+    if (dir === null) {
+      return;
+    }
+    const activeId = active.id;
+    const location = active.browse.location;
+    void createFolder(dir, strings.operations.newFolderName).match(
+      (newPath) => {
+        navigate(activeId, location, "replace", newPath);
+        opsDispatch({
+          type: "startRename",
+          path: newPath,
+          initialName: folderName(newPath),
+        });
+      },
+      (error) => {
+        opsDispatch({ type: "pushProblem", path: dir, cause: opErrorMessage(error) });
+      },
+    );
+    afterAction("new_folder");
+  }, [navigate, afterAction]);
+
+  // Resolve a Terminal/Editor slot (§8): the persisted bundle id if seeded, otherwise the
+  // first installed app in the priority list — persisted on first resolve. null means none
+  // is installed, so the caller routes to a Status Strip problem (Settings UI is #30).
+  const resolveSlot = useCallback(async (slot: Slot): Promise<string | null> => {
+    const settings = appSettingsRef.current;
+    const existing =
+      slot === "terminal" ? settings.terminalBundleId : settings.editorBundleId;
+    if (existing !== null) {
+      return existing;
+    }
+    const ids = slot === "terminal" ? TERMINAL_BUNDLE_IDS : EDITOR_BUNDLE_IDS;
+    const resolved = await resolveInstalledBundle([...ids]).match(
+      (value) => value,
+      (error) => {
+        reportShellError(error);
+        return null;
+      },
+    );
+    if (resolved !== null) {
+      const next: AppSettings =
+        slot === "terminal"
+          ? { ...settings, terminalBundleId: resolved }
+          : { ...settings, editorBundleId: resolved };
+      appSettingsRef.current = next;
+      void saveAppSettings(next).match(() => undefined, reportShellError);
+    }
+    return resolved;
+  }, []);
+
+  // Open in Terminal (§8): a directory opens itself; a file opens its containing Location.
+  const openInTerminal = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item === undefined) {
+      return;
+    }
+    const target = item.isDirectory ? item.path : parentPath(item.path);
+    void (async () => {
+      const bundle = await resolveSlot("terminal");
+      if (bundle === null) {
+        opsDispatch({
+          type: "pushProblem",
+          path: target,
+          cause: strings.operations.status.noTerminal,
+        });
+        return;
+      }
+      void openInApp(target, bundle).match(
+        () => {
+          afterAction("open_terminal");
+        },
+        (error) => {
+          opsDispatch({
+            type: "pushProblem",
+            path: target,
+            cause: opErrorMessage(error),
+          });
+        },
+      );
+    })();
+  }, [afterAction, resolveSlot]);
+
+  // Open in Editor (§8): a file opens as a file; a directory opens as a project. `open -b`
+  // hands the path to the editor, which treats a directory argument as a project root.
+  const openInEditor = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item === undefined) {
+      return;
+    }
+    const target = item.path;
+    void (async () => {
+      const bundle = await resolveSlot("editor");
+      if (bundle === null) {
+        opsDispatch({
+          type: "pushProblem",
+          path: target,
+          cause: strings.operations.status.noEditor,
+        });
+        return;
+      }
+      void openInApp(target, bundle).match(
+        () => {
+          afterAction("open_editor");
+        },
+        (error) => {
+          opsDispatch({
+            type: "pushProblem",
+            path: target,
+            cause: opErrorMessage(error),
+          });
+        },
+      );
+    })();
+  }, [afterAction, resolveSlot]);
+
+  const revealSelection = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item === undefined) {
+      return;
+    }
+    void revealInFinder(item.path).match(
+      () => {
+        afterAction("reveal");
+      },
+      (error) => {
+        opsDispatch({
+          type: "pushProblem",
+          path: item.path,
+          cause: opErrorMessage(error),
+        });
+      },
+    );
+  }, [afterAction]);
+
+  // Menu Open: run the Focused Item's primary action (a file opens and hides; a directory
+  // is entered). Reuses the double-click / Enter path so behavior stays identical.
+  const openSelected = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item !== undefined) {
+      activateItem(item);
+    }
+  }, [activateItem]);
+
+  // Open in New Tab (§8, §4): always creates a Temporary Tab — a directory opens at itself,
+  // a file at its containing Location with the file focused. Keep the window open (§12).
+  const openInNewTab = useCallback((): void => {
+    const current = stateRef.current;
+    const active = tabById(current, current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    const item = focusedItemOf(active.browse);
+    if (item === undefined) {
+      return;
+    }
+    const target = item.isDirectory ? item.path : parentPath(item.path);
+    const focusPath = item.isDirectory ? undefined : item.path;
+    const nowMs = Date.now();
+    const id = freshTabId();
+    const tab = makeTemporaryTab({ id, nowMs, originatorId: current.activeId });
+    const activeIndex = current.tabs.findIndex((t) => t.id === current.activeId);
+    const originator = current.tabs[activeIndex];
+    const index =
+      originator?.kind === "temporary" ? activeIndex + 1 : pinnedCount(current.tabs);
+    dispatch({
+      type: "create",
+      tab,
+      index,
+      outgoingScrollTop: scrollTopRef.current,
+      nowMs,
+    });
+    scrollTopRef.current = 0;
+    navigate(id, directoryLocation(target), "replace", focusPath, true);
+    fireTelemetry("tab_created", { kind: "temporary" });
+    afterAction("open_in_new_tab");
+  }, [navigate, afterAction]);
+
+  // App-scope Refresh: re-list the active Tab in place. Keep the window open (§12).
+  const refresh = useCallback((): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    if (active === undefined) {
+      return;
+    }
+    if (active.browse.load.status === "ready") {
+      revalidate(active.id, active.browse.location);
+    } else {
+      navigate(active.id, active.browse.location, "replace");
+    }
+    afterAction("navigation");
+  }, [revalidate, navigate, afterAction]);
+
+  // App-scope Paste Path (§5): drop the system clipboard text into the Navigation Input as
+  // a Search Query (not a file paste).
+  const pastePath = useCallback((): void => {
+    void readClipboardText().match((text) => {
+      activateSearch();
+      changeQuery(text);
+    }, reportShellError);
+  }, [activateSearch, changeQuery]);
+
+  const quit = useCallback((): void => {
+    void requestQuit().match(() => undefined, reportShellError);
+  }, []);
+
+  // Open the Action Menu by keyboard (§5, Cmd+K): app scope with no Selected Items, item
+  // scope otherwise. Position is derived at render (no anchor point).
+  const openActionMenu = useCallback((via: MenuVia): void => {
+    opsDispatch({ type: "openMenu", via, x: null, y: null, focusedIndex: 0 });
+    fireTelemetry("action_menu_opened", { via });
+  }, []);
+
+  // Open the Action Menu from a row (§5, `…` control or context click), selecting the row
+  // first unless it is already among the Selected Items (Finder behavior).
+  const openRowMenu = useCallback(
+    (index: number, via: MenuVia, x: number, y: number): void => {
+      const active = tabById(stateRef.current, stateRef.current.activeId);
+      if (active === undefined || active.browse.load.status !== "ready") {
+        return;
+      }
+      if (!active.browse.selected.has(index)) {
+        dispatch({
+          type: "browse",
+          tabId: active.id,
+          action: { type: "select", index, mode: "plain" },
+        });
+      }
+      opsDispatch({ type: "openMenu", via, x, y, focusedIndex: 0 });
+      fireTelemetry("action_menu_opened", { via });
+    },
+    [],
+  );
+
+  const focusMenuItem = useCallback((index: number): void => {
+    opsDispatch({ type: "menuFocus", index });
+  }, []);
+
+  const closeActionMenu = useCallback((): void => {
+    opsDispatch({ type: "closeMenu" });
+  }, []);
+
+  const runMenuItem = useCallback((item: MenuItem): void => {
+    opsDispatch({ type: "closeMenu" });
+    if (!item.disabled) {
+      item.run();
+    }
+  }, []);
+
+  const dismissProblem = useCallback((id: number): void => {
+    opsDispatch({ type: "dismissProblem", id });
+  }, []);
+
+  // The Action Menu's rows, derived from the live selection each render (§5): file actions
+  // with Selected Items, application actions without.
+  const menuItems = useMemo<MenuItem[]>(() => {
+    const active = state.tabs.find((tab) => tab.id === state.activeId);
+    const browse = active?.browse;
+    const selCount = browse === undefined ? 0 : selectedPaths(browse).length;
+    if (browse === undefined || selCount === 0) {
+      // Application actions (§5): reachable via Cmd+K with an empty selection.
+      const menu = strings.operations.menu;
+      return [
+        { id: "newTab", label: menu.newTab, disabled: false, run: newTemporaryTab },
+        { id: "pastePath", label: menu.pastePath, disabled: false, run: pastePath },
+        { id: "refresh", label: menu.refresh, disabled: false, run: refresh },
+        { id: "settings", label: menu.settings, disabled: true, run: () => undefined },
+        { id: "quit", label: menu.quit, disabled: false, run: quit },
+      ];
+    }
+    const menu = strings.operations.menu;
+    const isRecents = browse.location.kind === "recents";
+    const canPaste =
+      ops.clipboard !== null &&
+      ops.clipboard.length > 0 &&
+      currentDirPath(browse) !== null;
+    const single = selCount === 1;
+    return [
+      { id: "open", label: menu.open, disabled: false, run: openSelected },
+      // Quick Look is still absent in chunk B — a disabled placeholder (§9, ticket).
+      { id: "quickLook", label: menu.quickLook, disabled: true, run: () => undefined },
+      { id: "copyPath", label: menu.copyPath, disabled: false, run: copyPath },
+      { id: "copyFile", label: menu.copyFile, disabled: false, run: copySelection },
+      { id: "paste", label: menu.paste, disabled: !canPaste, run: pasteIntoLocation },
+      {
+        id: "movePaste",
+        label: menu.movePaste,
+        disabled: !canPaste,
+        run: movePasteIntoLocation,
+      },
+      { id: "rename", label: menu.rename, disabled: !single, run: startRename },
+      { id: "newFolder", label: menu.newFolder, disabled: isRecents, run: newFolder },
+      { id: "trash", label: menu.trash, disabled: false, run: trashSelection },
+      {
+        id: "deletePermanently",
+        label: menu.deletePermanently,
+        disabled: false,
+        run: requestDeleteSelection,
+      },
+      { id: "reveal", label: menu.reveal, disabled: false, run: revealSelection },
+      {
+        id: "openTerminal",
+        label: menu.openTerminal,
+        disabled: false,
+        run: openInTerminal,
+      },
+      { id: "openEditor", label: menu.openEditor, disabled: false, run: openInEditor },
+      {
+        id: "openInNewTab",
+        label: menu.openInNewTab,
+        disabled: false,
+        run: openInNewTab,
+      },
+    ];
+  }, [
+    state,
+    ops.clipboard,
+    newTemporaryTab,
+    pastePath,
+    refresh,
+    quit,
+    openSelected,
+    copyPath,
+    copySelection,
+    pasteIntoLocation,
+    movePasteIntoLocation,
+    startRename,
+    newFolder,
+    trashSelection,
+    requestDeleteSelection,
+    revealSelection,
+    openInTerminal,
+    openInEditor,
+    openInNewTab,
+  ]);
+
+  // The keyboard handler runs the focused row without re-deriving the menu; keep the latest
+  // rows in a ref so it never closes over a stale list.
+  const menuItemsRef = useRef<MenuItem[]>(menuItems);
+  useEffect(() => {
+    menuItemsRef.current = menuItems;
+  }, [menuItems]);
+
+  // Batch progress is throttled to one flush per animation frame (§10 keystroke budget):
+  // events accumulate in a map, the newest tick per job wins, and one dispatch applies them.
+  const pendingProgressRef = useRef(new Map<JobId, { done: number; total: number }>());
+  const progressRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    let unlistenProgress: UnlistenFn | null = null;
+    let unlistenFinished: UnlistenFn | null = null;
+    void subscribeOperationProgress((progress) => {
+      pendingProgressRef.current.set(progress.jobId, {
+        done: progress.done,
+        total: progress.total,
+      });
+      if (progressRafRef.current === null) {
+        progressRafRef.current = requestAnimationFrame(() => {
+          progressRafRef.current = null;
+          const updates = [...pendingProgressRef.current.entries()].map(
+            ([jobId, value]) => ({ jobId, done: value.done, total: value.total }),
+          );
+          pendingProgressRef.current.clear();
+          opsDispatch({ type: "jobProgress", updates });
+        });
+      }
+    }).match((fn) => {
+      unlistenProgress = fn;
+    }, reportShellError);
+    void subscribeOperationFinished((finished) => {
+      opsDispatch({
+        type: "jobFinished",
+        jobId: finished.jobId,
+        failures: finished.failures,
+      });
+      // Rows disappear only after success (§8): re-list the active Tab so trashed/deleted
+      // rows leave and pasted/moved rows arrive, selection re-resolved by path.
+      const active = tabById(stateRef.current, stateRef.current.activeId);
+      if (active !== undefined) {
+        if (active.browse.load.status === "ready") {
+          revalidate(active.id, active.browse.location);
+        } else {
+          navigate(active.id, active.browse.location, "replace");
+        }
+      }
+    }).match((fn) => {
+      unlistenFinished = fn;
+    }, reportShellError);
+    return () => {
+      if (unlistenProgress !== null) {
+        unlistenProgress();
+      }
+      if (unlistenFinished !== null) {
+        unlistenFinished();
+      }
+      if (progressRafRef.current !== null) {
+        cancelAnimationFrame(progressRafRef.current);
+        progressRafRef.current = null;
+      }
+    };
+  }, [revalidate, navigate]);
+
   // Whenever the active Tab changes, revalidate its cached listing (or retry a
   // failed one) so switching paints instantly, then refreshes in place (§10, §11).
   useEffect(() => {
@@ -1050,7 +1847,72 @@ export function useTabs(): Tabs {
   // capture phase so Escape can preventDefault before shell.ts's bubble hide.
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent): void {
-      if (event.defaultPrevented || isEditableTarget(event.target)) {
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      // The Action Menu is the topmost Escape layer (§5): while open it owns Up/Down,
+      // Enter/Right (run), and Escape (close), ahead of Search Results, Selected Items,
+      // and the window hide. stopPropagation keeps the Navigation Input's own Escape from
+      // also firing.
+      const currentOps = opsRef.current;
+      if (currentOps.menu !== null) {
+        const items = menuItemsRef.current;
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeActionMenu();
+          return;
+        }
+        if (
+          event.key === "ArrowDown" ||
+          event.key === "ArrowUp" ||
+          (event.ctrlKey && (event.key === "j" || event.key === "J")) ||
+          (event.ctrlKey && (event.key === "k" || event.key === "K"))
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          const delta =
+            event.key === "ArrowDown" || event.key === "j" || event.key === "J"
+              ? 1
+              : -1;
+          focusMenuItem(nextEnabledIndex(items, currentOps.menu.focusedIndex, delta));
+          return;
+        }
+        if (event.key === "Enter" || event.key === "ArrowRight") {
+          event.preventDefault();
+          event.stopPropagation();
+          const item = items[currentOps.menu.focusedIndex];
+          if (item !== undefined) {
+            runMenuItem(item);
+          }
+          return;
+        }
+        // Swallow the rest so the Browse list underneath never reacts while the menu owns
+        // the keyboard.
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+
+      // The always-on Delete Permanently confirm (§8): Enter confirms, Escape cancels.
+      if (currentOps.confirm !== null) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          cancelDelete();
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.stopPropagation();
+          confirmDelete();
+          return;
+        }
+        return;
+      }
+
+      if (isEditableTarget(event.target)) {
         return;
       }
 
@@ -1065,6 +1927,40 @@ export function useTabs(): Tabs {
           return;
         }
         switch (event.key) {
+          case "c":
+          case "C":
+            // Cmd+C copies Selected Items as file references (§8, point 1).
+            if (!event.altKey) {
+              event.preventDefault();
+              copySelection();
+            }
+            return;
+          case "v":
+          case "V":
+            // Cmd+V paste-copies; Cmd+Opt+V paste-moves and clears the clipboard (§8).
+            event.preventDefault();
+            if (event.altKey) {
+              movePasteIntoLocation();
+            } else {
+              pasteIntoLocation();
+            }
+            return;
+          case "k":
+          case "K":
+            // Cmd+K opens the one Action Menu (§5).
+            event.preventDefault();
+            openActionMenu("cmd_k");
+            return;
+          case "Backspace":
+          case "Delete":
+            // Cmd+Delete → Trash (no confirm); Opt+Cmd+Delete → confirm then delete (§8).
+            event.preventDefault();
+            if (event.altKey) {
+              requestDeleteSelection();
+            } else {
+              trashSelection();
+            }
+            return;
           case "9": {
             event.preventDefault();
             const tabs = stateRef.current.tabs;
@@ -1195,6 +2091,17 @@ export function useTabs(): Tabs {
     goForward,
     newTemporaryTab,
     removeTab,
+    closeActionMenu,
+    focusMenuItem,
+    runMenuItem,
+    cancelDelete,
+    confirmDelete,
+    copySelection,
+    pasteIntoLocation,
+    movePasteIntoLocation,
+    trashSelection,
+    requestDeleteSelection,
+    openActionMenu,
   ]);
 
   const activeTab = useMemo(() => {
@@ -1231,5 +2138,16 @@ export function useTabs(): Tabs {
     copyLocation,
     reorderTab,
     dropOnGroup,
+    ops,
+    menuItems,
+    openRowMenu,
+    focusMenuItem,
+    runMenuItem,
+    closeActionMenu,
+    commitRename,
+    cancelRename,
+    confirmDelete,
+    cancelDelete,
+    dismissProblem,
   };
 }

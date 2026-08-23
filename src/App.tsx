@@ -1,8 +1,11 @@
 import type { ReactElement } from "react";
 
+import { ActionMenu } from "./components/ActionMenu";
+import { ConfirmBar } from "./components/ConfirmBar";
 import { FileTable } from "./components/FileTable";
 import { NavigationInput } from "./components/NavigationInput";
 import { SearchResults } from "./components/SearchResults";
+import { StatusStrip } from "./components/StatusStrip";
 import { TabStrip } from "./components/TabStrip";
 import { strings } from "./strings";
 import { useTabs } from "./tabs/useTabs";
@@ -14,6 +17,7 @@ export default function App(): ReactElement {
   const tabs = useTabs();
   const browse = tabs.activeBrowse;
   const search = tabs.activeSearch;
+  const rename = tabs.ops.rename;
   return (
     <div className="flex h-screen flex-col bg-neutral-900 text-[13px] text-neutral-100">
       <TabStrip controller={tabs} />
@@ -27,9 +31,14 @@ export default function App(): ReactElement {
             selected={browse.selected}
             pendingScrollTop={browse.pendingScrollTop}
             scrollGeneration={browse.scrollGeneration}
+            renamePath={rename?.path ?? null}
+            renameError={rename?.error ?? null}
             onSelect={tabs.select}
             onActivate={tabs.activateItem}
             onScrollTop={tabs.onScrollTop}
+            onOpenMenu={tabs.openRowMenu}
+            onCommitRename={tabs.commitRename}
+            onCancelRename={tabs.cancelRename}
             onReachEnd={tabs.loadMoreRecents}
           />
           {search.mode === "search" ? (
@@ -45,10 +54,9 @@ export default function App(): ReactElement {
           aria-label={strings.zones.previewPanel}
         />
       </div>
-      <div
-        className="h-6 shrink-0 border-t border-neutral-800"
-        aria-label={strings.zones.statusStrip}
-      />
+      <ConfirmBar controller={tabs} />
+      <StatusStrip controller={tabs} />
+      <ActionMenu controller={tabs} />
     </div>
   );
 }
