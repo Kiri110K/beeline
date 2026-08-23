@@ -9,6 +9,8 @@
     "noImplicitOverride": true,
     "noPropertyAccessFromIndexSignature": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "erasableSyntaxOnly": true,
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
     "noUnusedLocals": true,
