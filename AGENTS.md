@@ -1,6 +1,6 @@
 # Beeline
 
-Design and specification repo for Beeline (working name for version 1; formerly Visual Files) — a personal, fast macOS file browser meant to replace Finder for everyday file work. This is a planning effort: specifications, ADRs, and disposable demos. No production implementation lives here yet.
+Repo for Beeline (working name for version 1; formerly Visual Files) — a personal, fast macOS file browser meant to replace Finder for everyday file work. Planning is complete: `docs/SPEC.md` is the implementation-ready specification, backed by ADRs and disposable demos. The production implementation is built in this same repo.
 
 - Canonical domain language: `CONTEXT.md` at the repo root (glossary only, no implementation details).
 - Decisions: `docs/adr/`.

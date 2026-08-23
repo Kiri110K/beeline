@@ -9,7 +9,7 @@ The app launches without a Dock icon and keeps one hidden `NSPanel` resident. `C
 The build needs macOS Command Line Tools. Full Xcode is not required.
 
 ```sh
-cd /Users/kiri110k/lab/raycast-visual-files/demos/native
+cd /Users/kiri110k/lab/beeline/demos/native
 ./scripts/test.sh
 ./scripts/build-app.sh
 open "dist/Visual Files Native.app"
