@@ -21,7 +21,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 use listing::list_location;
-use name_index::{search_name_index, NameIndex};
+use name_index::{record_visit, search_name_index, NameIndex};
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use telemetry::Telemetry;
 
@@ -301,6 +301,7 @@ pub fn run() {
             home_directory,
             list_location,
             load_pinned_tabs,
+            record_visit,
             save_pinned_tabs,
             search_name_index,
             telemetry_event

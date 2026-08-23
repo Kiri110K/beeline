@@ -113,6 +113,10 @@ pub struct IndexData {
     pub live: usize,
     /// Junk directories whose contents may be stale and need a lazy rescan.
     pub junk_dirty: HashSet<DirId>,
+    /// Index generation counter, bumped on every structural mutation. The search
+    /// response returns it so the UI can later reconcile progressive results (SPEC §6):
+    /// a rising revision between two responses means the index changed underneath them.
+    pub revision: u64,
 }
 
 impl IndexData {
@@ -125,6 +129,7 @@ impl IndexData {
             entries: Vec::new(),
             live: 0,
             junk_dirty: HashSet::new(),
+            revision: 0,
         }
     }
 
@@ -183,6 +188,7 @@ impl IndexData {
         let index = self.entries.len() as u32;
         self.entries.push(Some(entry));
         self.live += 1;
+        self.revision += 1;
         index
     }
 
@@ -247,12 +253,14 @@ impl IndexData {
         }
         self.entries[entry_index as usize] = None;
         self.live -= 1;
+        self.revision += 1;
         true
     }
 
     /// Tombstone everything inside `dir_id` but keep the directory node itself, so it
     /// can be re-crawled fresh (used by the Junk lazy drain).
     pub fn clear_children(&mut self, dir_id: DirId) {
+        self.revision += 1;
         let entries = std::mem::take(&mut self.nodes[dir_id as usize].entries);
         let children = std::mem::take(&mut self.nodes[dir_id as usize].child_dirs);
         for index in entries {

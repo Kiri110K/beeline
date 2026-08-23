@@ -177,6 +177,9 @@ fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
         entries,
         live,
         junk_dirty: std::collections::HashSet::new(),
+        // A freshly loaded index starts a new generation; the diff-rescan that follows
+        // bumps it as it applies changes.
+        revision: 0,
     })
 }
 

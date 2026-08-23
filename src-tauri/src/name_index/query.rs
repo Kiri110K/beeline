@@ -1,23 +1,138 @@
-//! Search over the Name Index.
+//! The ranking contract over the Name Index (SPEC §6).
 //!
-//! This is the *basic* order for chunk A, not the ranking contract: name-prefix match
-//! first, then substring, case-insensitive (Unicode lowercase); ties broken by shorter
-//! path, then lexicographic path. The full ranker (Visit Journal, Known Places, Alias
-//! Dictionary, tier penalties, layout correction) lands in a later chunk and replaces
-//! exactly one function — [`score_match`] — leaving the scan and ordering intact.
+//! This is the whole ranker in one module: the scan, the score, and the deterministic
+//! order. §6 splits into *guarantees* (binding, in precedence order) and *weights*
+//! (tuning). The guarantees are encoded as score bands wide enough that no combination
+//! of tuning weights can cross a band — e.g. an exact match minus the heaviest penalty
+//! still outscores any fuzzy match plus every boost, so "exact beats any penalty" holds
+//! whatever the constants below become. All weights live in the `weights` block so the
+//! tuning surface is one place.
+//!
+//! Guarantee → code map (each also has a focused test, see the `tests` module and
+//! `mod.rs`):
+//!   a. existing typed path first  → [`existing_typed_path`] injects at [`EXISTING_PATH`]
+//!   b. exact beats any penalty    → [`QUAL_EXACT`] band gap > all penalties + boosts
+//!   c. path-shaped scope priority → [`score_path_shaped`] (+[`SCOPE_BONUS`], no hidden penalty)
+//!   d. RU/EN layout correction    → [`layout_variants`] (−[`CORRECTION_PENALTY`])
+//!   e. Visit Journal boost        → `ctx.journal.boost` (≤ `VISIT_CAP`)
+//!   f. Known Places boost         → [`known_places`] (+[`KNOWN_PLACE_BOOST`])
+//!   g. Alias Dictionary recommend → `ctx.aliases` injects at [`ALIAS_RECOMMEND`]
+//!   h. hidden light / junk heavy  → [`HIDDEN_PENALTY`] / [`JUNK_PENALTY`]
+//! Ties break by shorter path, then lexicographic path — so the same index + journal +
+//! query always yields the same order.
+
+use std::{
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::Serialize;
 
-use crate::name_index::model::{IndexData, Tier};
+use crate::name_index::{
+    alias::AliasDictionary,
+    model::{DirId, Entry, IndexData, Tier},
+    visit_journal::Aggregate,
+};
 
-/// Upper bound on candidates collected before ranking. Bounding what we *keep* (not
-/// what we scan) caps the sort and path-reconstruction cost so search stays within the
-/// §10 Instant budget (≤50 ms) even when a query matches a large fraction of the
-/// index. A highly selective query still scans the whole index — that scan is a cheap
-/// per-entry lowercase-and-compare, which is the ≤50 ms target on the reference
-/// machine. When the cap is hit, results are drawn from crawl order; the real ranker
-/// removes this bias next chunk.
+/// Upper bound on candidates collected before ranking. Bounding what we *keep* (not what
+/// we scan) caps the sort and path-reconstruction cost so search stays within the §10
+/// Instant budget (≤50 ms) even when a query matches a large fraction of the index.
 const MAX_CANDIDATES: usize = 4096;
+
+// --- weights (the entire tuning surface, SPEC §6) --------------------------------------
+// `Q` is the match-quality unit. Quality bands are multiples of `Q`; every penalty and
+// boost is far below `Q`, so match quality always dominates and the guarantee bands never
+// cross. Injected bands (existing path, alias) sit far above any scanned score.
+
+/// Match-quality unit; one full band. All penalties and boosts combined stay below it.
+const Q: i64 = 1_000_000;
+/// Whole-name match (case-insensitive). Beats any penalty (guarantee b).
+const QUAL_EXACT: i64 = 5 * Q;
+/// The query is a prefix of the name.
+const QUAL_PREFIX: i64 = 4 * Q;
+/// The query occurs inside the name.
+const QUAL_SUBSTRING: i64 = 2 * Q;
+
+/// An existing absolute path typed as the query ranks its target first (guarantee a).
+const EXISTING_PATH: i64 = 100 * Q;
+/// A query matching an alias word recommends its target as a top result (guarantee g).
+const ALIAS_RECOMMEND: i64 = 50 * Q;
+
+/// Added when a path-shaped match falls under the typed prefix (guarantee c). Below a
+/// quality band but above every penalty and boost, so scoped matches win within a band.
+const SCOPE_BONUS: i64 = 500_000;
+/// A layout-corrected match ranks just below a same-quality direct match (guarantee d):
+/// larger than every boost combined (boosts can't lift a corrected match past a direct
+/// one) yet smaller than a quality band.
+const CORRECTION_PENALTY: i64 = 100_000;
+
+/// Junk carries a heavy ranking penalty (guarantee h).
+const JUNK_PENALTY: i64 = 40_000;
+/// Hidden content carries a light penalty (guarantee h).
+const HIDDEN_PENALTY: i64 = 8_000;
+/// A Known Place (Home, Desktop, …) is lifted in the results (guarantee f).
+const KNOWN_PLACE_BOOST: i64 = 20_000;
+
+/// The physical-key mapping between US QWERTY and РФ ЙЦУКЕН, used for layout correction
+/// (guarantee d). No phonetic transliteration — this is the keyboard geometry only.
+const LAYOUT_PAIRS: &[(char, char)] = &[
+    ('`', 'ё'),
+    ('q', 'й'),
+    ('w', 'ц'),
+    ('e', 'у'),
+    ('r', 'к'),
+    ('t', 'е'),
+    ('y', 'н'),
+    ('u', 'г'),
+    ('i', 'ш'),
+    ('o', 'щ'),
+    ('p', 'з'),
+    ('[', 'х'),
+    (']', 'ъ'),
+    ('a', 'ф'),
+    ('s', 'ы'),
+    ('d', 'в'),
+    ('f', 'а'),
+    ('g', 'п'),
+    ('h', 'р'),
+    ('j', 'о'),
+    ('k', 'л'),
+    ('l', 'д'),
+    (';', 'ж'),
+    ('\'', 'э'),
+    ('z', 'я'),
+    ('x', 'ч'),
+    ('c', 'с'),
+    ('v', 'м'),
+    ('b', 'и'),
+    ('n', 'т'),
+    ('m', 'ь'),
+    (',', 'б'),
+    ('.', 'ю'),
+    ('/', '.'),
+];
+
+/// Ranking inputs beyond the index itself: the Visit Journal aggregate and the Alias
+/// Dictionary. Both are borrowed for the duration of one search.
+pub struct RankContext<'a> {
+    pub journal: &'a Aggregate,
+    pub aliases: &'a AliasDictionary,
+}
+
+#[cfg(test)]
+impl RankContext<'static> {
+    /// A context with no journal and no aliases, for tier/ordering tests and any caller
+    /// that only needs the text ranker.
+    pub fn empty() -> RankContext<'static> {
+        use std::sync::OnceLock;
+        static AGG: OnceLock<Aggregate> = OnceLock::new();
+        static ALIASES: OnceLock<AliasDictionary> = OnceLock::new();
+        RankContext {
+            journal: AGG.get_or_init(Aggregate::default),
+            aliases: ALIASES.get_or_init(AliasDictionary::empty),
+        }
+    }
+}
 
 /// One search result, shaped for the IPC boundary (camelCase to match the TS schema).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -30,50 +145,60 @@ pub struct SearchHit {
     pub tier: &'static str,
 }
 
-/// The swappable scorer. Returns `Some(rank)` for a match — `0` = name-prefix,
-/// `1` = substring — or `None` for no match. Case-insensitive via Unicode lowercase;
-/// `scratch` is reused across calls to avoid per-entry allocation.
-fn score_match(query_lower: &str, name: &str, scratch: &mut String) -> Option<u8> {
-    scratch.clear();
-    for ch in name.chars() {
-        for lower in ch.to_lowercase() {
-            scratch.push(lower);
-        }
-    }
-    if scratch.starts_with(query_lower) {
-        Some(0)
-    } else if scratch.contains(query_lower) {
-        Some(1)
-    } else {
-        None
-    }
-}
-
 struct Candidate {
-    rank: u8,
+    score: i64,
     path: String,
     name: String,
     is_directory: bool,
     tier: Tier,
 }
 
-/// Run a search, returning up to `limit` hits in the basic deterministic order.
-pub fn search(index: &IndexData, query: &str, limit: usize) -> Vec<SearchHit> {
-    let query_lower = query.trim().to_lowercase();
+/// Run a search, returning up to `limit` hits in the §6 ranked, deterministic order.
+pub fn search(index: &IndexData, ctx: &RankContext, query: &str, limit: usize) -> Vec<SearchHit> {
+    let trimmed = query.trim();
+    let query_lower = trimmed.to_lowercase();
     if query_lower.is_empty() || limit == 0 {
         return Vec::new();
     }
+
+    let known = known_places(&index.root);
+    let path_shaped = is_path_shaped(trimmed);
+    let segments = if path_shaped {
+        path_segments(&query_lower)
+    } else {
+        Vec::new()
+    };
+    // Layout correction applies to plain queries; a path-shaped query already carries
+    // structure that the wrong layout would not have produced.
+    let corrected = if path_shaped {
+        Vec::new()
+    } else {
+        layout_variants(&query_lower)
+    };
 
     let mut scratch = String::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     for slot in &index.entries {
         let Some(entry) = slot else { continue };
-        let Some(rank) = score_match(&query_lower, &entry.name, &mut scratch) else {
+        let scored = if path_shaped {
+            score_path_shaped(index, entry, &segments, &known, ctx, &mut scratch)
+        } else {
+            score_plain(
+                index,
+                entry,
+                &query_lower,
+                &corrected,
+                &known,
+                ctx,
+                &mut scratch,
+            )
+        };
+        let Some((score, path)) = scored else {
             continue;
         };
         candidates.push(Candidate {
-            rank,
-            path: index.entry_path(entry).to_string_lossy().into_owned(),
+            score,
+            path,
             name: entry.name.to_string(),
             is_directory: entry.is_directory,
             tier: entry.tier,
@@ -83,10 +208,23 @@ pub fn search(index: &IndexData, query: &str, limit: usize) -> Vec<SearchHit> {
         }
     }
 
-    // Order: prefix before substring, then shorter path, then lexicographic path.
+    // Guarantee (a): an existing typed absolute path ranks its target first. The fs
+    // existence check is only ever done here, for path-shaped queries.
+    if path_shaped {
+        if let Some((target, is_dir)) = existing_typed_path(trimmed, &index.root) {
+            inject(&mut candidates, index, &target, EXISTING_PATH, is_dir);
+        }
+    }
+    // Guarantee (g): an alias word recommends its target — added, never used to filter.
+    if let Some(target) = ctx.aliases.resolve(&query_lower) {
+        let target = target.to_path_buf();
+        inject(&mut candidates, index, &target, ALIAS_RECOMMEND, true);
+    }
+
+    // Higher score first; ties by shorter path, then lexicographic path (determinism).
     candidates.sort_by(|a, b| {
-        a.rank
-            .cmp(&b.rank)
+        b.score
+            .cmp(&a.score)
             .then_with(|| a.path.len().cmp(&b.path.len()))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -101,4 +239,515 @@ pub fn search(index: &IndexData, query: &str, limit: usize) -> Vec<SearchHit> {
             tier: candidate.tier.as_str(),
         })
         .collect()
+}
+
+/// Score a plain (non-path) query against one entry, or `None` if it does not match.
+/// The name is lowered once; direct and layout-corrected needles reuse that haystack.
+fn score_plain(
+    index: &IndexData,
+    entry: &Entry,
+    query_lower: &str,
+    corrected: &[String],
+    known: &HashSet<PathBuf>,
+    ctx: &RankContext,
+    scratch: &mut String,
+) -> Option<(i64, String)> {
+    let (mut score, corrected_match) =
+        if let Some(quality) = quality_match(&entry.name, query_lower, scratch) {
+            (quality, false)
+        } else {
+            let mut best: Option<i64> = None;
+            for needle in corrected {
+                // A corrected needle can only match a name of the same script: a Cyrillic
+                // needle never occurs in an ASCII name, so skip that pair before touching
+                // the buffer (keeps the whole-index scan cheap under layout correction).
+                if !needle.is_ascii() && entry.name.is_ascii() {
+                    continue;
+                }
+                if let Some(quality) = quality_match(&entry.name, needle, scratch) {
+                    best = Some(best.map_or(quality, |current| current.max(quality)));
+                }
+            }
+            (best?, true)
+        };
+
+    if corrected_match {
+        score -= CORRECTION_PENALTY;
+    }
+    score -= tier_penalty(entry.tier);
+
+    let path = index.entry_path(entry);
+    let path_str = path.to_string_lossy().into_owned();
+    score += ctx.journal.boost(&path_str);
+    if known.contains(&path) {
+        score += KNOWN_PLACE_BOOST;
+    }
+    Some((score, path_str))
+}
+
+/// Score a path-shaped query. The last segment matches the entry name; any preceding
+/// segments must match ancestor components in order, and when they do the match is under
+/// the typed prefix — it gets scope priority and no hidden penalty (guarantee c).
+fn score_path_shaped(
+    index: &IndexData,
+    entry: &Entry,
+    segments: &[String],
+    known: &HashSet<PathBuf>,
+    ctx: &RankContext,
+    scratch: &mut String,
+) -> Option<(i64, String)> {
+    let (last, prefix) = segments.split_last()?;
+    let mut score = quality_match(&entry.name, last, scratch)?;
+
+    let scoped = !prefix.is_empty() && ancestors_match(index, entry.parent, prefix);
+    if scoped {
+        score += SCOPE_BONUS;
+    }
+
+    // Junk stays penalized even under a typed prefix; only the hidden penalty is waived
+    // for a scoped match (guarantee c: "no hidden penalty").
+    match entry.tier {
+        Tier::Junk => score -= JUNK_PENALTY,
+        Tier::Hidden if !scoped => score -= HIDDEN_PENALTY,
+        _ => {}
+    }
+
+    let path = index.entry_path(entry);
+    let path_str = path.to_string_lossy().into_owned();
+    score += ctx.journal.boost(&path_str);
+    if known.contains(&path) {
+        score += KNOWN_PLACE_BOOST;
+    }
+    Some((score, path_str))
+}
+
+/// Whether the ordered `segments` each occur (as a substring) in the ancestor component
+/// names of an entry, in order — i.e. the entry sits under the typed path prefix.
+fn ancestors_match(index: &IndexData, parent: DirId, segments: &[String]) -> bool {
+    let ancestors = ancestor_names(index, parent);
+    let mut next = 0usize;
+    for segment in segments {
+        loop {
+            let Some(name) = ancestors.get(next) else {
+                return false;
+            };
+            next += 1;
+            if name.contains(segment) {
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Lowercased component names from the root down to (and including) `dir`.
+fn ancestor_names(index: &IndexData, dir: DirId) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = dir;
+    while current != 0 {
+        let node = &index.nodes[current as usize];
+        names.push(node.name.to_lowercase());
+        current = node.parent;
+    }
+    names.reverse();
+    names
+}
+
+/// Match quality of the already-lowercased `needle` against a `name`. When both are ASCII
+/// (the vast majority of file names) it compares bytes case-insensitively with no
+/// allocation; otherwise it Unicode-lowercases `name` into `scratch` and compares.
+fn quality_match(name: &str, needle: &str, scratch: &mut String) -> Option<i64> {
+    if name.is_ascii() && needle.is_ascii() {
+        return quality_ascii(name.as_bytes(), needle.as_bytes());
+    }
+    lower_into(name, scratch);
+    quality_of(scratch, needle)
+}
+
+/// Match quality of `needle` against an already-lowercased `haystack` (Unicode path).
+fn quality_of(haystack: &str, needle: &str) -> Option<i64> {
+    if haystack == needle {
+        Some(QUAL_EXACT)
+    } else if haystack.starts_with(needle) {
+        Some(QUAL_PREFIX)
+    } else if haystack.contains(needle) {
+        Some(QUAL_SUBSTRING)
+    } else {
+        None
+    }
+}
+
+/// Case-insensitive ASCII match quality of `needle` (lowercase) against `name` bytes.
+fn quality_ascii(name: &[u8], needle: &[u8]) -> Option<i64> {
+    if needle.is_empty() || name.len() < needle.len() {
+        return None;
+    }
+    if name.len() == needle.len() && ascii_ci_eq(name, needle) {
+        return Some(QUAL_EXACT);
+    }
+    if ascii_ci_eq(&name[..needle.len()], needle) {
+        return Some(QUAL_PREFIX);
+    }
+    if name
+        .windows(needle.len())
+        .any(|window| ascii_ci_eq(window, needle))
+    {
+        return Some(QUAL_SUBSTRING);
+    }
+    None
+}
+
+/// Whether two equal-length ASCII byte slices are equal ignoring case.
+fn ascii_ci_eq(a: &[u8], b: &[u8]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+fn tier_penalty(tier: Tier) -> i64 {
+    match tier {
+        Tier::Normal => 0,
+        Tier::Hidden => HIDDEN_PENALTY,
+        Tier::Junk => JUNK_PENALTY,
+    }
+}
+
+/// Lowercase `name` into the reused `scratch` buffer. The overwhelming majority of file
+/// names are ASCII, so a byte-wise fast path avoids the per-`char` Unicode `to_lowercase`
+/// iterator — that difference is what keeps the whole-index scan inside the §10 budget on
+/// a multi-million-entry index. Non-ASCII names fall back to full Unicode lowercasing.
+fn lower_into(name: &str, scratch: &mut String) {
+    scratch.clear();
+    if name.is_ascii() {
+        scratch.push_str(name);
+        scratch.make_ascii_lowercase();
+        return;
+    }
+    for ch in name.chars() {
+        for lower in ch.to_lowercase() {
+            scratch.push(lower);
+        }
+    }
+}
+
+/// A query is path-shaped when it contains a slash or starts with `~` (SPEC §6).
+fn is_path_shaped(query: &str) -> bool {
+    query.contains('/') || query.starts_with('~')
+}
+
+/// Split a path-shaped query into matchable segments, dropping empties and the
+/// navigational `.`, `..`, and `~` anchors (they shape ranking, not matching).
+fn path_segments(query_lower: &str) -> Vec<String> {
+    query_lower
+        .split('/')
+        .filter_map(|segment| {
+            let segment = segment.trim();
+            if segment.is_empty() || segment == "." || segment == ".." || segment == "~" {
+                None
+            } else {
+                Some(segment.to_owned())
+            }
+        })
+        .collect()
+}
+
+/// The layout-corrected variants of a query (both directions), excluding the query
+/// itself. Empty when the query has no keys that differ between layouts.
+fn layout_variants(query_lower: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    let to_ru = map_layout(query_lower, true);
+    if to_ru != query_lower {
+        variants.push(to_ru);
+    }
+    let to_en = map_layout(query_lower, false);
+    if to_en != query_lower {
+        variants.push(to_en);
+    }
+    variants
+}
+
+/// Remap each character through the physical-key table: `en_to_ru` picks the ЙЦУКЕН
+/// character under the same key as a QWERTY character, and the reverse otherwise.
+fn map_layout(query: &str, en_to_ru: bool) -> String {
+    query
+        .chars()
+        .map(|ch| {
+            LAYOUT_PAIRS
+                .iter()
+                .find(|(en, ru)| if en_to_ru { *en == ch } else { *ru == ch })
+                .map(|(en, ru)| if en_to_ru { *ru } else { *en })
+                .unwrap_or(ch)
+        })
+        .collect()
+}
+
+/// The Known Places under the index root (SPEC §6). Mounted volume roots live outside the
+/// home root and join this set once volume indexing lands; noted as an open question.
+fn known_places(root: &Path) -> HashSet<PathBuf> {
+    let mut places = HashSet::new();
+    places.insert(root.to_path_buf());
+    for name in [
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Movies",
+        "Music",
+        "Pictures",
+        "Public",
+    ] {
+        places.insert(root.join(name));
+    }
+    // iCloud Drive root.
+    places.insert(root.join("Library/Mobile Documents/com~apple~CloudDocs"));
+    places
+}
+
+/// Resolve a path-shaped query to an existing absolute path on disk, expanding a leading
+/// `~` to the root. Returns the path and whether it is a directory, or `None` when the
+/// query is not an absolute/`~` path or nothing exists there.
+fn existing_typed_path(query: &str, root: &Path) -> Option<(PathBuf, bool)> {
+    let expanded = if query == "~" {
+        root.to_path_buf()
+    } else if let Some(rest) = query.strip_prefix("~/") {
+        root.join(rest)
+    } else {
+        PathBuf::from(query)
+    };
+    if !expanded.is_absolute() {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(&expanded).ok()?;
+    Some((expanded, metadata.is_dir()))
+}
+
+/// Add an injected candidate (existing path or alias target) at `score`. If the path is
+/// already among the scanned candidates, its score is only lifted, never duplicated. When
+/// the path is indexed its real kind and tier are used; otherwise `fallback_is_dir` and
+/// the Normal tier stand in.
+fn inject(
+    candidates: &mut Vec<Candidate>,
+    index: &IndexData,
+    target: &Path,
+    score: i64,
+    fallback_is_dir: bool,
+) {
+    let path_str = target.to_string_lossy().into_owned();
+    if let Some(existing) = candidates.iter_mut().find(|c| c.path == path_str) {
+        existing.score = existing.score.max(score);
+        return;
+    }
+    let (is_directory, tier) = find_entry(index, target).unwrap_or((fallback_is_dir, Tier::Normal));
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_str.clone());
+    candidates.push(Candidate {
+        score,
+        path: path_str,
+        name,
+        is_directory,
+        tier,
+    });
+}
+
+/// Look up an absolute path in the index, returning `(is_directory, tier)` if present.
+fn find_entry(index: &IndexData, path: &Path) -> Option<(bool, Tier)> {
+    if path == index.root {
+        return Some((true, Tier::Normal));
+    }
+    let relative = path.strip_prefix(&index.root).ok()?;
+    let components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let (name, parents) = components.split_last()?;
+
+    let mut current: DirId = 0;
+    for parent in parents {
+        current = *index.nodes[current as usize]
+            .child_dirs
+            .get(parent.as_str())?;
+    }
+    if let Some(&dir_id) = index.nodes[current as usize].child_dirs.get(name.as_str()) {
+        return Some((true, index.nodes[dir_id as usize].tier));
+    }
+    for &entry_index in &index.nodes[current as usize].entries {
+        if let Some(entry) = &index.entries[entry_index as usize] {
+            if &*entry.name == name.as_str() {
+                return Some((entry.is_directory, entry.tier));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::name_index::model::IndexData;
+
+    fn root() -> PathBuf {
+        PathBuf::from("/home/tester")
+    }
+
+    fn index() -> IndexData {
+        IndexData::new(root())
+    }
+
+    fn paths(hits: &[SearchHit]) -> Vec<&str> {
+        hits.iter().map(|hit| hit.path.as_str()).collect()
+    }
+
+    fn run(index: &IndexData, query: &str) -> Vec<SearchHit> {
+        search(index, &RankContext::empty(), query, 50)
+    }
+
+    #[test]
+    fn exact_beats_penalty_even_for_junk() {
+        // An exact-named Junk file must outrank a fuzzy (prefix/substring) normal file
+        // (guarantee b).
+        let mut index = index();
+        index.add_file(0, "config", Tier::Junk); // exact match for "config"
+        index.add_file(0, "config-loader.rs", Tier::Normal); // prefix match, normal
+        index.add_file(0, "app.config.js", Tier::Normal); // substring match, normal
+
+        let hits = run(&index, "config");
+        assert_eq!(hits[0].name, "config");
+        assert_eq!(hits[0].tier, "junk");
+    }
+
+    #[test]
+    fn path_scope_priority_without_hidden_penalty() {
+        // secret.txt under the typed prefix `.config` outranks an equally hidden
+        // secret.txt elsewhere, because the scoped one is not hidden-penalized
+        // (guarantee c).
+        let mut index = index();
+        let config = index.add_dir(0, ".config", Tier::Hidden, 0);
+        index.add_file(config, "secret.txt", Tier::Hidden);
+        let other = index.add_dir(0, "other", Tier::Normal, 0);
+        index.add_file(other, "secret.txt", Tier::Hidden);
+
+        let hits = run(&index, ".config/secret");
+        assert_eq!(hits[0].path, "/home/tester/.config/secret.txt");
+        assert_eq!(hits[0].tier, "hidden"); // still hidden — scoped, not excluded
+        assert_eq!(hits[1].path, "/home/tester/other/secret.txt");
+    }
+
+    #[test]
+    fn layout_correction_en_to_ru_ranks_below_direct() {
+        // Query "cat" (EN). It prefix-matches "cat.txt" directly, and — mapped to the
+        // ЙЦУКЕН keys under c/a/t → "сфе" — prefix-matches "сфе.txt" by correction. The
+        // direct match ranks above the corrected one (guarantees d).
+        let mut index = index();
+        index.add_file(0, "cat.txt", Tier::Normal);
+        index.add_file(0, "сфе.txt", Tier::Normal);
+
+        let hits = run(&index, "cat");
+        assert_eq!(
+            paths(&hits),
+            vec!["/home/tester/cat.txt", "/home/tester/сфе.txt",]
+        );
+    }
+
+    #[test]
+    fn layout_correction_ru_to_en_ranks_below_direct() {
+        // Query "куку" (RU). Direct-matches "куку.txt"; mapped RU→EN (к/у → r/e) it
+        // becomes "rere" and corrects onto "rere.txt".
+        let mut index = index();
+        index.add_file(0, "куку.txt", Tier::Normal);
+        index.add_file(0, "rere.txt", Tier::Normal);
+
+        let hits = run(&index, "куку");
+        assert_eq!(
+            paths(&hits),
+            vec!["/home/tester/куку.txt", "/home/tester/rere.txt",]
+        );
+    }
+
+    #[test]
+    fn visit_boost_changes_order() {
+        // Two exact matches; the shorter path wins by default, but a visit boost on the
+        // deeper one flips the order (guarantee e).
+        let mut index = index();
+        index.add_file(0, "notes", Tier::Normal);
+        let sub = index.add_dir(0, "sub", Tier::Normal, 0);
+        index.add_file(sub, "notes", Tier::Normal);
+
+        let baseline = run(&index, "notes");
+        assert_eq!(baseline[0].path, "/home/tester/notes"); // shorter path first
+
+        let aggregate = Aggregate::from_visits(&[("/home/tester/sub/notes", 1_000)]);
+        let ctx = RankContext {
+            journal: &aggregate,
+            aliases: &AliasDictionary::empty(),
+        };
+        let boosted = search(&index, &ctx, "notes", 50);
+        assert_eq!(boosted[0].path, "/home/tester/sub/notes"); // visited path lifted
+    }
+
+    #[test]
+    fn known_place_boost_lifts_home_location() {
+        // Home's Downloads (a Known Place) outranks an all-caps DOWNLOADS file that would
+        // otherwise sort first lexicographically (guarantee f).
+        let mut index = index();
+        index.add_dir(0, "Downloads", Tier::Normal, 0); // Known Place
+        index.add_file(0, "DOWNLOADS", Tier::Normal); // sorts before "Downloads" without a boost
+
+        let hits = run(&index, "downloads");
+        assert_eq!(hits[0].path, "/home/tester/Downloads");
+    }
+
+    #[test]
+    fn alias_recommends_target_without_filtering() {
+        // "docs" is aliased to ~/Projects; that target surfaces on top, and a literal
+        // docs.txt still appears (aliases recommend, never filter — guarantee g).
+        let mut index = index();
+        index.add_dir(0, "Projects", Tier::Normal, 0);
+        index.add_file(0, "docs.txt", Tier::Normal);
+
+        let aliases = AliasDictionary::from_pairs([("docs", "~/Projects")], &root());
+        let ctx = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &aliases,
+        };
+        let hits = search(&index, &ctx, "docs", 50);
+        assert_eq!(hits[0].path, "/home/tester/Projects");
+        assert!(hits.iter().any(|hit| hit.path == "/home/tester/docs.txt"));
+    }
+
+    #[test]
+    fn hidden_and_junk_penalty_ordering() {
+        // Same prefix-match quality; normal > hidden > junk (guarantee h).
+        let mut index = index();
+        index.add_file(0, "report-normal", Tier::Normal);
+        index.add_file(0, "report-hidden", Tier::Hidden);
+        index.add_file(0, "report-junk", Tier::Junk);
+
+        let hits = run(&index, "report");
+        assert_eq!(hits[0].name, "report-normal");
+        assert_eq!(hits[1].name, "report-hidden");
+        assert_eq!(hits[2].name, "report-junk");
+    }
+
+    #[test]
+    fn deterministic_tie_breaks_by_length_then_lexicographic() {
+        // Identical quality and tier: shorter path first, then lexicographic.
+        let mut index = index();
+        let b = index.add_dir(0, "b", Tier::Normal, 0);
+        index.add_file(b, "item", Tier::Normal); // /home/tester/b/item (longer)
+        index.add_file(0, "item", Tier::Normal); // /home/tester/item (shorter)
+        let a = index.add_dir(0, "a", Tier::Normal, 0);
+        index.add_file(a, "item", Tier::Normal); // /home/tester/a/item
+
+        let hits = run(&index, "item");
+        assert_eq!(
+            paths(&hits),
+            vec![
+                "/home/tester/item",   // shortest
+                "/home/tester/a/item", // same length as b/item, lexicographically first
+                "/home/tester/b/item",
+            ]
+        );
+    }
 }
