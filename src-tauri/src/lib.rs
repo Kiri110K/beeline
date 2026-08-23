@@ -169,6 +169,9 @@ struct ShellState {
     show_on_frontend_ready: bool,
     // Wall-clock ms of the last hide, cleared on the next show.
     last_hidden_at_ms: Mutex<Option<u64>>,
+    // Monotonic token bumped by every show; a settle loop keeps its token and
+    // bails when a newer show has taken over (see `spawn_focus_settle`).
+    settle_generation: AtomicU64,
 }
 
 impl ShellState {
@@ -178,6 +181,7 @@ impl ShellState {
             next_show_sequence: AtomicU64::new(1),
             show_on_frontend_ready,
             last_hidden_at_ms: Mutex::new(None),
+            settle_generation: AtomicU64::new(0),
         }
     }
 
@@ -235,10 +239,13 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
     window
         .show()
         .map_err(|error| format!("failed to show main window: {error}"))?;
-    activate_app(app);
+    activate_and_make_key(app, &window);
+    // Keep the tauri-level focus call so the plugin's internal focus state matches
+    // AppKit's; the settle loop below is what actually makes it stick (§2).
     window
         .set_focus()
         .map_err(|error| format!("failed to focus main window: {error}"))?;
+    spawn_focus_settle(app, &window, state);
 
     let hidden_ms = state.take_hidden_ms();
     record_event(
@@ -287,15 +294,24 @@ fn install_space_behavior(window: &WebviewWindow) {
     let _ = window;
 }
 
+// Number of settle retries and the gap between them: since macOS 14 activation is
+// cooperative, so a single request from a non-frontmost Accessory app is often
+// dropped and one call is a coin flip (observed live: 8 of 9 shortcut presses left
+// another app key). ~320 ms total is below the perceptible-lag threshold for a show.
+const FOCUS_SETTLE_ATTEMPTS: u32 = 8;
+const FOCUS_SETTLE_INTERVAL_MS: u64 = 40;
+
 // An Accessory app that has never been active does not come frontmost from
 // `set_focus` alone (observed live: window visible, `focused:false`, another app
-// still frontmost). Activate NSApplication explicitly on the main thread — the
-// "precise window activation" bridge ADR-0001 anticipated.
-fn activate_app(app: &AppHandle) {
+// still frontmost). Drive the full AppKit sequence on the main thread — activate
+// NSApplication, then order the window front and make it key — the "precise window
+// activation" bridge ADR-0001 anticipated. Best-effort: a dropped request is what
+// `spawn_focus_settle` retries.
+fn activate_and_make_key(app: &AppHandle, window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     {
         let _ = app.run_on_main_thread({
-            let app = app.clone();
+            let window = window.clone();
             move || {
                 let Some(marker) = objc2_foundation::MainThreadMarker::new() else {
                     return;
@@ -304,12 +320,52 @@ fn activate_app(app: &AppHandle) {
                 #[allow(deprecated)] // activate() defers to the system; ignoringOtherApps
                 // is what a user-initiated global shortcut wants.
                 ns_app.activateIgnoringOtherApps(true);
-                let _ = app;
+                if let Ok(ns_window_ptr) = window.ns_window() {
+                    // SAFETY: tauri hands back the live NSWindow pointer for this window;
+                    // ns_window() and these calls all run on the main thread (this closure).
+                    let ns_window = unsafe { &*ns_window_ptr.cast::<objc2_app_kit::NSWindow>() };
+                    ns_window.orderFrontRegardless();
+                    ns_window.makeKeyAndOrderFront(None);
+                }
             }
         });
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = app;
+    let _ = (app, window);
+}
+
+// Activation may still be deferred after the initial request, so verify and retry
+// off the show path. Every 40 ms, up to 8 times: if the window is key, stop; else
+// re-run the activation sequence. Exactly one `focus_settled` event is recorded
+// (attempts made, final focus). A generation token guards against overlapping loops
+// from rapid re-shows — a newer show bumps the token, and this stale loop exits
+// silently without recording so only the current show reports.
+fn spawn_focus_settle(app: &AppHandle, window: &WebviewWindow, state: &ShellState) {
+    let generation = state.settle_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let app = app.clone();
+    let window = window.clone();
+    std::thread::spawn(move || {
+        let state = app.state::<ShellState>();
+        let mut attempts = 0;
+        let mut focused = window.is_focused().unwrap_or(false);
+        while !focused && attempts < FOCUS_SETTLE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(FOCUS_SETTLE_INTERVAL_MS));
+            if state.settle_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            activate_and_make_key(&app, &window);
+            attempts += 1;
+            focused = window.is_focused().unwrap_or(false);
+        }
+        if state.settle_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        record_event(
+            &app,
+            "focus_settled",
+            json!({ "attempts": attempts, "focused": focused }),
+        );
+    });
 }
 
 // The single hide path: stamp the background clock, hide, and record telemetry.
@@ -322,6 +378,10 @@ fn perform_hide(
     origin: &str,
 ) -> Result<(), String> {
     record_event(app, "hide_requested", json!({ "origin": origin }));
+    // Invalidate any in-flight focus-settle loop: its retries call
+    // `orderFrontRegardless`, which would re-show a window hidden within the
+    // settle window (~320 ms after a show).
+    state.settle_generation.fetch_add(1, Ordering::AcqRel);
     state.stamp_hidden();
     window
         .hide()
