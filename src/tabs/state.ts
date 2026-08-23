@@ -1,4 +1,5 @@
 import { browseReducer, type BrowseAction } from "../browse/state";
+import { searchReducer, type SearchAction } from "../search/state";
 import {
   freshTabId,
   makeTemporaryTab,
@@ -21,6 +22,7 @@ export interface TabsState {
 export type TabsAction =
   | { type: "hydrate"; state: TabsState }
   | { type: "browse"; tabId: TabId; action: BrowseAction }
+  | { type: "search"; tabId: TabId; action: SearchAction }
   | {
       type: "create";
       tab: Tab;
@@ -62,6 +64,10 @@ function clamp(value: number, min: number, max: number): number {
 
 function withBrowse<T extends Tab>(tab: T, action: BrowseAction): T {
   return { ...tab, browse: browseReducer(tab.browse, action) };
+}
+
+function withSearch<T extends Tab>(tab: T, action: SearchAction): T {
+  return { ...tab, search: searchReducer(tab.search, action) };
 }
 
 function replaceTab(
@@ -130,6 +136,14 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         ...state,
         tabs: replaceTab(state.tabs, action.tabId, (tab) =>
           withBrowse(tab, action.action),
+        ),
+      };
+
+    case "search":
+      return {
+        ...state,
+        tabs: replaceTab(state.tabs, action.tabId, (tab) =>
+          withSearch(tab, action.action),
         ),
       };
 
@@ -231,6 +245,7 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         anchorPath,
         customName: null,
         browse: tab.browse,
+        search: tab.search,
       };
       const without = state.tabs.filter((candidate) => candidate.id !== tab.id);
       const insertAt = pinnedCount(without);
@@ -254,6 +269,7 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
         lastActivatedAtMs: action.nowMs,
         originatorId: null,
         browse: tab.browse,
+        search: tab.search,
       };
       const without = state.tabs.filter((candidate) => candidate.id !== tab.id);
       const insertAt = pinnedCount(without);

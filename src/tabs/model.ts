@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { initialBrowseState, type BrowseState } from "../browse/state";
+import { initialSearchState, type SearchState } from "../search/state";
 
 // A Tab id is a branded uuid so it can never be confused with a path or any
 // other string; it is produced only by parsing a real uuid.
@@ -26,6 +27,8 @@ export interface TemporaryTab {
   // The Tab this one was created beside, so closing can return activation to it.
   originatorId: TabId | null;
   browse: BrowseState;
+  // The Tab's own Search Mode / retained query (§4: each Tab retains its own).
+  search: SearchState;
 }
 
 export interface PinnedTab {
@@ -34,6 +37,7 @@ export interface PinnedTab {
   anchorPath: string;
   customName: string | null;
   browse: BrowseState;
+  search: SearchState;
 }
 
 export type Tab = TemporaryTab | PinnedTab;
@@ -50,6 +54,7 @@ export function makeTemporaryTab(args: {
     lastActivatedAtMs: args.nowMs,
     originatorId: args.originatorId,
     browse: initialBrowseState,
+    search: initialSearchState,
   };
 }
 
@@ -62,6 +67,18 @@ export function folderName(path: string): string {
   }
   const slash = trimmed.lastIndexOf("/");
   return slash === -1 ? trimmed : trimmed.slice(slash + 1);
+}
+
+// The containing directory of a path — a Search Result's parent Location for
+// display, and the Location a file Reveal navigates into (SPEC §6, CONTEXT.md).
+// "/" for a root-level path or the root itself.
+export function parentPath(path: string): string {
+  const trimmed = path.replace(/\/+$/, "");
+  const slash = trimmed.lastIndexOf("/");
+  if (slash <= 0) {
+    return "/";
+  }
+  return trimmed.slice(0, slash);
 }
 
 // A Pinned Tab is on a Pinned Excursion whenever its Location has moved away

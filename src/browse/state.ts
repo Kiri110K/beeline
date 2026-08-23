@@ -54,6 +54,9 @@ export type BrowseAction =
       items: Item[];
       nav: NavKind;
       originScrollTop: number;
+      // A specific path to focus on arrival (a file Reveal focuses its target,
+      // §6); null lets history restore or the first row take focus.
+      focusPath: string | null;
     }
   // Background re-list of the current Location (Tab switch, §11 revalidation):
   // items are replaced but the Focused Item never moves and history/scroll stand.
@@ -284,7 +287,19 @@ export function browseReducer(
           future = [];
           break;
       }
-      const position = positionFor(restore, items);
+      // A Reveal target overrides history restoration: focus (and select) it.
+      const position =
+        action.focusPath !== null
+          ? positionFor(
+              {
+                location: action.location,
+                focusedPath: action.focusPath,
+                selectedPaths: [action.focusPath],
+                scrollTop: 0,
+              },
+              items,
+            )
+          : positionFor(restore, items);
       return {
         location: action.location,
         load: { status: "ready", items },
