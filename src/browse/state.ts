@@ -30,15 +30,19 @@ export interface BrowseState {
   selected: ReadonlySet<number>;
   history: HistoryEntry[];
   future: HistoryEntry[];
+  // Saved scroll offset of this view, retained across Tab switches. The live
+  // offset lives in the table; this is snapshotted when the Tab is deactivated.
+  scrollTop: number;
   // Scroll offset to apply after a restore listing; `scrollGeneration` bumps once
-  // per landed listing so the table re-applies it exactly once.
+  // per landed listing (or Tab reactivation) so the table re-applies it exactly once.
   pendingScrollTop: number;
   scrollGeneration: number;
 }
 
 // enter: new navigation into a Location. back/forward: history stack moves.
-// replace: the initial home load, which records no history.
-export type NavKind = "enter" | "back" | "forward" | "replace";
+// replace: the initial load, which records no history. reset: like replace but
+// also drops both stacks (returning a Pinned Tab to its Anchor).
+export type NavKind = "enter" | "back" | "forward" | "replace" | "reset";
 
 export type BrowseAction =
   | { type: "focusDelta"; delta: number; extend: boolean }
@@ -51,6 +55,13 @@ export type BrowseAction =
       nav: NavKind;
       originScrollTop: number;
     }
+  // Background re-list of the current Location (Tab switch, §11 revalidation):
+  // items are replaced but the Focused Item never moves and history/scroll stand.
+  | { type: "revalidated"; location: string; items: Item[] }
+  // Snapshot the live scroll offset into the Tab (on deactivation).
+  | { type: "saveScroll"; top: number }
+  // Reapply the saved scroll offset without a new listing (Tab reactivation).
+  | { type: "restoreScroll" }
   | { type: "failed"; location: string; error: ListErrorPayload };
 
 export const initialBrowseState: BrowseState = {
@@ -61,6 +72,7 @@ export const initialBrowseState: BrowseState = {
   selected: new Set<number>(),
   history: [],
   future: [],
+  scrollTop: 0,
   pendingScrollTop: 0,
   scrollGeneration: 0,
 };
@@ -266,6 +278,11 @@ export function browseReducer(
           break;
         case "replace":
           break;
+        case "reset":
+          // Returning a Pinned Tab to its Anchor: no history in either direction.
+          history = [];
+          future = [];
+          break;
       }
       const position = positionFor(restore, items);
       return {
@@ -276,10 +293,41 @@ export function browseReducer(
         selected: position.selected,
         history,
         future,
+        scrollTop: position.scrollTop,
         pendingScrollTop: position.scrollTop,
         scrollGeneration: state.scrollGeneration + 1,
       };
     }
+    case "revalidated": {
+      // A stale background result for a Location we have since left is dropped.
+      if (state.load.status !== "ready" || action.location !== state.location) {
+        return state;
+      }
+      // Re-resolve the Focused and Selected Items by path so the focused row
+      // keeps its identity even as indices shift; scroll and history untouched.
+      const restore: HistoryEntry = {
+        location: state.location,
+        focusedPath: focusedPathOf(state),
+        selectedPaths: selectedPathsOf(state),
+        scrollTop: state.scrollTop,
+      };
+      const position = positionFor(restore, action.items);
+      return {
+        ...state,
+        load: { status: "ready", items: action.items },
+        focusedIndex: position.focusedIndex,
+        anchorIndex: position.focusedIndex,
+        selected: position.selected,
+      };
+    }
+    case "saveScroll":
+      return { ...state, scrollTop: action.top };
+    case "restoreScroll":
+      return {
+        ...state,
+        pendingScrollTop: state.scrollTop,
+        scrollGeneration: state.scrollGeneration + 1,
+      };
     case "failed":
       // A failed navigation from a working view leaves that view intact.
       if (state.load.status === "ready") {

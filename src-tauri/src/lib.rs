@@ -1,10 +1,14 @@
 mod listing;
+mod pinned_tabs;
 mod telemetry;
 
 use std::{
     env,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -16,11 +20,21 @@ use tauri::{
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 use listing::list_location;
+use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use telemetry::Telemetry;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_SHOWN_EVENT: &str = "beeline://window-shown";
 const SNAP_DISTANCE_PX: u64 = 12;
+
+// Wall-clock ms since the Unix epoch, used to measure continuous background time
+// (which must count sleep, so a monotonic clock will not do — §2, §9).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 fn default_shortcut() -> Shortcut {
     Shortcut::new(
@@ -33,6 +47,8 @@ struct ShellState {
     launch_show_claimed: AtomicBool,
     next_show_sequence: AtomicU64,
     show_on_frontend_ready: bool,
+    // Wall-clock ms of the last hide, cleared on the next show.
+    last_hidden_at_ms: Mutex<Option<u64>>,
 }
 
 impl ShellState {
@@ -41,11 +57,26 @@ impl ShellState {
             launch_show_claimed: AtomicBool::new(false),
             next_show_sequence: AtomicU64::new(1),
             show_on_frontend_ready,
+            last_hidden_at_ms: Mutex::new(None),
         }
     }
 
     fn next_show_sequence(&self) -> u64 {
         self.next_show_sequence.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn stamp_hidden(&self) {
+        if let Ok(mut guard) = self.last_hidden_at_ms.lock() {
+            *guard = Some(now_ms());
+        }
+    }
+
+    // Continuous background ms since the last hide, consuming the stamp so a
+    // second show without an intervening hide reports None.
+    fn take_hidden_ms(&self) -> Option<u64> {
+        let mut guard = self.last_hidden_at_ms.lock().ok()?;
+        let hidden_at = guard.take()?;
+        Some(now_ms().saturating_sub(hidden_at))
     }
 }
 
@@ -57,9 +88,11 @@ enum ShowOrigin {
 }
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WindowShownPayload {
     origin: ShowOrigin,
     sequence: u64,
+    hidden_ms: Option<u64>,
 }
 
 fn record_event(app: &AppHandle, event: &str, fields: Value) {
@@ -86,6 +119,7 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
         .set_focus()
         .map_err(|error| format!("failed to focus main window: {error}"))?;
 
+    let hidden_ms = state.take_hidden_ms();
     record_event(
         app,
         "window_visible",
@@ -94,19 +128,36 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
             "origin": origin,
             "sequence": sequence,
             "visible": window.is_visible().unwrap_or(false),
+            "hidden_ms": hidden_ms,
         }),
     );
     window
-        .emit(WINDOW_SHOWN_EVENT, WindowShownPayload { origin, sequence })
+        .emit(
+            WINDOW_SHOWN_EVENT,
+            WindowShownPayload {
+                origin,
+                sequence,
+                hidden_ms,
+            },
+        )
         .map_err(|error| format!("failed to emit window shown event: {error}"))
 }
 
-fn hide_for_shortcut(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
-    record_event(app, "hide_requested", json!({ "origin": "shortcut" }));
+// The single hide path: stamp the background clock, hide, and record telemetry.
+// `origin` distinguishes the global-shortcut toggle, an Escape, and a Pinned-Tab
+// Cmd+W (§4, §9).
+fn perform_hide(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    state: &ShellState,
+    origin: &str,
+) -> Result<(), String> {
+    record_event(app, "hide_requested", json!({ "origin": origin }));
+    state.stamp_hidden();
     window
         .hide()
         .map_err(|error| format!("failed to hide main window: {error}"))?;
-    record_event(app, "window_hidden", json!({ "origin": "shortcut" }));
+    record_event(app, "window_hidden", json!({ "origin": origin }));
     Ok(())
 }
 
@@ -121,12 +172,24 @@ fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
         .is_focused()
         .map_err(|error| format!("failed to read main window focus: {error}"))?;
 
+    let state = app.state::<ShellState>();
     if is_visible && is_focused {
-        hide_for_shortcut(app, &window)
+        perform_hide(app, &window, &state, "shortcut")
     } else {
-        let state = app.state::<ShellState>();
         show_and_focus(app, &state, ShowOrigin::Shortcut)
     }
+}
+
+#[tauri::command]
+fn hide_window(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+    origin: String,
+) -> Result<(), String> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "main window is missing".to_owned())?;
+    perform_hide(&app, &window, &state, &origin)
 }
 
 fn global_shortcut_plugin(
@@ -236,8 +299,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            hide_window,
             home_directory,
             list_location,
+            load_pinned_tabs,
+            save_pinned_tabs,
             telemetry_event
         ])
         .setup(move |app| {

@@ -14,4 +14,17 @@ export const strings = {
     previewPanel: "Preview panel",
     statusStrip: "Status",
   },
+  tabs: {
+    untitled: "Untitled",
+    newTab: "New tab",
+    renamePlaceholder: "Tab name",
+    menu: {
+      pin: "Pin Tab",
+      close: "Close Tab",
+      rename: "Rename",
+      unpin: "Unpin Tab",
+      remove: "Remove Pinned Tab",
+      copyLocation: "Copy Location",
+    },
+  },
 };

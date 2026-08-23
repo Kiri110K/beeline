@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { err, ok, ResultAsync, type Result } from "neverthrow";
 import { z } from "zod";
 
@@ -12,8 +11,11 @@ const windowShownPayloadSchema = z
   .object({
     origin: z.enum(["launch", "shortcut"]),
     sequence: z.number().int().nonnegative(),
+    // Continuous background ms before this show; null on the first launch show.
+    hiddenMs: z.number().int().nonnegative().nullable(),
   })
   .strict();
+export type WindowShownPayload = z.infer<typeof windowShownPayloadSchema>;
 const unlistenSchema = z.custom<UnlistenFn>(
   (value) => typeof value === "function",
 );
@@ -63,8 +65,19 @@ export function recordTelemetry(
   return invokeCommand("telemetry_event", { name, fields });
 }
 
-function hideCurrentWindow(): ResultAsync<null, ShellError> {
-  return fromTauri("window.hide", unitSchema, () => getCurrentWindow().hide());
+// Hide through Rust so the background clock is stamped in one place; the origin
+// distinguishes an Escape hide from a Pinned-Tab Cmd+W hide in telemetry.
+export function requestHide(origin: string): ResultAsync<null, ShellError> {
+  return invokeCommand("hide_window", { origin });
+}
+
+// Copy text to the clipboard via the webview API (works in WKWebView), wrapped
+// in the shell's Result pattern like every other side-effecting boundary.
+export function copyToClipboard(text: string): ResultAsync<null, ShellError> {
+  return ResultAsync.fromPromise(
+    navigator.clipboard.writeText(text),
+    (cause) => requestError("clipboard.writeText", cause),
+  ).map(() => null);
 }
 
 export function reportShellError(error: ShellError): void {
@@ -77,38 +90,31 @@ function reportIfError(result: Result<unknown, ShellError>): void {
   }
 }
 
-function handleWindowShown(payload: unknown): void {
-  parseBoundary(WINDOW_SHOWN_EVENT, windowShownPayloadSchema, payload).match(
-    (shown) => {
-      window.requestAnimationFrame(() => {
-        void recordTelemetry("frontend_painted", shown).match(
-          () => undefined,
-          reportShellError,
-        );
-      });
-    },
-    reportShellError,
-  );
-}
-
-function registerWindowShownListener(): ResultAsync<UnlistenFn, ShellError> {
+// Parsed subscription to the window-shown event, shared by the shell's own
+// paint telemetry and the Tabs lifecycle listener (§9).
+export function subscribeWindowShown(
+  handler: (payload: WindowShownPayload) => void,
+): ResultAsync<UnlistenFn, ShellError> {
   return fromTauri(`listen:${WINDOW_SHOWN_EVENT}`, unlistenSchema, () =>
     listen(WINDOW_SHOWN_EVENT, (event) => {
-      handleWindowShown(event.payload);
+      parseBoundary(
+        WINDOW_SHOWN_EVENT,
+        windowShownPayloadSchema,
+        event.payload,
+      ).match(handler, reportShellError);
     }),
   );
 }
 
-async function hideForEscape(): Promise<void> {
-  reportIfError(await recordTelemetry("hide_requested", { origin: "escape" }));
-
-  const hidden = await hideCurrentWindow();
-  if (hidden.isErr()) {
-    reportShellError(hidden.error);
-    return;
-  }
-
-  reportIfError(await recordTelemetry("window_hidden", { origin: "escape" }));
+function registerWindowShownListener(): ResultAsync<UnlistenFn, ShellError> {
+  return subscribeWindowShown((shown) => {
+    window.requestAnimationFrame(() => {
+      void recordTelemetry("frontend_painted", shown).match(
+        () => undefined,
+        reportShellError,
+      );
+    });
+  });
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
@@ -117,7 +123,7 @@ function handleKeyDown(event: KeyboardEvent): void {
   }
 
   event.preventDefault();
-  void hideForEscape();
+  void requestHide("escape").match(() => undefined, reportShellError);
 }
 
 export async function initializeShell(): Promise<void> {
