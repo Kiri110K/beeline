@@ -6,10 +6,17 @@ import {
   hasSelectionBeyondFocus,
   initialBrowseState,
   type BrowseState,
+  type LoadResult,
   type NavKind,
   type SelectMode,
 } from "../browse/state";
-import { homeDirectory, listLocation } from "../location/ipc";
+import { listLocation } from "../location/ipc";
+import {
+  directoryLocation,
+  recentsLocation,
+  type Location,
+} from "../location/location";
+import { getRecents } from "../location/recents";
 import type { Item } from "../location/schema";
 import {
   recordVisit,
@@ -26,6 +33,7 @@ import {
   recordTelemetry,
   reportShellError,
   requestHide,
+  subscribeRecentsUpdated,
   subscribeWindowShown,
 } from "../shell";
 import { defaultEntryPoint } from "./entryPoint";
@@ -60,6 +68,10 @@ const SEARCH_SLOW_MS = 200;
 const SEARCH_TELEMETRY_MS_THRESHOLD = 25;
 const SEARCH_TELEMETRY_SAMPLE = 20;
 
+// Recents loads and scrolls in pages of this size (SPEC §7): the first page paints from
+// the cache, later pages arrive on scroll with no hard cap.
+const RECENTS_BATCH = 100;
+
 // The kind of Tab a group boundary drop lands in — the signal that a drag
 // crossed the Pinned/Temporary divide and must pin or unpin (§4, point 7).
 export type TabGroup = "pinned" | "temporary";
@@ -73,6 +85,8 @@ export interface Tabs {
   select: (index: number, mode: SelectMode) => void;
   activateItem: (item: Item) => void;
   onScrollTop: (top: number) => void;
+  // Pull the next page of Recents when the table nears its end (§7).
+  loadMoreRecents: () => void;
   // Search interactions on the active Tab (§5, §6).
   setInputEl: (element: HTMLInputElement | null) => void;
   activateSearch: () => void;
@@ -147,8 +161,11 @@ export function useTabs(): Tabs {
   }, [state]);
   const scrollTopRef = useRef(0);
 
-  // Resolved home directory backing the Default Entry Point seam.
-  const homeRef = useRef("");
+  // Per-Tab Recents paging: the full cached count and whether a page fetch is in flight,
+  // so scroll-to-load never over-requests (§7). Loaded count is the view's item length.
+  const recentsMetaRef = useRef(
+    new Map<TabId, { total: number; loading: boolean }>(),
+  );
 
   // The Navigation Input DOM node, so the controller can focus and select the
   // retained query when Search Mode activates (§5). Registered via a callback ref
@@ -184,7 +201,7 @@ export function useTabs(): Tabs {
   const navigate = useCallback(
     (
       tabId: TabId,
-      target: string,
+      target: Location,
       nav: NavKind,
       focusPath?: string,
       forceRecord = false,
@@ -195,32 +212,74 @@ export function useTabs(): Tabs {
         tabId === current.activeId
           ? scrollTopRef.current
           : (tabById(current, tabId)?.browse.scrollTop ?? 0);
-      void listLocation(target).match(
+      // Commit a landed load. The Location entered is recorded (SPEC §6) only for a
+      // directory; programmatic `replace` loads are silent unless forced by a Reveal.
+      const commit = (location: Location, result: LoadResult): void => {
+        if (seq !== seqRef.current.get(tabId)) {
+          return;
+        }
+        dispatch({
+          type: "browse",
+          tabId,
+          action: {
+            type: "listed",
+            location,
+            result,
+            nav,
+            originScrollTop,
+            focusPath: focusPath ?? null,
+          },
+        });
+        if (location.kind === "directory" && (forceRecord || nav !== "replace")) {
+          void recordVisit(location.path, "entered_location").match(
+            () => undefined,
+            reportShellError,
+          );
+        }
+      };
+
+      if (target.kind === "recents") {
+        // A fresh Recents load resets this Tab's paging cursor (§7).
+        recentsMetaRef.current.set(tabId, { total: 0, loading: false });
+        void getRecents(0, RECENTS_BATCH).match(
+          (response) => {
+            if (seq !== seqRef.current.get(tabId)) {
+              return;
+            }
+            switch (response.state) {
+              case "ok":
+                recentsMetaRef.current.set(tabId, {
+                  total: response.total,
+                  loading: false,
+                });
+                commit(recentsLocation, { kind: "items", items: response.items });
+                break;
+              case "empty":
+                recentsMetaRef.current.set(tabId, { total: 0, loading: false });
+                commit(recentsLocation, { kind: "items", items: [] });
+                break;
+              case "spotlight_unavailable":
+                commit(recentsLocation, {
+                  kind: "unavailable",
+                  reason: response.reason,
+                });
+                break;
+            }
+          },
+          (error) => {
+            reportShellError(error);
+            commit(recentsLocation, { kind: "unavailable", reason: "unknown" });
+          },
+        );
+        return;
+      }
+
+      void listLocation(target.path).match(
         (response) => {
-          if (seq !== seqRef.current.get(tabId)) {
-            return;
-          }
-          dispatch({
-            type: "browse",
-            tabId,
-            action: {
-              type: "listed",
-              location: response.path,
-              items: response.items,
-              nav,
-              originScrollTop,
-              focusPath: focusPath ?? null,
-            },
+          commit(directoryLocation(response.path), {
+            kind: "items",
+            items: response.items,
           });
-          // Record the Location entered (SPEC §6). Programmatic `replace` loads
-          // (startup, Tab creation, error retry) are silent unless forced by a
-          // Reveal that opens or reuses a Temporary Tab.
-          if (forceRecord || nav !== "replace") {
-            void recordVisit(response.path, "entered_location").match(
-              () => undefined,
-              reportShellError,
-            );
-          }
         },
         (error) => {
           if (seq !== seqRef.current.get(tabId)) {
@@ -237,11 +296,31 @@ export function useTabs(): Tabs {
     [nextSeq],
   );
 
-  // Re-list the current Location in the background, keeping the Focused Item put.
+  // Re-list the current Location in the background, keeping the Focused Item put. A
+  // Recents revalidation re-pulls the first page (resetting the paging cursor); a
+  // Spotlight-unavailable revalidation keeps the cached view, like a failed relist.
   const revalidate = useCallback(
-    (tabId: TabId, location: string): void => {
+    (tabId: TabId, location: Location): void => {
       const seq = nextSeq(tabId);
-      void listLocation(location).match(
+      if (location.kind === "recents") {
+        void getRecents(0, RECENTS_BATCH).match((response) => {
+          if (seq !== seqRef.current.get(tabId)) {
+            return;
+          }
+          if (response.state === "ok" || response.state === "empty") {
+            const total = response.state === "ok" ? response.total : 0;
+            const items = response.state === "ok" ? response.items : [];
+            recentsMetaRef.current.set(tabId, { total, loading: false });
+            dispatch({
+              type: "browse",
+              tabId,
+              action: { type: "revalidated", location, items },
+            });
+          }
+        }, reportShellError);
+        return;
+      }
+      void listLocation(location.path).match(
         (response) => {
           if (seq !== seqRef.current.get(tabId)) {
             return;
@@ -251,7 +330,7 @@ export function useTabs(): Tabs {
             tabId,
             action: {
               type: "revalidated",
-              location: response.path,
+              location: directoryLocation(response.path),
               items: response.items,
             },
           });
@@ -262,6 +341,49 @@ export function useTabs(): Tabs {
     },
     [nextSeq],
   );
+
+  // Pull the next Recents page when the table nears its end (§7). No-op unless the active
+  // Tab is a ready Recents view with more cached rows than shown and no fetch in flight.
+  const loadMoreRecents = useCallback((): void => {
+    const current = stateRef.current;
+    const active = tabById(current, current.activeId);
+    if (
+      active === undefined ||
+      active.browse.location.kind !== "recents" ||
+      active.browse.load.status !== "ready"
+    ) {
+      return;
+    }
+    const tabId = active.id;
+    const meta = recentsMetaRef.current.get(tabId) ?? { total: 0, loading: false };
+    const loaded = active.browse.load.items.length;
+    if (meta.loading || loaded >= meta.total) {
+      return;
+    }
+    recentsMetaRef.current.set(tabId, { ...meta, loading: true });
+    void getRecents(loaded, RECENTS_BATCH).match(
+      (response) => {
+        const currentMeta = recentsMetaRef.current.get(tabId);
+        const total =
+          response.state === "ok" ? response.total : (currentMeta?.total ?? 0);
+        recentsMetaRef.current.set(tabId, { total, loading: false });
+        if (response.state === "ok") {
+          dispatch({
+            type: "browse",
+            tabId,
+            action: { type: "recentsAppended", items: response.items },
+          });
+        }
+      },
+      (error) => {
+        reportShellError(error);
+        const currentMeta = recentsMetaRef.current.get(tabId);
+        if (currentMeta !== undefined) {
+          recentsMetaRef.current.set(tabId, { ...currentMeta, loading: false });
+        }
+      },
+    );
+  }, []);
 
   const openFile = useCallback((path: string): void => {
     void openPath(path).match(() => {
@@ -275,7 +397,11 @@ export function useTabs(): Tabs {
       const action = primaryActionFor(item);
       switch (action.kind) {
         case "enter":
-          navigate(stateRef.current.activeId, action.path, "enter");
+          navigate(
+            stateRef.current.activeId,
+            directoryLocation(action.path),
+            "enter",
+          );
           break;
         case "open":
           openFile(action.path);
@@ -500,7 +626,10 @@ export function useTabs(): Tabs {
     (target: string, focusPath: string | undefined, originId: TabId): void => {
       const current = stateRef.current;
       const existing = current.tabs.find(
-        (tab) => tab.kind === "temporary" && tab.browse.location === target,
+        (tab) =>
+          tab.kind === "temporary" &&
+          tab.browse.location.kind === "directory" &&
+          tab.browse.location.path === target,
       );
       if (existing !== undefined) {
         if (existing.id !== current.activeId) {
@@ -508,7 +637,7 @@ export function useTabs(): Tabs {
         }
         if (focusPath !== undefined) {
           // Re-focus the revealed file without pushing a bogus history step.
-          navigate(existing.id, target, "replace", focusPath, true);
+          navigate(existing.id, directoryLocation(target), "replace", focusPath, true);
         } else {
           void recordVisit(target, "entered_location").match(
             () => undefined,
@@ -530,7 +659,7 @@ export function useTabs(): Tabs {
         nowMs,
       });
       scrollTopRef.current = 0;
-      navigate(id, target, "replace", focusPath, true);
+      navigate(id, directoryLocation(target), "replace", focusPath, true);
       fireTelemetry("tab_created", { kind: "temporary" });
     },
     [activateTab, navigate],
@@ -568,10 +697,10 @@ export function useTabs(): Tabs {
         if (anchor.id !== originId) {
           activateTab(anchor.id);
         }
-        navigate(anchor.id, target, "enter", focusPath);
+        navigate(anchor.id, directoryLocation(target), "enter", focusPath);
       } else if (origin.kind === "temporary") {
         // Otherwise, a Search begun in a Temporary Tab reuses it (§4).
-        navigate(originId, target, "enter", focusPath);
+        navigate(originId, directoryLocation(target), "enter", focusPath);
       } else {
         // A directory below an Anchor, or any result outside all Anchors, when
         // Search began in a Pinned Tab → a Temporary Tab (§4).
@@ -615,7 +744,7 @@ export function useTabs(): Tabs {
       }
       if (id === current.activeId) {
         if (tab.kind === "pinned" && isOnExcursion(tab)) {
-          navigate(id, tab.anchorPath, "reset");
+          navigate(id, directoryLocation(tab.anchorPath), "reset");
         }
         return;
       }
@@ -644,7 +773,7 @@ export function useTabs(): Tabs {
       nowMs,
     });
     scrollTopRef.current = 0;
-    navigate(id, defaultEntryPoint(homeRef.current), "replace");
+    navigate(id, defaultEntryPoint(), "replace");
     // A new Temporary Tab starts with the Navigation Input active (§4, point 8).
     dispatch({ type: "search", tabId: id, action: { type: "activate" } });
     focusInput();
@@ -673,11 +802,12 @@ export function useTabs(): Tabs {
     // Closing the last Tab installs the clean replacement, which needs a listing.
     if (current.tabs.length === 1) {
       scrollTopRef.current = 0;
-      navigate(replacement.id, defaultEntryPoint(homeRef.current), "replace");
+      navigate(replacement.id, defaultEntryPoint(), "replace");
     }
     fireTelemetry("tab_closed", { kind: tab.kind });
     seqRef.current.delete(id);
     searchSeqRef.current.delete(id);
+    recentsMetaRef.current.delete(id);
     clearSlowTimer(id);
   }, [navigate, clearSlowTimer]);
 
@@ -687,12 +817,14 @@ export function useTabs(): Tabs {
     if (
       tab === undefined ||
       tab.kind !== "temporary" ||
-      tab.browse.load.status !== "ready"
+      tab.browse.load.status !== "ready" ||
+      // Only a directory can be an Anchor; Recents is not pinnable in v1.
+      tab.browse.location.kind !== "directory"
     ) {
       return;
     }
     // Pinning a Location an Anchor already holds is a silent no-op (§4).
-    const anchorPath = tab.browse.location;
+    const anchorPath = tab.browse.location.path;
     if (
       current.tabs.some(
         (t) => t.kind === "pinned" && t.anchorPath === anchorPath,
@@ -719,10 +851,15 @@ export function useTabs(): Tabs {
 
   const copyLocation = useCallback((id: TabId): void => {
     const tab = tabById(stateRef.current, id);
-    if (tab === undefined || tab.browse.location === "") {
+    // Only a directory has a path to copy; Recents is a collection, not a Location path.
+    if (
+      tab === undefined ||
+      tab.browse.location.kind !== "directory" ||
+      tab.browse.location.path === ""
+    ) {
       return;
     }
-    void copyToClipboard(tab.browse.location).match(
+    void copyToClipboard(tab.browse.location.path).match(
       () => undefined,
       reportShellError,
     );
@@ -762,7 +899,10 @@ export function useTabs(): Tabs {
     const load = active.browse.load;
     if (load.status === "ready") {
       revalidate(active.id, active.browse.location);
-    } else if (load.status === "error") {
+    } else if (load.status === "error" || load.status === "unavailable") {
+      // A degraded Recents view (or a failed listing) fully re-pulls on activation, so a
+      // recovered Spotlight replaces the explanatory line (revalidate only updates a
+      // view that is already ready).
       navigate(active.id, active.browse.location, "replace");
     }
   }, [state.activeId, navigate, revalidate]);
@@ -777,11 +917,6 @@ export function useTabs(): Tabs {
     }
     initedRef.current = true;
     void (async () => {
-      const home = (await homeDirectory()).match(
-        (value) => value,
-        () => "",
-      );
-      homeRef.current = home;
       const persisted = (await loadPinnedTabs()).match(
         (value) => value,
         (error) => {
@@ -790,10 +925,10 @@ export function useTabs(): Tabs {
         },
       );
       if (persisted.length === 0) {
-        // Keep the initial Temporary Tab; send it to the Default Entry Point and
-        // start with the Navigation Input active (§4, fresh Temporary Tab).
+        // Keep the initial Temporary Tab; send it to the Default Entry Point (Recents,
+        // §4/§7) and start with the Navigation Input active (§4, fresh Temporary Tab).
         const activeId = stateRef.current.activeId;
-        navigate(activeId, defaultEntryPoint(home), "replace");
+        navigate(activeId, defaultEntryPoint(), "replace");
         dispatch({ type: "search", tabId: activeId, action: { type: "activate" } });
         focusInput();
         hydratedRef.current = true;
@@ -818,7 +953,7 @@ export function useTabs(): Tabs {
       });
       hydratedRef.current = true;
       for (const pinnedTab of pinnedTabs) {
-        navigate(pinnedTab.id, pinnedTab.anchorPath, "replace");
+        navigate(pinnedTab.id, directoryLocation(pinnedTab.anchorPath), "replace");
       }
     })();
   }, [navigate, focusInput]);
@@ -857,7 +992,7 @@ export function useTabs(): Tabs {
         const resets: PinnedTab[] = excursionsToReset(current.tabs);
         if (resets.length > 0) {
           for (const pinnedTab of resets) {
-            navigate(pinnedTab.id, pinnedTab.anchorPath, "reset");
+            navigate(pinnedTab.id, directoryLocation(pinnedTab.anchorPath), "reset");
           }
           fireTelemetry("excursions_reset", { count: resets.length });
         }
@@ -869,6 +1004,7 @@ export function useTabs(): Tabs {
           fireTelemetry("tab_closed", { kind: "temporary" });
           seqRef.current.delete(id);
           searchSeqRef.current.delete(id);
+          recentsMetaRef.current.delete(id);
           clearSlowTimer(id);
         }
       }
@@ -881,6 +1017,34 @@ export function useTabs(): Tabs {
       }
     };
   }, [navigate, clearSlowTimer]);
+
+  // A background Recents refresh landed (§7): re-pull the active Tab if it is showing
+  // Recents so the fresh list replaces the cached one in place. Other Recents Tabs
+  // re-pull on their next activation via the revalidate effect above.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void subscribeRecentsUpdated(() => {
+      const current = stateRef.current;
+      const active = tabById(current, current.activeId);
+      if (active === undefined || active.browse.location.kind !== "recents") {
+        return;
+      }
+      // A ready view updates in place; a degraded one fully re-pulls so a recovered
+      // Spotlight replaces the explanatory line (revalidate needs a ready view).
+      if (active.browse.load.status === "ready") {
+        revalidate(active.id, recentsLocation);
+      } else {
+        navigate(active.id, recentsLocation, "replace");
+      }
+    }).match((fn) => {
+      unlisten = fn;
+    }, reportShellError);
+    return () => {
+      if (unlisten !== null) {
+        unlisten();
+      }
+    };
+  }, [navigate, revalidate]);
 
   // Combined keyboard contract: Tab shortcuts plus the Browse-mode keys, in the
   // capture phase so Escape can preventDefault before shell.ts's bubble hide.
@@ -1050,6 +1214,7 @@ export function useTabs(): Tabs {
     select,
     activateItem,
     onScrollTop,
+    loadMoreRecents,
     setInputEl,
     activateSearch,
     deactivateSearch,

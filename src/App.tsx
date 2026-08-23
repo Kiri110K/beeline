@@ -30,6 +30,7 @@ export default function App(): ReactElement {
             onSelect={tabs.select}
             onActivate={tabs.activateItem}
             onScrollTop={tabs.onScrollTop}
+            onReachEnd={tabs.loadMoreRecents}
           />
           {search.mode === "search" ? (
             <SearchResults

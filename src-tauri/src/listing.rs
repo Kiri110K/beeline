@@ -49,7 +49,7 @@ fn map_io_error(error: &io::Error) -> ListError {
     }
 }
 
-fn kind_label(name: &str, is_directory: bool) -> String {
+pub(crate) fn kind_label(name: &str, is_directory: bool) -> String {
     if is_directory {
         return "Folder".to_owned();
     }

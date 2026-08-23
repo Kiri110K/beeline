@@ -1,11 +1,29 @@
+import {
+  directoryLocation,
+  locationEquals,
+  type Location,
+} from "../location/location";
+import type { RecentsUnavailableReason } from "../location/recents";
 import type { Item, ListErrorPayload } from "../location/schema";
 
-// One variant per real state; `items` is only reachable once `ready`.
+// Why a load produced no usable list. The three Spotlight reasons (SPEC §7) plus
+// "unknown" for a boundary failure that never resolved to one of them.
+export type LoadUnavailableReason = RecentsUnavailableReason | "unknown";
+
+// One variant per real state; `items` is only reachable once `ready`. `unavailable` is
+// produced only by Recents (a degraded Spotlight), never by a directory listing (§7).
 export type LoadState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; error: ListErrorPayload }
+  | { status: "unavailable"; reason: LoadUnavailableReason }
   | { status: "ready"; items: Item[] };
+
+// The outcome of loading a Location: a list of Items, or a degraded Recents state. One
+// type so the `listed` transition does its history bookkeeping once for both.
+export type LoadResult =
+  | { kind: "items"; items: Item[] }
+  | { kind: "unavailable"; reason: LoadUnavailableReason };
 
 // How a mouse gesture changes selection. Keyboard uses `focusDelta`/`clearSelection`.
 export type SelectMode = "plain" | "range" | "toggle";
@@ -13,7 +31,7 @@ export type SelectMode = "plain" | "range" | "toggle";
 // A saved browsing position: the Focused Item, the Selected Items, and the
 // scroll offset, all keyed by path so they survive re-listing a Location.
 export interface HistoryEntry {
-  location: string;
+  location: Location;
   focusedPath: string | null;
   selectedPaths: string[];
   scrollTop: number;
@@ -21,7 +39,7 @@ export interface HistoryEntry {
 
 // Single implicit Tab for chunk A/B, shaped so chunk C can lift it into many Tabs.
 export interface BrowseState {
-  location: string;
+  location: Location;
   load: LoadState;
   // Exactly one Focused Item; `anchorIndex` is the fixed end of a range selection.
   focusedIndex: number;
@@ -50,8 +68,8 @@ export type BrowseAction =
   | { type: "clearSelection" }
   | {
       type: "listed";
-      location: string;
-      items: Item[];
+      location: Location;
+      result: LoadResult;
       nav: NavKind;
       originScrollTop: number;
       // A specific path to focus on arrival (a file Reveal focuses its target,
@@ -60,15 +78,17 @@ export type BrowseAction =
     }
   // Background re-list of the current Location (Tab switch, §11 revalidation):
   // items are replaced but the Focused Item never moves and history/scroll stand.
-  | { type: "revalidated"; location: string; items: Item[] }
+  | { type: "revalidated"; location: Location; items: Item[] }
+  // Append the next page of Recents onto the current view (progressive scroll, §7).
+  | { type: "recentsAppended"; items: Item[] }
   // Snapshot the live scroll offset into the Tab (on deactivation).
   | { type: "saveScroll"; top: number }
   // Reapply the saved scroll offset without a new listing (Tab reactivation).
   | { type: "restoreScroll" }
-  | { type: "failed"; location: string; error: ListErrorPayload };
+  | { type: "failed"; location: Location; error: ListErrorPayload };
 
 export const initialBrowseState: BrowseState = {
-  location: "",
+  location: directoryLocation(""),
   load: { status: "loading" },
   focusedIndex: 0,
   anchorIndex: 0,
@@ -253,7 +273,8 @@ export function browseReducer(
       };
     }
     case "listed": {
-      const items = action.items;
+      const items =
+        action.result.kind === "items" ? action.result.items : [];
       const outgoing: HistoryEntry = {
         location: state.location,
         focusedPath: focusedPathOf(state),
@@ -300,9 +321,13 @@ export function browseReducer(
               items,
             )
           : positionFor(restore, items);
+      const load: LoadState =
+        action.result.kind === "items"
+          ? { status: "ready", items }
+          : { status: "unavailable", reason: action.result.reason };
       return {
         location: action.location,
-        load: { status: "ready", items },
+        load,
         focusedIndex: position.focusedIndex,
         anchorIndex: position.focusedIndex,
         selected: position.selected,
@@ -315,7 +340,10 @@ export function browseReducer(
     }
     case "revalidated": {
       // A stale background result for a Location we have since left is dropped.
-      if (state.load.status !== "ready" || action.location !== state.location) {
+      if (
+        state.load.status !== "ready" ||
+        !locationEquals(action.location, state.location)
+      ) {
         return state;
       }
       // Re-resolve the Focused and Selected Items by path so the focused row
@@ -333,6 +361,23 @@ export function browseReducer(
         focusedIndex: position.focusedIndex,
         anchorIndex: position.focusedIndex,
         selected: position.selected,
+      };
+    }
+    case "recentsAppended": {
+      // Append the next Recents page onto the current view without disturbing the
+      // Focused Item, selection, or scroll (indices are stable — rows only grow at the
+      // end). Guarded to the Recents view so a stale page can never land elsewhere (§7).
+      if (state.load.status !== "ready" || state.location.kind !== "recents") {
+        return state;
+      }
+      const seen = new Set(state.load.items.map((item) => item.path));
+      const fresh = action.items.filter((item) => !seen.has(item.path));
+      if (fresh.length === 0) {
+        return state;
+      }
+      return {
+        ...state,
+        load: { status: "ready", items: [...state.load.items, ...fresh] },
       };
     }
     case "saveScroll":

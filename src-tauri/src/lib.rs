@@ -1,6 +1,7 @@
 mod listing;
 mod name_index;
 mod pinned_tabs;
+mod recents;
 mod telemetry;
 
 use std::{
@@ -23,6 +24,7 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 use listing::list_location;
 use name_index::{record_visit, search_name_index, NameIndex};
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
+use recents::{get_recents, RecentsCache};
 use telemetry::Telemetry;
 
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -297,6 +299,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            get_recents,
             hide_window,
             home_directory,
             list_location,
@@ -314,6 +317,9 @@ pub fn run() {
             )?;
             app.manage(telemetry);
             app.manage(ShellState::new(!hidden_launch));
+            // Load the last-success Recents cache so the first get_recents paints from it
+            // instantly; the refresh is triggered lazily by that first call (§7, §11).
+            app.manage(RecentsCache::load(&app.path().app_data_dir()?));
 
             let window = app
                 .get_webview_window(MAIN_WINDOW_LABEL)

@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { initialBrowseState, type BrowseState } from "../browse/state";
+import { directoryLocation, locationEquals } from "../location/location";
 import { initialSearchState, type SearchState } from "../search/state";
 
 // A Tab id is a branded uuid so it can never be confused with a path or any
@@ -82,9 +83,13 @@ export function parentPath(path: string): string {
 }
 
 // A Pinned Tab is on a Pinned Excursion whenever its Location has moved away
-// from its Anchor. Derived, never stored (see the note on `Tab`).
+// from its Anchor. Derived, never stored (see the note on `Tab`). A Pinned Anchor is
+// always a directory, so the comparison is against the directory form of the Anchor.
 export function isOnExcursion(tab: Tab): boolean {
-  return tab.kind === "pinned" && tab.browse.location !== tab.anchorPath;
+  return (
+    tab.kind === "pinned" &&
+    !locationEquals(tab.browse.location, directoryLocation(tab.anchorPath))
+  );
 }
 
 export function isPinned(tab: Tab): tab is PinnedTab {

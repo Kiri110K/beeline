@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "
 import { match } from "ts-pattern";
 
 import type { LoadState, SelectMode } from "../browse/state";
+import type { Location } from "../location/location";
 import type { Item, ListErrorPayload } from "../location/schema";
 import { strings } from "../strings";
 import { FileRow } from "./FileRow";
@@ -9,7 +10,7 @@ import { GRID_COLS, OVERSCAN, ROW_HEIGHT } from "./layout";
 
 interface FileTableProps {
   load: LoadState;
-  location: string;
+  location: Location;
   focusedIndex: number;
   selected: ReadonlySet<number>;
   pendingScrollTop: number;
@@ -17,6 +18,8 @@ interface FileTableProps {
   onSelect: (index: number, mode: SelectMode) => void;
   onActivate: (item: Item) => void;
   onScrollTop: (top: number) => void;
+  // Called when the table nears its end, so a Recents view can load its next page (§7).
+  onReachEnd: () => void;
 }
 
 function errorText(error: ListErrorPayload, location: string): string {
@@ -44,6 +47,7 @@ export function FileTable({
   onSelect,
   onActivate,
   onScrollTop,
+  onReachEnd,
 }: FileTableProps): ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -96,11 +100,25 @@ export function FileTable({
     .with({ status: "idle" }, () => null)
     .with({ status: "loading" }, () => null)
     .with({ status: "error" }, ({ error }) => (
-      <RowStateLine text={errorText(error, location)} />
+      <RowStateLine
+        text={errorText(
+          error,
+          location.kind === "directory" ? location.path : "",
+        )}
+      />
+    ))
+    .with({ status: "unavailable" }, ({ reason }) => (
+      // Recents is degraded: one honest explanatory line (SPEC §7).
+      <RowStateLine text={strings.recents.unavailable[reason]} />
     ))
     .with({ status: "ready" }, ({ items }) => {
       if (items.length === 0) {
-        return <RowStateLine text={strings.rowState.empty} />;
+        // Honest empty: Recents distinguishes "no recent files" from an empty folder.
+        const text =
+          location.kind === "recents"
+            ? strings.recents.empty
+            : strings.rowState.empty;
+        return <RowStateLine text={text} />;
       }
       const count = items.length;
       const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
@@ -146,6 +164,12 @@ export function FileTable({
           if (element !== null) {
             setScrollTop(element.scrollTop);
             onScrollTop(element.scrollTop);
+            // Near the bottom (within a page of rows): ask for the next batch (§7).
+            const remaining =
+              element.scrollHeight - element.scrollTop - element.clientHeight;
+            if (remaining <= OVERSCAN * ROW_HEIGHT) {
+              onReachEnd();
+            }
           }
         }}
         className="min-h-0 flex-1 overflow-auto"

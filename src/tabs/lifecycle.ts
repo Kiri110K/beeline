@@ -1,4 +1,4 @@
-import { type PinnedTab, type Tab, type TabId } from "./model";
+import { isOnExcursion, type PinnedTab, type Tab, type TabId } from "./model";
 
 // After this much continuous background time, every Pinned Excursion resets to
 // its Anchor on the next show (§2, §4).
@@ -17,8 +17,7 @@ export function temporaryLifetimeMs(): number {
 // returns home.
 export function excursionsToReset(tabs: readonly Tab[]): PinnedTab[] {
   return tabs.filter(
-    (tab): tab is PinnedTab =>
-      tab.kind === "pinned" && tab.browse.location !== tab.anchorPath,
+    (tab): tab is PinnedTab => tab.kind === "pinned" && isOnExcursion(tab),
   );
 }
 

@@ -12,6 +12,17 @@ export const strings = {
     notFound: (path: string): string => `Not found — ${path}`,
     noAccess: (path: string): string => `No access — ${path}`,
   },
+  recents: {
+    // Honest empty vs Spotlight-unavailable, one explanatory line each (SPEC §7).
+    empty: "No recent files",
+    unavailable: {
+      disabled: "Recents is unavailable — Spotlight indexing is turned off",
+      privacy_excluded:
+        "Recents is unavailable — this location is excluded from Spotlight",
+      indexing: "Recents is updating — Spotlight is still indexing",
+      unknown: "Recents is unavailable",
+    },
+  },
   search: {
     // Row-state lines, never banners or raw backend text (SPEC §6).
     empty: "Nothing found",
@@ -26,6 +37,7 @@ export const strings = {
   },
   tabs: {
     untitled: "Untitled",
+    recents: "Recents",
     newTab: "New tab",
     renamePlaceholder: "Tab name",
     menu: {

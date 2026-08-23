@@ -14,9 +14,13 @@ function tabTitle(tab: Tab): string {
   if (tab.kind === "pinned") {
     return tab.customName ?? folderName(tab.anchorPath);
   }
-  return tab.browse.location === ""
+  const location = tab.browse.location;
+  if (location.kind === "recents") {
+    return strings.tabs.recents;
+  }
+  return location.path === ""
     ? strings.tabs.untitled
-    : folderName(tab.browse.location);
+    : folderName(location.path);
 }
 
 interface MenuState {

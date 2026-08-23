@@ -4,6 +4,7 @@ import { err, ok, ResultAsync, type Result } from "neverthrow";
 import { z } from "zod";
 
 const WINDOW_SHOWN_EVENT = "beeline://window-shown";
+const RECENTS_UPDATED_EVENT = "beeline://recents-updated";
 
 // Tauri commands that return unit resolve to `null` across the IPC boundary.
 const unitSchema = z.null();
@@ -102,6 +103,19 @@ export function subscribeWindowShown(
         windowShownPayloadSchema,
         event.payload,
       ).match(handler, reportShellError);
+    }),
+  );
+}
+
+// Subscription to the Recents-updated event (SPEC §7): a background refresh landed, so
+// the frontend re-pulls the current Recents view. The payload (an advisory count) is not
+// needed — the listener always re-pulls from the freshly persisted cache.
+export function subscribeRecentsUpdated(
+  handler: () => void,
+): ResultAsync<UnlistenFn, ShellError> {
+  return fromTauri(`listen:${RECENTS_UPDATED_EVENT}`, unlistenSchema, () =>
+    listen(RECENTS_UPDATED_EVENT, () => {
+      handler();
     }),
   );
 }

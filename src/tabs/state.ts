@@ -230,7 +230,12 @@ export function tabsReducer(state: TabsState, action: TabsAction): TabsState {
       if (tab === undefined || tab.kind !== "temporary") {
         return state;
       }
-      const anchorPath = tab.browse.location;
+      // Only a directory Location can become an Anchor; a Recents Tab cannot be pinned
+      // (Pinned Anchors are directory paths in v1). A silent no-op otherwise.
+      if (tab.browse.location.kind !== "directory") {
+        return state;
+      }
+      const anchorPath = tab.browse.location.path;
       // Two Pinned Tabs cannot share an Anchor: a silent no-op (§4).
       const anchorTaken = state.tabs.some(
         (candidate) =>
