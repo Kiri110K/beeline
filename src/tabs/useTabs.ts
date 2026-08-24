@@ -804,6 +804,7 @@ export function useTabs(
       queryLen: number,
       results: number,
       durationMs: number,
+      backendDurationMs: number,
       reused: boolean,
       scanned: number,
     ): void => {
@@ -817,6 +818,7 @@ export function useTabs(
           query_len: queryLen,
           results,
           duration_ms: duration,
+          backend_duration_ms: backendDurationMs,
           reused,
           scanned,
         });
@@ -862,6 +864,7 @@ export function useTabs(
             query.length,
             response.hits.length,
             performance.now() - started,
+            response.backendDurationMs,
             response.reused,
             response.scanned,
           );

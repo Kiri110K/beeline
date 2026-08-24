@@ -23,7 +23,7 @@ use std::{
         Arc, Mutex, RwLock,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -232,6 +232,9 @@ pub struct SearchResponse {
     /// How many entries the scan scored — small for a reuse scan, up to the whole index for
     /// a cold full scan; passed through to sampled search telemetry.
     pub scanned: usize,
+    /// Time spent inside the blocking backend task. Comparing it with frontend telemetry
+    /// separates index-scan cost from task-queue, IPC, and WebView wake-up latency.
+    pub backend_duration_ms: u64,
     pub hits: Vec<SearchHit>,
 }
 
@@ -338,11 +341,13 @@ fn run_search(
     query: &str,
     limit: usize,
 ) -> SearchResponse {
+    let started = Instant::now();
     let executed = execute_search(data, junk, root, journal, aliases, query, limit, None, None);
     SearchResponse {
         revision: executed.revision,
         reused: executed.reused,
         scanned: executed.outcome.scanned,
+        backend_duration_ms: started.elapsed().as_millis() as u64,
         hits: executed.outcome.hits,
     }
 }
@@ -367,6 +372,8 @@ pub async fn search_name_index(
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        crate::qos::set_user_initiated_qos();
+        let started = Instant::now();
         let cached = reuse.lock().expect("reuse cache lock poisoned").clone();
         let cancel = query::Cancel::new(&generation, my_gen);
         let executed = execute_search(
@@ -404,6 +411,7 @@ pub async fn search_name_index(
             revision: executed.revision,
             reused: executed.reused,
             scanned: executed.outcome.scanned,
+            backend_duration_ms: started.elapsed().as_millis() as u64,
             hits: executed.outcome.hits,
         })
     })
@@ -628,6 +636,8 @@ mod tests {
         persist::save(&shared, &file).expect("save");
         let loaded = persist::load(&file, dir.path()).expect("load");
         assert_eq!(loaded.len(), before);
+        assert_eq!(loaded.name_filters.len(), loaded.entries.len());
+        assert!(loaded.name_filters.iter().all(|filter| *filter != 0));
 
         let reloaded = Arc::new(RwLock::new(loaded));
         assert_eq!(tier_of(&reloaded, "index.js"), Some("junk"));
@@ -862,6 +872,142 @@ mod tests {
             .any(|hit| hit.name == "приемки.txt"));
     }
 
+    // Machine-local benchmark over the persisted production index. Ignored by default and
+    // gated by explicit paths so ordinary test runs never read user data. This complements
+    // the synthetic 5M benchmark below: its regular tree catches algorithmic regressions,
+    // while the live index exposes costs caused by the reference machine's real name, path,
+    // depth, and tier distribution (#31).
+    #[test]
+    #[ignore]
+    fn live_persisted_index_query_timing() {
+        use std::time::Instant;
+
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let load_started = Instant::now();
+        let index = persist::load(&index_path, &root).expect("load live persisted index");
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let cores = query::resolve_shards(index.entries.len());
+        let non_ascii = index
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| !entry.name.is_ascii())
+            .count();
+        let name_bytes: usize = index
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.name.len())
+            .sum();
+        let max_name_bytes = index
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.name.len())
+            .max()
+            .unwrap_or(0);
+        let junk = index
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.tier == model::Tier::Junk)
+            .count();
+        let hidden = index
+            .entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.tier == model::Tier::Hidden)
+            .count();
+        println!(
+            "loaded {} entries / {} dirs in {load_ms:.2} ms across {cores} shards; names {:.1} bytes avg / {max_name_bytes} max, non-ASCII {non_ascii}, hidden {hidden}, junk {junk}",
+            index.len(),
+            index.nodes.len(),
+            name_bytes as f64 / index.len() as f64
+        );
+
+        let ctx = RankContext::empty();
+        let queries = [
+            "g",
+            "gh",
+            "zzz_no_such_entry_zz",
+            "процедура приемки",
+            "ghjwtlehf ghbtvrb",
+            "kirill macbook",
+        ];
+        for query in queries {
+            // Warm query-derived allocation and CPU caches once, then report five production-
+            // shard samples. The median is stable enough for comparing local code changes.
+            let _ = query::run_impl(&index, &ctx, query, 50, None, None, cores);
+            let mut samples = Vec::new();
+            let mut last = None;
+            for _ in 0..5 {
+                let started = Instant::now();
+                let outcome = query::run_impl(&index, &ctx, query, 50, None, None, cores);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                last = Some(outcome);
+            }
+            samples.sort_by(f64::total_cmp);
+            let outcome = last.expect("five samples");
+            println!(
+                "q={query:?}: median {:.2} ms, min {:.2}, max {:.2}; {} hits, scanned {}, exhaustive {}",
+                samples[2],
+                samples[0],
+                samples[4],
+                outcome.hits.len(),
+                outcome.scanned,
+                outcome.exhaustive
+            );
+        }
+
+        for shards in [1, 2, 4, 6, cores] {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                let _ = query::run_impl(&index, &ctx, "процедура приемки", 50, None, None, shards);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "cyrillic two-token with {shards:>2} shards: median {:.2} ms, min {:.2}, max {:.2}",
+                samples[1], samples[0], samples[2]
+            );
+        }
+
+        for shards in [1, 2, 4, 6, cores] {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                let _ = query::run_impl(&index, &ctx, "gh", 50, None, None, shards);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "common two-char with {shards:>2} shards: median {:.2} ms, min {:.2}, max {:.2}",
+                samples[1], samples[0], samples[2]
+            );
+        }
+
+        let upgraded_dir = TempDir::new();
+        let upgraded_path = upgraded_dir.path().join("home-v3.idx");
+        let shared = Arc::new(RwLock::new(index));
+        persist::save(&shared, &upgraded_path).expect("save upgraded live index");
+        drop(shared);
+        let upgraded_bytes = fs::metadata(&upgraded_path).expect("stat v3 index").len();
+        let upgraded_started = Instant::now();
+        let upgraded = persist::load(&upgraded_path, &root).expect("reload v3 live index");
+        println!(
+            "v3 reload: {} entries / {:.1} MiB in {:.2} ms",
+            upgraded.len(),
+            upgraded_bytes as f64 / 1024.0 / 1024.0,
+            upgraded_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     // Benchmark-style timing on a synthetic 5M-entry index shaped like the reference
     // machine's home: paths four components deep, mixed name lengths. Ignored by default (it
     // builds a large in-memory tree); run with `cargo test --release -- --ignored --nocapture`
@@ -916,9 +1062,7 @@ mod tests {
 
         let index = shared.read().unwrap();
         let ctx = RankContext::empty();
-        let cores = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
+        let cores = query::resolve_shards(index.entries.len());
         println!(
             "scanning {} entries across {cores} shards\n",
             index.entries.len()

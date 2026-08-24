@@ -20,18 +20,24 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::name_index::model::{DirNode, Entry, IndexData, Tier, NO_DIR};
+use crate::name_index::model::{name_filter, DirNode, Entry, IndexData, Tier, NO_DIR};
 
 const MAGIC: &[u8; 4] = b"BLNI";
-/// v1 files are bloated with duplicate subtree entries from the FSEvents reconcile bug
-/// (each dir event re-added the whole subtree); rejecting them forces one clean full crawl.
-const VERSION: u32 = 2;
+/// v1 files are bloated with duplicate subtree entries from the FSEvents reconcile bug and
+/// remain rejected. v2 is accepted for an in-place upgrade: its name filters are derived once
+/// while loading, then the next save writes v3 with each filter persisted beside its Item.
+const VERSION: u32 = 3;
+const OLDEST_SUPPORTED_VERSION: u32 = 2;
 
 fn put_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_i64(buffer: &mut Vec<u8>, value: i64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(buffer: &mut Vec<u8>, value: u64) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -69,6 +75,11 @@ impl<'a> Reader<'a> {
         Some(i64::from_le_bytes(bytes.try_into().ok()?))
     }
 
+    fn u64(&mut self) -> Option<u64> {
+        let bytes = self.take(8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    }
+
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
     }
@@ -97,12 +108,18 @@ fn encode(index: &IndexData) -> Vec<u8> {
 
     let live = index.entries.iter().flatten().count();
     put_u32(&mut buffer, live as u32);
-    for entry in index.entries.iter().flatten() {
+    for (entry, filter) in index
+        .entries
+        .iter()
+        .zip(&index.name_filters)
+        .filter_map(|(entry, filter)| entry.as_ref().map(|entry| (entry, filter)))
+    {
         put_u32(&mut buffer, entry.parent);
         buffer.push(u8::from(entry.is_directory));
         buffer.push(entry.tier as u8);
         put_u32(&mut buffer, entry.dir_id);
         put_str(&mut buffer, &entry.name);
+        put_u64(&mut buffer, *filter);
     }
     buffer
 }
@@ -115,7 +132,8 @@ fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
     if reader.take(4)? != MAGIC {
         return None;
     }
-    if reader.u32()? != VERSION {
+    let version = reader.u32()?;
+    if !(OLDEST_SUPPORTED_VERSION..=VERSION).contains(&version) {
         return None;
     }
     let root = PathBuf::from(reader.string()?);
@@ -143,6 +161,7 @@ fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
 
     let entry_count = reader.u32()? as usize;
     let mut entries: Vec<Option<Entry>> = Vec::with_capacity(entry_count);
+    let mut name_filters: Vec<u64> = Vec::with_capacity(entry_count);
     for _ in 0..entry_count {
         let parent = reader.u32()?;
         let is_directory = reader.u8()? != 0;
@@ -163,6 +182,11 @@ fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
                 .child_dirs
                 .insert(name.clone(), dir_id);
         }
+        name_filters.push(if version >= 3 {
+            reader.u64()?
+        } else {
+            name_filter(&name)
+        });
         entries.push(Some(Entry {
             name,
             parent,
@@ -177,6 +201,7 @@ fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
         root,
         nodes,
         entries,
+        name_filters,
         live,
         junk_dirty: std::collections::HashSet::new(),
         // A freshly loaded index starts a new generation; the diff-rescan that follows

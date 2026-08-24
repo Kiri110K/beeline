@@ -28,11 +28,12 @@ use std::{
     thread,
 };
 
+use memchr::{memchr2_iter, memchr_iter};
 use serde::Serialize;
 
 use crate::name_index::{
     alias::AliasDictionary,
-    model::{DirId, Entry, IndexData, Tier},
+    model::{name_filter, DirId, Entry, IndexData, Tier},
     visit_journal::Aggregate,
 };
 
@@ -45,6 +46,12 @@ const MAX_CANDIDATES: usize = 4096;
 /// split across cores. The threshold keeps the tiny indexes in tests (and a cold,
 /// nearly-empty index) from paying thread-spawn overhead for no gain.
 const PAR_THRESHOLD: usize = 50_000;
+
+/// Cold scans are memory-bound once eight workers chase Item-name pointers and build path
+/// masks. More workers add transient per-shard caches and contend for memory bandwidth: the
+/// reference 10-core machine measures 8 workers consistently faster than 10 on its live 5M
+/// index. Smaller machines still use every available core.
+const MAX_SEARCH_SHARDS: usize = 8;
 
 /// How many index slots each shard scans between stale-query checks. A few thousand entries
 /// is frequent enough to abort a superseded scan promptly (well under a millisecond of extra
@@ -173,6 +180,12 @@ struct Candidate {
     slot: u32,
 }
 
+#[derive(Clone, Copy)]
+struct SearchItem<'a> {
+    entry: &'a Entry,
+    name_filter: u64,
+}
+
 /// A best-effort cancellation token: the search's own generation stamp and the shared
 /// counter that a newer `search_name_index` bumps. A shard consults it every
 /// [`ABORT_STRIDE`] entries and aborts once the counter has moved past `mine` (SPEC §10: a
@@ -217,12 +230,15 @@ pub struct SearchOutcome {
 /// Everything derived once from the query text, shared read-only across scan shards.
 struct Prepared {
     query_lower: String,
+    query_name_filter: u64,
     path_shaped: bool,
     segments: Vec<String>,
+    segment_name_filters: Vec<u64>,
     /// Whole-query layout-corrected variants (a plain query). For a single-token query these
     /// are the needles [`score_plain`] falls back to; for a multi-token query they are only
     /// the source of [`Prepared::corrected_tokens`].
     corrected: Vec<String>,
+    corrected_name_filters: Vec<u64>,
     /// The plain query split on whitespace (SPEC §6 token contract). One element is a
     /// single-token query (scored byte-identically to before tokenization); two or more is a
     /// multi-token AND query. Empty for a path-shaped query (slashes stay literal).
@@ -235,12 +251,13 @@ struct Prepared {
     /// `path_needles[i]` occurs in some component of that dir's path. Duplicates across sets
     /// are kept so a flat index maps straight back to a token position.
     path_needles: Vec<String>,
+    path_needle_name_filters: Vec<u64>,
     /// Flat-list offset of each corrected variant's token set in [`Prepared::path_needles`]
     /// (the direct set sits at offset 0). `corrected_offsets[k]` is where variant `k`'s tokens
     /// begin, so [`score_multi`] can turn a per-set token position into a flat needle index.
     corrected_offsets: Vec<usize>,
-    /// Whether the path check uses the per-dir bit-mask cache: multi-token and at most 64
-    /// needles (a `u64` mask). A pasted wall of text can exceed 64 needles; that overflow
+    /// Whether the path check uses the per-dir bit-mask cache: multi-token and at most 63
+    /// needles (a `u64` mask with one marker bit). A pasted wall of text can exceed 63 needles; that overflow
     /// falls back to the uncached ancestor walk instead (same component-wise test).
     use_path_mask: bool,
     /// Lowercased `Normal` components of the index root, for the overflow-fallback path check
@@ -252,7 +269,9 @@ struct Prepared {
 
 /// A `u64` mask holds one bit per path needle, so beyond this many needles the per-dir mask
 /// cache cannot represent the answer and the scan falls back to the uncached ancestor walk.
-const MAX_PATH_NEEDLES: usize = 64;
+/// Bit 63 is reserved as the cached marker in [`DirMaskCache`], leaving 63 query bits. A query
+/// large enough to exceed that still takes the semantics-identical ancestor-walk fallback.
+const MAX_PATH_NEEDLES: usize = 63;
 
 impl Prepared {
     fn new(index: &IndexData, trimmed: &str, query_lower: &str) -> Self {
@@ -263,6 +282,10 @@ impl Prepared {
         } else {
             Vec::new()
         };
+        let segment_name_filters = segments
+            .iter()
+            .map(|segment| name_filter(segment))
+            .collect();
         // Layout correction applies to plain queries; a path-shaped query already carries
         // structure that the wrong layout would not have produced.
         let corrected = if path_shaped {
@@ -270,6 +293,10 @@ impl Prepared {
         } else {
             layout_variants(query_lower)
         };
+        let corrected_name_filters = corrected
+            .iter()
+            .map(|variant| name_filter(variant))
+            .collect();
         // A plain query tokenizes on whitespace; a path-shaped one keeps spaces literal
         // (paths can contain spaces), so it is never tokenized.
         let tokens = if path_shaped {
@@ -295,6 +322,10 @@ impl Prepared {
             }
         }
         let use_path_mask = multi && path_needles.len() <= MAX_PATH_NEEDLES;
+        let path_needle_name_filters = path_needles
+            .iter()
+            .map(|needle| name_filter(needle))
+            .collect();
         let root_lower = if multi {
             root_components_lower(&index.root)
         } else {
@@ -302,18 +333,47 @@ impl Prepared {
         };
         Self {
             query_lower: query_lower.to_owned(),
+            query_name_filter: name_filter(query_lower),
             path_shaped,
             segments,
+            segment_name_filters,
             corrected,
+            corrected_name_filters,
             tokens,
             corrected_tokens,
             path_needles,
+            path_needle_name_filters,
             corrected_offsets,
             use_path_mask,
             root_lower,
             known,
         }
     }
+
+    /// Whether an Item name can satisfy a name-only query before its heap string is read.
+    /// Multi-token queries may match missing tokens through the path, so they cannot reject
+    /// the whole Item here and use the same filter later inside `token_quality` instead.
+    fn name_only_may_match(&self, item_filter: u64) -> bool {
+        if self.path_shaped {
+            return self
+                .segment_name_filters
+                .last()
+                .is_some_and(|query_filter| filter_contains(item_filter, *query_filter));
+        }
+        if self.tokens.len() > 1 {
+            return true;
+        }
+        filter_contains(item_filter, self.query_name_filter)
+            || self
+                .corrected_name_filters
+                .iter()
+                .any(|query_filter| filter_contains(item_filter, *query_filter))
+    }
+}
+
+#[inline]
+fn filter_contains(item_filter: u64, query_filter: u64) -> bool {
+    item_filter & query_filter == query_filter
 }
 
 /// Scan-local memo answering, per directory, the one bit a multi-token path check needs:
@@ -323,23 +383,26 @@ impl Prepared {
 ///   `mask(d) = mask(parent) | bits_of(name(d))`, with `mask(0)` the bits of the root path's
 ///   `Normal` components (the old `root_components_lower` semantics).
 ///
-/// One `Option<u64>` per directory node (`None` until built), sized to `index.nodes.len()` —
-/// ~16 bytes × nodes per shard, a few MB transient on the reference machine, dropped with the
-/// scan. The index is immutable under the read lock for the duration of a search, so a cached
-/// mask never goes stale within the scan; each shard (and the reuse scan) owns one — the cache
-/// is never shared across threads and never stored in [`IndexData`].
+/// One `u64` per directory node, sized to `index.nodes.len()`. Bit 63 marks a built slot and the
+/// lower 63 bits answer the query needles. This is half the memory of `Option<u64>` on the
+/// reference target and halves the zero-fill paid by every search shard. The index is immutable
+/// under the read lock for the duration of a search, so a cached mask never goes stale within
+/// the scan; each shard (and the reuse scan) owns one — the cache is never shared across threads
+/// and never stored in [`IndexData`].
 ///
 /// Millions of entries share the same few hundred thousand parent directories, so memoizing
 /// the answer per dir turns the per-entry ancestor walk into one `Vec` index and one bit test;
 /// each dir's own name is tested against each needle at most once per scan.
 struct DirMaskCache {
-    masks: Vec<Option<u64>>,
+    masks: Vec<u64>,
 }
 
 impl DirMaskCache {
+    const CACHED: u64 = 1u64 << 63;
+
     fn new(node_count: usize) -> Self {
         Self {
-            masks: vec![None; node_count],
+            masks: vec![0; node_count],
         }
     }
 
@@ -352,11 +415,13 @@ impl DirMaskCache {
         needles: &[String],
         scratch: &mut String,
     ) -> u64 {
-        if let Some(mask) = self.masks[dir as usize] {
-            return mask;
+        let cached = self.masks[dir as usize];
+        if cached & Self::CACHED != 0 {
+            return cached & !Self::CACHED;
         }
         let mask = self.build(index, dir, needles, scratch);
-        self.masks[dir as usize] = Some(mask);
+        debug_assert_eq!(mask & Self::CACHED, 0);
+        self.masks[dir as usize] = mask | Self::CACHED;
         mask
     }
 
@@ -377,20 +442,18 @@ impl DirMaskCache {
             }
             return mask;
         }
-        let (parent, name) = {
-            let node = &index.nodes[dir as usize];
-            (node.parent, node.name.clone())
-        };
-        // Recurse first, then OR in this dir's own bits: the recursion mutably borrows `self`,
-        // so `name` is copied out of the node above rather than held across the call.
+        let parent = index.nodes[dir as usize].parent;
+        // Recurse first, then borrow this node's name. Borrowing after the recursive mutable
+        // `self` call avoids cloning the boxed component — on the reference index that clone
+        // meant hundreds of thousands of tiny allocations during every cold multi-token scan.
         let parent_mask = self.mask_for(index, parent, needles, scratch);
-        parent_mask | component_bits(&name, needles, scratch)
+        parent_mask | component_bits(&index.nodes[dir as usize].name, needles, scratch)
     }
 }
 
 /// A fresh mask cache for one scan, or `None` when the query does not use it: single-token
 /// and path-shaped queries never do the path-mask check, and a multi-token query with more
-/// than 64 needles overflows the `u64` and takes the uncached ancestor-walk fallback instead.
+/// than 63 needles overflows the cache and takes the uncached ancestor-walk fallback instead.
 /// Sizing the cache to the node count is skipped in those cases, so a single-token scan pays
 /// nothing for it.
 fn new_dir_masks(index: &IndexData, prep: &Prepared) -> Option<DirMaskCache> {
@@ -539,14 +602,14 @@ pub(crate) fn run_impl(
 
 /// Shard count for a full scan of `n` slots: one (inline) below [`PAR_THRESHOLD`], else the
 /// available core count.
-fn resolve_shards(n: usize) -> usize {
+pub(crate) fn resolve_shards(n: usize) -> usize {
     if n < PAR_THRESHOLD {
         return 1;
     }
     thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1)
-        .max(1)
+        .clamp(1, MAX_SEARCH_SHARDS)
 }
 
 /// Full-index scan, split across `shards` contiguous ranges. Returns the collected
@@ -573,7 +636,10 @@ fn scan_full(
         let mut lo = 0;
         while lo < n {
             let hi = (lo + chunk).min(n);
-            handles.push(scope.spawn(move || scan_range(index, prep, ctx, lo, hi, cancel)));
+            handles.push(scope.spawn(move || {
+                crate::qos::set_user_initiated_qos();
+                scan_range(index, prep, ctx, lo, hi, cancel)
+            }));
             lo = hi;
         }
         handles
@@ -624,19 +690,31 @@ fn scan_range(
                 return (local, scanned, true);
             }
         }
+        let item_filter = index.name_filters[slot];
+        if item_filter == 0 {
+            continue;
+        }
+        scanned += 1;
+        if !prep.name_only_may_match(item_filter) {
+            continue;
+        }
         let Some(entry) = &index.entries[slot] else {
+            debug_assert!(false, "nonzero name filter on a tombstone");
             continue;
         };
-        scanned += 1;
+        let item = SearchItem {
+            entry,
+            name_filter: item_filter,
+        };
         if let Some((score, path)) =
-            score_entry(index, entry, prep, ctx, &mut dir_masks, &mut scratch)
+            score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             local.push(Candidate {
                 score,
                 path,
-                name: entry.name.to_string(),
-                is_directory: entry.is_directory,
-                tier: entry.tier,
+                name: item.entry.name.to_string(),
+                is_directory: item.entry.is_directory,
+                tier: item.entry.tier,
                 slot: slot as u32,
             });
             if local.len() >= MAX_CANDIDATES {
@@ -669,19 +747,31 @@ fn scan_reuse(
                 return (local, scanned, true, false);
             }
         }
+        let item_filter = index.name_filters[slot as usize];
+        if item_filter == 0 {
+            continue;
+        }
+        scanned += 1;
+        if !prep.name_only_may_match(item_filter) {
+            continue;
+        }
         let Some(entry) = &index.entries[slot as usize] else {
+            debug_assert!(false, "nonzero name filter on a tombstone");
             continue;
         };
-        scanned += 1;
+        let item = SearchItem {
+            entry,
+            name_filter: item_filter,
+        };
         if let Some((score, path)) =
-            score_entry(index, entry, prep, ctx, &mut dir_masks, &mut scratch)
+            score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             local.push(Candidate {
                 score,
                 path,
-                name: entry.name.to_string(),
-                is_directory: entry.is_directory,
-                tier: entry.tier,
+                name: item.entry.name.to_string(),
+                is_directory: item.entry.is_directory,
+                tier: item.entry.tier,
                 slot,
             });
             if local.len() >= MAX_CANDIDATES {
@@ -698,26 +788,18 @@ fn scan_reuse(
 /// scorer. Byte-identical scoring to the pre-parallel inline scan.
 fn score_entry(
     index: &IndexData,
-    entry: &Entry,
+    item: SearchItem<'_>,
     prep: &Prepared,
     ctx: &RankContext,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<(i64, String)> {
     if prep.path_shaped {
-        score_path_shaped(index, entry, &prep.segments, &prep.known, ctx, scratch)
+        score_path_shaped(index, item, prep, ctx, scratch)
     } else if prep.tokens.len() > 1 {
-        score_multi(index, entry, prep, ctx, dir_masks, scratch)
+        score_multi(index, item, prep, ctx, dir_masks, scratch)
     } else {
-        score_plain(
-            index,
-            entry,
-            &prep.query_lower,
-            &prep.corrected,
-            &prep.known,
-            ctx,
-            scratch,
-        )
+        score_plain(index, item, prep, ctx, scratch)
     }
 }
 
@@ -725,41 +807,50 @@ fn score_entry(
 /// The name is lowered once; direct and layout-corrected needles reuse that haystack.
 fn score_plain(
     index: &IndexData,
-    entry: &Entry,
-    query_lower: &str,
-    corrected: &[String],
-    known: &HashSet<PathBuf>,
+    item: SearchItem<'_>,
+    prep: &Prepared,
     ctx: &RankContext,
     scratch: &mut String,
 ) -> Option<(i64, String)> {
-    let (mut score, corrected_match) =
-        if let Some(quality) = quality_match(&entry.name, query_lower, scratch) {
-            (quality, false)
-        } else {
-            let mut best: Option<i64> = None;
-            for needle in corrected {
-                // A corrected needle can only match a name of the same script: a Cyrillic
-                // needle never occurs in an ASCII name, so skip that pair before touching
-                // the buffer (keeps the whole-index scan cheap under layout correction).
-                if !needle.is_ascii() && entry.name.is_ascii() {
-                    continue;
-                }
-                if let Some(quality) = quality_match(&entry.name, needle, scratch) {
-                    best = Some(best.map_or(quality, |current| current.max(quality)));
-                }
+    let (mut score, corrected_match) = if let Some(quality) = quality_match(
+        &item.entry.name,
+        item.name_filter,
+        &prep.query_lower,
+        prep.query_name_filter,
+        scratch,
+    ) {
+        (quality, false)
+    } else {
+        let mut best: Option<i64> = None;
+        for (needle, needle_filter) in prep.corrected.iter().zip(&prep.corrected_name_filters) {
+            // A corrected needle can only match a name of the same script: a Cyrillic
+            // needle never occurs in an ASCII name, so skip that pair before touching
+            // the buffer (keeps the whole-index scan cheap under layout correction).
+            if !needle.is_ascii() && item.entry.name.is_ascii() {
+                continue;
             }
-            (best?, true)
-        };
+            if let Some(quality) = quality_match(
+                &item.entry.name,
+                item.name_filter,
+                needle,
+                *needle_filter,
+                scratch,
+            ) {
+                best = Some(best.map_or(quality, |current| current.max(quality)));
+            }
+        }
+        (best?, true)
+    };
 
     if corrected_match {
         score -= CORRECTION_PENALTY;
     }
-    score -= tier_penalty(entry.tier);
+    score -= tier_penalty(item.entry.tier);
 
-    let path = index.entry_path(entry);
+    let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
-    if known.contains(&path) {
+    if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
     Some((score, path_str))
@@ -774,7 +865,7 @@ fn score_plain(
 /// (with the same [`CORRECTION_PENALTY`]). Tokens need not be adjacent and order is irrelevant.
 fn score_multi(
     index: &IndexData,
-    entry: &Entry,
+    item: SearchItem<'_>,
     prep: &Prepared,
     ctx: &RankContext,
     dir_masks: &mut Option<DirMaskCache>,
@@ -783,7 +874,7 @@ fn score_multi(
     // The direct token set is the flat needle prefix (offset 0); each corrected set follows at
     // its recorded offset, so a per-set token position maps to a flat bit index.
     let (mut score, corrected_match) = if let Some(band) =
-        match_token_set(index, entry, &prep.tokens, 0, prep, dir_masks, scratch)
+        match_token_set(index, item, &prep.tokens, 0, prep, dir_masks, scratch)
     {
         (band, false)
     } else {
@@ -794,7 +885,7 @@ fn score_multi(
             // this fallback stays cheap across a whole-index scan (e.g. a Cyrillic corrected
             // token over millions of ASCII names).
             let offset = prep.corrected_offsets[k];
-            if let Some(band) = match_token_set(index, entry, set, offset, prep, dir_masks, scratch)
+            if let Some(band) = match_token_set(index, item, set, offset, prep, dir_masks, scratch)
             {
                 best = Some(best.map_or(band, |current| current.max(band)));
             }
@@ -805,9 +896,9 @@ fn score_multi(
     if corrected_match {
         score -= CORRECTION_PENALTY;
     }
-    score -= tier_penalty(entry.tier);
+    score -= tier_penalty(item.entry.tier);
 
-    let path = index.entry_path(entry);
+    let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
     if prep.known.contains(&path) {
@@ -822,7 +913,7 @@ fn score_multi(
 /// count), so `None` here always means an unmatched token, not an empty set.
 fn match_token_set(
     index: &IndexData,
-    entry: &Entry,
+    item: SearchItem<'_>,
     tokens: &[String],
     offset: usize,
     prep: &Prepared,
@@ -835,7 +926,7 @@ fn match_token_set(
         // dir mask.
         band = band.min(token_quality(
             index,
-            entry,
+            item,
             token,
             offset + j,
             prep,
@@ -855,28 +946,34 @@ fn match_token_set(
 ///
 /// `flat_index` is the token's index in [`Prepared::path_needles`]. When the mask cache is
 /// present the path check is one memoized `Vec` index plus one bit test (`mask & 1<<flat_index`);
-/// the `dir_masks == None` branch is the overflow fallback (>64 needles) — the same
+/// the `dir_masks == None` branch is the overflow fallback (>63 needles) — the same
 /// component-wise test done by an uncached ancestor walk plus the root components, not a second
 /// semantics.
 fn token_quality(
     index: &IndexData,
-    entry: &Entry,
+    item: SearchItem<'_>,
     token: &str,
     flat_index: usize,
     prep: &Prepared,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
 ) -> Option<i64> {
-    if let Some(quality) = quality_match(&entry.name, token, scratch) {
+    if let Some(quality) = quality_match(
+        &item.entry.name,
+        item.name_filter,
+        token,
+        prep.path_needle_name_filters[flat_index],
+        scratch,
+    ) {
         return Some(quality);
     }
     let in_path = match dir_masks {
         Some(cache) => {
-            let mask = cache.mask_for(index, entry.parent, &prep.path_needles, scratch);
+            let mask = cache.mask_for(index, item.entry.parent, &prep.path_needles, scratch);
             mask & (1u64 << flat_index) != 0
         }
         None => {
-            ancestor_contains(index, entry.parent, token, scratch)
+            ancestor_contains(index, item.entry.parent, token, scratch)
                 || prep
                     .root_lower
                     .iter()
@@ -898,32 +995,38 @@ fn tokenize(query_lower: &str) -> Vec<String> {
 /// the typed prefix — it gets scope priority and no hidden penalty (guarantee c).
 fn score_path_shaped(
     index: &IndexData,
-    entry: &Entry,
-    segments: &[String],
-    known: &HashSet<PathBuf>,
+    item: SearchItem<'_>,
+    prep: &Prepared,
     ctx: &RankContext,
     scratch: &mut String,
 ) -> Option<(i64, String)> {
-    let (last, prefix) = segments.split_last()?;
-    let mut score = quality_match(&entry.name, last, scratch)?;
+    let (last, prefix) = prep.segments.split_last()?;
+    let last_filter = *prep.segment_name_filters.last()?;
+    let mut score = quality_match(
+        &item.entry.name,
+        item.name_filter,
+        last,
+        last_filter,
+        scratch,
+    )?;
 
-    let scoped = !prefix.is_empty() && ancestors_match(index, entry.parent, prefix);
+    let scoped = !prefix.is_empty() && ancestors_match(index, item.entry.parent, prefix);
     if scoped {
         score += SCOPE_BONUS;
     }
 
     // Junk stays penalized even under a typed prefix; only the hidden penalty is waived
     // for a scoped match (guarantee c: "no hidden penalty").
-    match entry.tier {
+    match item.entry.tier {
         Tier::Junk => score -= JUNK_PENALTY,
         Tier::Hidden if !scoped => score -= HIDDEN_PENALTY,
         _ => {}
     }
 
-    let path = index.entry_path(entry);
+    let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
-    if known.contains(&path) {
+    if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
     Some((score, path_str))
@@ -950,7 +1053,7 @@ fn ancestors_match(index: &IndexData, parent: DirId, segments: &[String]) -> boo
 
 /// Whether `needle` occurs (case-insensitive substring) in any ancestor directory component
 /// name from `dir` up to the root. Allocation-free for ASCII component names. This is the
-/// overflow-fallback path check (>64 needles), used together with the root components in
+/// overflow-fallback path check (>63 needles), used together with the root components in
 /// [`token_quality`]; the mask cache folds the same tests into a memoized per-dir bitmask.
 fn ancestor_contains(
     index: &IndexData,
@@ -996,7 +1099,16 @@ fn ancestor_names(index: &IndexData, dir: DirId) -> Vec<String> {
 /// Match quality of the already-lowercased `needle` against a `name`. When both are ASCII
 /// (the vast majority of file names) it compares bytes case-insensitively with no
 /// allocation; otherwise it Unicode-lowercases `name` into `scratch` and compares.
-fn quality_match(name: &str, needle: &str, scratch: &mut String) -> Option<i64> {
+fn quality_match(
+    name: &str,
+    item_filter: u64,
+    needle: &str,
+    needle_filter: u64,
+    scratch: &mut String,
+) -> Option<i64> {
+    if !filter_contains(item_filter, needle_filter) {
+        return None;
+    }
     if name.is_ascii() && needle.is_ascii() {
         return quality_ascii(name.as_bytes(), needle.as_bytes());
     }
@@ -1035,10 +1147,7 @@ fn quality_ascii(name: &[u8], needle: &[u8]) -> Option<i64> {
     if ascii_ci_eq(&name[..needle.len()], needle) {
         return Some(QUAL_PREFIX);
     }
-    if name
-        .windows(needle.len())
-        .any(|window| ascii_ci_eq(window, needle))
-    {
+    if ascii_contains_ci(name, needle) {
         return Some(QUAL_SUBSTRING);
     }
     None
@@ -1046,7 +1155,7 @@ fn quality_ascii(name: &[u8], needle: &[u8]) -> Option<i64> {
 
 /// Whether two equal-length ASCII byte slices are equal ignoring case.
 fn ascii_ci_eq(a: &[u8], b: &[u8]) -> bool {
-    a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.eq_ignore_ascii_case(b)
 }
 
 /// Whether the already-lowercased `needle` occurs in `haystack`, case-insensitively. Like
@@ -1072,9 +1181,21 @@ fn ascii_contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
     if haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|window| ascii_ci_eq(window, needle))
+    // `windows().any(eq_ignore_ascii_case)` checks every possible start byte. Real file names
+    // average 33 bytes on the reference machine, so a cold miss repeats that branch over
+    // 5M scattered allocations. SIMD `memchr` finds only occurrences of the first byte (in
+    // either ASCII case); the full comparison runs at those positions. Same answer, much less
+    // work for the overwhelmingly common miss.
+    let last_start = haystack.len() - needle.len();
+    let starts = &haystack[..=last_start];
+    let first_lower = needle[0].to_ascii_lowercase();
+    let first_upper = needle[0].to_ascii_uppercase();
+    if first_lower == first_upper {
+        return memchr_iter(first_lower, starts)
+            .any(|start| ascii_ci_eq(&haystack[start..start + needle.len()], needle));
+    }
+    memchr2_iter(first_lower, first_upper, starts)
+        .any(|start| ascii_ci_eq(&haystack[start..start + needle.len()], needle))
 }
 
 fn tier_penalty(tier: Tier) -> i64 {
@@ -1280,6 +1401,29 @@ mod tests {
 
     fn run(index: &IndexData, query: &str) -> Vec<SearchHit> {
         search(index, &RankContext::empty(), query, 50)
+    }
+
+    #[test]
+    fn name_filter_keeps_every_supported_substring_match() {
+        for (name, needle) in [
+            ("README.MD", "readme"),
+            ("ПМИ_Процедура_Приемки.html", "процедура"),
+            ("Desktop - Kirill’s MacBook Pro", "kirill"),
+            ("report-1.42_final.docx", "1.42"),
+        ] {
+            let needle = needle.to_lowercase();
+            let item_filter = name_filter(name);
+            let needle_filter = name_filter(&needle);
+            assert!(filter_contains(item_filter, needle_filter));
+            assert!(quality_match(
+                name,
+                item_filter,
+                &needle,
+                needle_filter,
+                &mut String::new(),
+            )
+            .is_some());
+        }
     }
 
     #[test]

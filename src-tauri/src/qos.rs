@@ -2,9 +2,9 @@
 //! at background QoS so it never competes with the UI). Extracted from the Name Index
 //! crawl so the operations engine reuses the same libSystem shim rather than a copy.
 
-/// Lower the calling thread's QoS on macOS. This links `libSystem` (always present);
-/// no crate dependency is needed. `QOS_CLASS_BACKGROUND` is `0x09`,
-/// `QOS_CLASS_UTILITY` is `0x11`.
+/// Set the calling thread's QoS on macOS. This links `libSystem` (always present);
+/// no crate dependency is needed. Darwin's classes used here are background `0x09`,
+/// utility `0x11`, and user-initiated `0x19`.
 pub fn set_qos(qos_class: u32) {
     #[cfg(target_os = "macos")]
     {
@@ -27,4 +27,11 @@ pub fn set_qos(qos_class: u32) {
 /// this so they yield the machine to the UI (SPEC §10).
 pub fn set_background_qos() {
     set_qos(0x09);
+}
+
+/// User-initiated QoS (`0x19`): work triggered directly by an interaction whose result the
+/// user is waiting for. Search scans use this so a process waking from its hidden state does
+/// not run the first keystrokes at background priority.
+pub fn set_user_initiated_qos() {
+    set_qos(0x19);
 }

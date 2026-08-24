@@ -27,6 +27,7 @@ export const searchResponseSchema = z
     revision: z.number().int().nonnegative(),
     reused: z.boolean(),
     scanned: z.number().int().nonnegative(),
+    backendDurationMs: z.number().int().nonnegative(),
     hits: z.array(searchHitSchema),
   })
   .strict();

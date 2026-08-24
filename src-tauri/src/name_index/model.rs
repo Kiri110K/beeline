@@ -24,6 +24,39 @@ pub type DirId = u32;
 /// Sentinel `dir_id` on an [`Entry`] that is a file, not a directory.
 pub const NO_DIR: u32 = u32::MAX;
 
+/// Compact necessary-condition filter for case-insensitive substring matching. Each ASCII
+/// letter and digit owns a stable bit; punctuation and lowercased Unicode bytes share the
+/// remaining bits. If every bit in a query is not present in an Item name's filter, that name
+/// cannot contain the query. Collisions only cause extra string checks, never missed matches.
+pub(crate) fn name_filter(name: &str) -> u64 {
+    fn bit(byte: u8) -> u64 {
+        let lower = byte.to_ascii_lowercase();
+        let index = match lower {
+            b'a'..=b'z' => lower - b'a',
+            b'0'..=b'9' => 26 + (lower - b'0'),
+            _ => 36 + (lower % 28),
+        };
+        1u64 << index
+    }
+
+    let mut filter = 0u64;
+    if name.is_ascii() {
+        for byte in name.bytes() {
+            filter |= bit(byte);
+        }
+        return filter;
+    }
+    let mut encoded = [0u8; 4];
+    for ch in name.chars() {
+        for lower in ch.to_lowercase() {
+            for byte in lower.encode_utf8(&mut encoded).bytes() {
+                filter |= bit(byte);
+            }
+        }
+    }
+    filter
+}
+
 /// Ranking / refresh tier of an item, per SPEC §6.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -109,6 +142,10 @@ pub struct IndexData {
     pub nodes: Vec<DirNode>,
     /// Slot vector; a removed item leaves a `None` tombstone so indices stay stable.
     pub entries: Vec<Option<Entry>>,
+    /// Case-insensitive necessary-condition filters aligned one-for-one with `entries`.
+    /// Tombstones carry zero. Keeping this as a dense side array lets a miss reject a name
+    /// without following the `Entry::name` heap pointer.
+    pub name_filters: Vec<u64>,
     /// Count of live (non-tombstone) entries.
     pub live: usize,
     /// Junk directories whose contents may be stale and need a lazy rescan.
@@ -127,6 +164,7 @@ impl IndexData {
             root,
             nodes: vec![root_node],
             entries: Vec::new(),
+            name_filters: Vec::new(),
             live: 0,
             junk_dirty: HashSet::new(),
             revision: 0,
@@ -186,6 +224,7 @@ impl IndexData {
 
     fn push_entry(&mut self, entry: Entry) -> u32 {
         let index = self.entries.len() as u32;
+        self.name_filters.push(name_filter(&entry.name));
         self.entries.push(Some(entry));
         self.live += 1;
         self.revision += 1;
@@ -252,6 +291,7 @@ impl IndexData {
             self.nodes[parent as usize].child_dirs.remove(name);
         }
         self.entries[entry_index as usize] = None;
+        self.name_filters[entry_index as usize] = 0;
         self.live -= 1;
         self.revision += 1;
         true
@@ -265,6 +305,7 @@ impl IndexData {
         let children = std::mem::take(&mut self.nodes[dir_id as usize].child_dirs);
         for index in entries {
             if self.entries[index as usize].take().is_some() {
+                self.name_filters[index as usize] = 0;
                 self.live -= 1;
             }
         }
@@ -281,6 +322,7 @@ impl IndexData {
         let children = std::mem::take(&mut self.nodes[dir_id as usize].child_dirs);
         for index in entries {
             if self.entries[index as usize].take().is_some() {
+                self.name_filters[index as usize] = 0;
                 self.live -= 1;
             }
         }
