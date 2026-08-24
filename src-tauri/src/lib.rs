@@ -2,6 +2,7 @@ mod listing;
 mod name_index;
 mod operations;
 mod pinned_tabs;
+mod power;
 mod preview;
 mod qos;
 mod quick_look;
@@ -27,7 +28,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-use listing::list_location;
+use listing::{list_location, list_location_initial};
 use name_index::{record_visit, search_name_index, NameIndex};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
@@ -36,7 +37,8 @@ use operations::{
 use pinned_tabs::{load_pinned_tabs, save_pinned_tabs};
 use preview::{preview_metadata, preview_text_excerpt, preview_thumbnail, ThumbnailTracker};
 use quick_look::{
-    quick_look_hide, quick_look_is_open, quick_look_show, quick_look_update, QuickLook,
+    prewarm as prewarm_quick_look, quick_look_hide, quick_look_is_open, quick_look_show,
+    quick_look_update, QuickLook,
 };
 use recents::{get_recents, RecentsCache};
 use settings::get_settings;
@@ -236,6 +238,13 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "main window is missing".to_owned())?;
+    // Current macOS treats activation as a cooperative request. An Accessory app may be
+    // activated in principle, but a global-shortcut callback has repeatedly been denied on
+    // the reference machine. Become a Regular app for the visible session, then return to
+    // Accessory in the single hide path so the hidden resident has no Dock presence.
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Regular)
+        .map_err(|error| format!("failed to enable visible activation policy: {error}"))?;
     window
         .show()
         .map_err(|error| format!("failed to show main window: {error}"))?;
@@ -248,11 +257,15 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
     spawn_focus_settle(app, &window, state);
 
     let hidden_ms = state.take_hidden_ms();
+    let window_key = window.is_focused().unwrap_or(false);
+    let app_active = application_is_active();
     record_event(
         app,
         "window_visible",
         json!({
-            "focused": window.is_focused().unwrap_or(false),
+            "focused": window_key && app_active,
+            "window_key": window_key,
+            "app_active": app_active,
             "origin": origin,
             "sequence": sequence,
             "visible": window.is_visible().unwrap_or(false),
@@ -295,18 +308,16 @@ fn install_space_behavior(window: &WebviewWindow) {
 }
 
 // Number of settle retries and the gap between them: since macOS 14 activation is
-// cooperative, so a single request from a non-frontmost Accessory app is often
-// dropped and one call is a coin flip (observed live: 8 of 9 shortcut presses left
-// another app key). ~320 ms total is below the perceptible-lag threshold for a show.
+// cooperative, so a single request from a non-frontmost Accessory app may be dropped.
+// ~320 ms total is below the perceptible-lag threshold for a show.
 const FOCUS_SETTLE_ATTEMPTS: u32 = 8;
 const FOCUS_SETTLE_INTERVAL_MS: u64 = 40;
 
-// An Accessory app that has never been active does not come frontmost from
-// `set_focus` alone (observed live: window visible, `focused:false`, another app
-// still frontmost). Drive the full AppKit sequence on the main thread — activate
-// NSApplication, then order the window front and make it key — the "precise window
-// activation" bridge ADR-0001 anticipated. Best-effort: a dropped request is what
-// `spawn_focus_settle` retries.
+// An Accessory app that has never been active does not come frontmost from `set_focus`
+// alone. Drive the full AppKit sequence on the main thread: make the window key, then
+// use macOS 14's user-intent-aware activation request. The old
+// `activateIgnoringOtherApps` API is deprecated and has no effect on current macOS.
+// Best-effort: a dropped request is what `spawn_focus_settle` retries.
 fn activate_and_make_key(app: &AppHandle, window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     {
@@ -317,9 +328,6 @@ fn activate_and_make_key(app: &AppHandle, window: &WebviewWindow) {
                     return;
                 };
                 let ns_app = objc2_app_kit::NSApplication::sharedApplication(marker);
-                #[allow(deprecated)] // activate() defers to the system; ignoringOtherApps
-                // is what a user-initiated global shortcut wants.
-                ns_app.activateIgnoringOtherApps(true);
                 if let Ok(ns_window_ptr) = window.ns_window() {
                     // SAFETY: tauri hands back the live NSWindow pointer for this window;
                     // ns_window() and these calls all run on the main thread (this closure).
@@ -327,11 +335,31 @@ fn activate_and_make_key(app: &AppHandle, window: &WebviewWindow) {
                     ns_window.orderFrontRegardless();
                     ns_window.makeKeyAndOrderFront(None);
                 }
+                ns_app.activate();
             }
         });
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (app, window);
+}
+
+// A window can be "key" inside an inactive Accessory app while another process still owns
+// the keyboard. NSRunningApplication is thread-safe and reports the OS-level frontmost
+// truth, so every focus decision combines both signals.
+#[cfg(target_os = "macos")]
+fn application_is_active() -> bool {
+    objc2_app_kit::NSRunningApplication::currentApplication().isActive()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn application_is_active() -> bool {
+    true
+}
+
+fn has_foreground_focus(window: &WebviewWindow) -> (bool, bool, bool) {
+    let window_key = window.is_focused().unwrap_or(false);
+    let app_active = application_is_active();
+    (window_key && app_active, window_key, app_active)
 }
 
 // Activation may still be deferred after the initial request, so verify and retry
@@ -347,7 +375,7 @@ fn spawn_focus_settle(app: &AppHandle, window: &WebviewWindow, state: &ShellStat
     std::thread::spawn(move || {
         let state = app.state::<ShellState>();
         let mut attempts = 0;
-        let mut focused = window.is_focused().unwrap_or(false);
+        let (mut focused, mut window_key, mut app_active) = has_foreground_focus(&window);
         while !focused && attempts < FOCUS_SETTLE_ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(FOCUS_SETTLE_INTERVAL_MS));
             if state.settle_generation.load(Ordering::Acquire) != generation {
@@ -355,7 +383,7 @@ fn spawn_focus_settle(app: &AppHandle, window: &WebviewWindow, state: &ShellStat
             }
             activate_and_make_key(&app, &window);
             attempts += 1;
-            focused = window.is_focused().unwrap_or(false);
+            (focused, window_key, app_active) = has_foreground_focus(&window);
         }
         if state.settle_generation.load(Ordering::Acquire) != generation {
             return;
@@ -363,7 +391,12 @@ fn spawn_focus_settle(app: &AppHandle, window: &WebviewWindow, state: &ShellStat
         record_event(
             &app,
             "focus_settled",
-            json!({ "attempts": attempts, "focused": focused }),
+            json!({
+                "attempts": attempts,
+                "focused": focused,
+                "window_key": window_key,
+                "app_active": app_active,
+            }),
         );
     });
 }
@@ -386,6 +419,9 @@ fn perform_hide(
     window
         .hide()
         .map_err(|error| format!("failed to hide main window: {error}"))?;
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)
+        .map_err(|error| format!("failed to restore hidden activation policy: {error}"))?;
     record_event(app, "window_hidden", json!({ "origin": origin }));
     Ok(())
 }
@@ -397,9 +433,7 @@ fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
     let is_visible = window
         .is_visible()
         .map_err(|error| format!("failed to read main window visibility: {error}"))?;
-    let is_focused = window
-        .is_focused()
-        .map_err(|error| format!("failed to read main window focus: {error}"))?;
+    let (is_focused, _, _) = has_foreground_focus(&window);
 
     let state = app.state::<ShellState>();
     if is_visible && is_focused {
@@ -571,6 +605,7 @@ pub fn run() {
             hide_window,
             home_directory,
             list_location,
+            list_location_initial,
             load_pinned_tabs,
             open_in_app,
             paste_copy,
@@ -633,7 +668,10 @@ pub fn run() {
             app.manage(telemetry);
             app.manage(ShellState::new(!hidden_launch));
             app.manage(Operations::new());
-            app.manage(QuickLook::new());
+            app.manage(QuickLook::new(app.handle()));
+            if let Err(error) = prewarm_quick_look(app.handle()) {
+                eprintln!("Quick Look prewarm dispatch failed: {error}");
+            }
             app.manage(ThumbnailTracker::new());
             // Load the last-success Recents cache so the first get_recents paints from it
             // instantly; the refresh is triggered lazily by that first call (§7, §11).

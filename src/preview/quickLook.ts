@@ -12,6 +12,9 @@ import { fromTauri, type ShellError } from "../shell";
 // panel is closed by its own close control instead of by the app (SPEC §5 Escape order).
 
 const QUICK_LOOK_CLOSED_EVENT = "beeline://quick-look-closed";
+const QUICK_LOOK_KEY_EVENT = "beeline://quick-look-key";
+const quickLookKeySchema = z.enum(["next", "previous", "close"]);
+export type QuickLookKey = z.infer<typeof quickLookKeySchema>;
 
 // Every Quick Look command resolves to unit across the boundary.
 const unitSchema = z.null();
@@ -56,6 +59,19 @@ export function subscribeQuickLookClosed(
   return fromTauri(`listen:${QUICK_LOOK_CLOSED_EVENT}`, unlistenSchema, () =>
     listen(QUICK_LOOK_CLOSED_EVENT, () => {
       handler();
+    }),
+  );
+}
+
+export function subscribeQuickLookKey(
+  handler: (key: QuickLookKey) => void,
+): ResultAsync<UnlistenFn, ShellError> {
+  return fromTauri(`listen:${QUICK_LOOK_KEY_EVENT}`, unlistenSchema, () =>
+    listen(QUICK_LOOK_KEY_EVENT, (event) => {
+      const parsed = quickLookKeySchema.safeParse(event.payload);
+      if (parsed.success) {
+        handler(parsed.data);
+      }
     }),
   );
 }

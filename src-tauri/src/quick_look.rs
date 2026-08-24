@@ -22,8 +22,10 @@
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    mpsc, Arc,
 };
+use std::thread;
+use std::time::Instant;
 
 use serde_json::json;
 use tauri::{AppHandle, Manager, State};
@@ -31,26 +33,71 @@ use tauri::{AppHandle, Manager, State};
 use crate::telemetry::Telemetry;
 
 pub const QUICK_LOOK_CLOSED_EVENT: &str = "beeline://quick-look-closed";
+pub const QUICK_LOOK_KEY_EVENT: &str = "beeline://quick-look-key";
+
+type MainJob = Box<dyn FnOnce(objc2::MainThreadMarker) + Send + 'static>;
 
 /// The `Send` half of the bridge, held in Tauri managed state: a mirror of whether the panel
 /// is currently visible. The main-thread controller and the close observer keep it in sync so
 /// `quick_look_is_open` is an instant atomic read (SPEC §10), never a main-thread round trip.
 pub struct QuickLook {
     open: Arc<AtomicBool>,
+    main_jobs: mpsc::Sender<MainJob>,
 }
 
 impl QuickLook {
-    pub fn new() -> Self {
+    pub fn new(app: &AppHandle) -> Self {
+        let (main_jobs, receiver) = mpsc::channel::<MainJob>();
+        let handle = app.clone();
+        thread::Builder::new()
+            .name("beeline-quick-look-dispatch".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    if let Err(error) = handle.run_on_main_thread(move || {
+                        // SAFETY: Tauri executes this closure on AppKit's main thread.
+                        let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
+                        job(mtm);
+                    }) {
+                        eprintln!("failed to dispatch Quick Look work to main thread: {error}");
+                    }
+                }
+            })
+            .expect("failed to start Quick Look dispatcher");
         Self {
             open: Arc::new(AtomicBool::new(false)),
+            main_jobs,
         }
+    }
+
+    /// Enqueue one AppKit operation. The dedicated receiver preserves show/update/hide order,
+    /// while this send returns before the main thread presents or reloads the panel.
+    fn dispatch<F>(&self, body: F) -> Result<(), String>
+    where
+        F: FnOnce(objc2::MainThreadMarker) + Send + 'static,
+    {
+        self.main_jobs
+            .send(Box::new(body))
+            .map_err(|_| "Quick Look dispatcher stopped".to_owned())
     }
 }
 
-impl Default for QuickLook {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Create the process-wide panel/controller during launch, before the first Space press.
+/// AppKit still runs on the main thread, but the user-facing Quick Look dispatch no longer
+/// pays the framework/singleton initialization cost (SPEC §10: ≤50 ms).
+pub fn prewarm(app: &AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    let started_at = Instant::now();
+    app.state::<QuickLook>().dispatch(move |mtm| {
+        imp::prewarm(mtm, &handle);
+        record(
+            &handle,
+            "quick_look_prewarmed",
+            json!({
+                "duration_ms": u64::try_from(started_at.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            }),
+        );
+    })
 }
 
 fn record(app: &AppHandle, event: &str, fields: serde_json::Value) {
@@ -76,13 +123,17 @@ pub fn quick_look_show(
     app: AppHandle,
     state: State<'_, QuickLook>,
 ) -> Result<(), String> {
+    let started_at = Instant::now();
+    let count = paths.len();
     record(&app, "quick_look_shown", json!({ "count": paths.len() }));
     // Mirror the intent before the async hop so an immediately-following is_open reads true;
     // the observer flips it back the moment the user closes the panel.
     state.open.store(true, Ordering::SeqCst);
 
     let handle = app.clone();
-    let dispatched = dispatch_to_main(&app, move |mtm| imp::present(mtm, &handle, paths, index));
+    let dispatched = state.dispatch(move |mtm| {
+        imp::present(mtm, &handle, paths, index, started_at, count);
+    });
     if dispatched.is_err() {
         // The panel work never reached the main thread, so the mirror must not claim open.
         state.open.store(false, Ordering::SeqCst);
@@ -102,7 +153,12 @@ pub fn quick_look_update(
     if !state.open.load(Ordering::SeqCst) {
         return Ok(());
     }
-    dispatch_to_main(&app, move |mtm| imp::update(mtm, paths, index))
+    record(
+        &app,
+        "quick_look_updated",
+        json!({ "count": paths.len(), "index": index }),
+    );
+    state.dispatch(move |mtm| imp::update(mtm, paths, index))
 }
 
 /// `quick_look_hide`: close the panel programmatically (SPEC §5: the frontend's Escape order
@@ -115,23 +171,7 @@ pub fn quick_look_hide(app: AppHandle, state: State<'_, QuickLook>) -> Result<()
     if was_open {
         record(&app, "quick_look_hidden", json!({}));
     }
-    dispatch_to_main(&app, imp::hide)
-}
-
-/// Run `body` on the main thread with a [`MainThreadMarker`], mapping Tauri's dispatch error
-/// to a string.
-#[cfg(target_os = "macos")]
-fn dispatch_to_main<F>(app: &AppHandle, body: F) -> Result<(), String>
-where
-    F: FnOnce(objc2::MainThreadMarker) + Send + 'static,
-{
-    app.run_on_main_thread(move || {
-        // SAFETY: `run_on_main_thread` guarantees this closure executes on the main thread,
-        // so a marker asserting that invariant is sound.
-        let mtm = unsafe { objc2::MainThreadMarker::new_unchecked() };
-        body(mtm);
-    })
-    .map_err(|error| format!("failed to dispatch Quick Look work to the main thread: {error}"))
+    state.dispatch(imp::hide)
 }
 
 #[cfg(target_os = "macos")]
@@ -141,20 +181,24 @@ mod imp {
     //! non-`Send` `Retained` controller lives in a `thread_local` rather than managed state.
 
     use std::cell::RefCell;
+    use std::ptr::{self, NonNull};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
+    use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, ProtocolObject};
     use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::NSWindowWillCloseNotification;
+    use objc2_app_kit::{
+        NSEvent, NSEventMask, NSEventModifierFlags, NSWindow, NSWindowWillCloseNotification,
+    };
     use objc2_foundation::{
         NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSString, NSURL,
     };
     use objc2_quick_look_ui::{QLPreviewItem, QLPreviewPanel, QLPreviewPanelDataSource};
     use tauri::{AppHandle, Emitter, Manager};
 
-    use super::{record, QuickLook, QUICK_LOOK_CLOSED_EVENT};
+    use super::{record, QuickLook, QUICK_LOOK_CLOSED_EVENT, QUICK_LOOK_KEY_EVENT};
 
     thread_local! {
         /// The one data-source/observer object, created on first show and reused thereafter.
@@ -171,6 +215,7 @@ mod imp {
         urls: RefCell<Vec<Retained<NSURL>>>,
         app: AppHandle,
         open: Arc<std::sync::atomic::AtomicBool>,
+        event_monitor: RefCell<Option<Retained<AnyObject>>>,
     }
 
     define_class!(
@@ -239,6 +284,7 @@ mod imp {
                 urls: RefCell::new(Vec::new()),
                 app,
                 open,
+                event_monitor: RefCell::new(None),
             });
             // SAFETY: standard `init` on a freshly allocated instance with its ivars set.
             let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -259,6 +305,45 @@ mod imp {
                     Some(panel_object),
                 );
             }
+
+            // QLPreviewPanel owns the key window while visible, so the WebView cannot see
+            // its navigation keys. A process-local AppKit monitor intercepts only the Quick
+            // Look contract while the atomic mirror is true, emits one frontend action, and
+            // returns null so the panel does not also handle the key.
+            let key_app = this.ivars().app.clone();
+            let key_open = this.ivars().open.clone();
+            let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                if !key_open.load(Ordering::SeqCst) {
+                    return event.as_ptr();
+                }
+                // SAFETY: AppKit passes a valid NSEvent for the duration of this block.
+                let event_ref = unsafe { event.as_ref() };
+                let control = event_ref
+                    .modifierFlags()
+                    .contains(NSEventModifierFlags::Control);
+                let action = match event_ref.keyCode() {
+                    125 => Some("next"),
+                    126 => Some("previous"),
+                    38 if control => Some("next"),
+                    40 if control => Some("previous"),
+                    49 | 53 => Some("close"),
+                    _ => None,
+                };
+                let Some(action) = action else {
+                    return event.as_ptr();
+                };
+                if let Err(error) = key_app.emit(QUICK_LOOK_KEY_EVENT, action) {
+                    eprintln!("failed to emit Quick Look key event: {error}");
+                    return event.as_ptr();
+                }
+                ptr::null_mut()
+            });
+            // SAFETY: the block returns either AppKit's original live event pointer or null;
+            // the returned monitor token is retained in the process-lifetime controller.
+            let monitor = unsafe {
+                NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block)
+            };
+            *this.ivars().event_monitor.borrow_mut() = monitor;
             this
         }
 
@@ -300,6 +385,11 @@ mod imp {
         })
     }
 
+    pub(super) fn prewarm(mtm: MainThreadMarker, app: &AppHandle) {
+        let open = app.state::<QuickLook>().open.clone();
+        let _ = controller(mtm, app, &open);
+    }
+
     fn clamp_index(index: usize, len: usize) -> isize {
         if len == 0 {
             0
@@ -314,6 +404,8 @@ mod imp {
         app: &AppHandle,
         paths: Vec<String>,
         index: usize,
+        started_at: std::time::Instant,
+        count: usize,
     ) {
         let open = app.state::<QuickLook>().open.clone();
         let controller = controller(mtm, app, &open);
@@ -334,6 +426,32 @@ mod imp {
             panel.setCurrentPreviewItemIndex(target);
             panel.orderFront(None);
         }
+        // `QLPreviewPanel` can become the key window even when ordered without
+        // `makeKeyAndOrderFront`. Return key focus to the webview so Space/Up/Down keep
+        // reaching the frontend; the preview panel remains ordered above it.
+        if let Some(window) = app.get_webview_window("main") {
+            match window.ns_window() {
+                Ok(ns_window_ptr) => {
+                    // SAFETY: Tauri returns the live NSWindow pointer and this function runs
+                    // on AppKit's main thread. `makeKeyWindow` changes keyboard ownership
+                    // without changing the window order, so the panel stays visible.
+                    let ns_window = unsafe { &*ns_window_ptr.cast::<NSWindow>() };
+                    ns_window.makeKeyWindow();
+                }
+                Err(error) => {
+                    eprintln!("failed to get main window after Quick Look presentation: {error}");
+                }
+            }
+        }
+        record(
+            app,
+            "quick_look_presented",
+            serde_json::json!({
+                "count": count,
+                "duration_ms": u64::try_from(started_at.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+            }),
+        );
     }
 
     /// Replace the open panel's list/position (Up/Down while open).

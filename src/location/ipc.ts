@@ -4,8 +4,10 @@ import { z } from "zod";
 
 import { fromTauri, type ShellError } from "../shell";
 import {
+  initialListLocationSchema,
   listErrorSchema,
   listLocationSchema,
+  type InitialListLocationResponse,
   type ListErrorPayload,
   type ListLocationResponse,
 } from "./schema";
@@ -23,6 +25,14 @@ function classifyListError(error: ShellError): ListErrorPayload {
     }
   }
   return { code: "io" };
+}
+
+export function listLocationInitial(
+  path: string,
+): ResultAsync<InitialListLocationResponse, ListErrorPayload> {
+  return fromTauri("list_location_initial", initialListLocationSchema, () =>
+    invoke("list_location_initial", { path }),
+  ).mapErr(classifyListError);
 }
 
 export function listLocation(

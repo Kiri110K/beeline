@@ -48,7 +48,7 @@ import {
   type NavKind,
   type SelectMode,
 } from "../browse/state";
-import { listLocation } from "../location/ipc";
+import { listLocation, listLocationInitial } from "../location/ipc";
 import {
   directoryLocation,
   recentsLocation,
@@ -71,6 +71,7 @@ import {
   quickLookShow,
   quickLookUpdate,
   subscribeQuickLookClosed,
+  subscribeQuickLookKey,
 } from "../preview/quickLook";
 import {
   copyToClipboard,
@@ -140,7 +141,7 @@ interface QuickLookSession {
 // its Focused-Item mapping (SPEC §9: "files only"). Directories are skipped.
 function fileRowsOf(
   items: readonly Item[],
-  rowOrder: readonly number[],
+  rowOrder: Iterable<number>,
 ): { paths: string[]; rows: number[] } {
   const paths: string[] = [];
   const rows: number[] = [];
@@ -499,12 +500,55 @@ export function useTabs(
         return;
       }
 
-      void listLocation(target.path).match(
+      const listingStartedAt = performance.now();
+      void listLocationInitial(target.path).match(
         (response) => {
+          if (seq !== seqRef.current.get(tabId)) {
+            return;
+          }
           commit(directoryLocation(response.path), {
             kind: "items",
             items: response.items,
           });
+          // Two animation frames give React a paint opportunity after the listing state
+          // commits. This is an upper-bound measurement from navigation through the first
+          // rendered frame, including IPC, sorting, reconciliation, and virtualization.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              if (
+                seq === seqRef.current.get(tabId) &&
+                tabId === stateRef.current.activeId
+              ) {
+                fireTelemetry("location_first_frame", {
+                  path: response.path,
+                  count: response.total,
+                  duration_ms: Math.round(performance.now() - listingStartedAt),
+                });
+              }
+            });
+          });
+          if (!response.complete) {
+            // The sorted prefix is already interactive. Fill in the remaining metadata-rich
+            // rows as one background replacement, preserving the visible row by path.
+            void listLocation(target.path).match(
+              (full) => {
+                if (seq !== seqRef.current.get(tabId)) {
+                  return;
+                }
+                dispatch({
+                  type: "browse",
+                  tabId,
+                  action: {
+                    type: "revalidated",
+                    location: directoryLocation(full.path),
+                    items: full.items,
+                    focusPath: focusPath ?? null,
+                  },
+                });
+              },
+              () => undefined,
+            );
+          }
         },
         (error) => {
           if (seq !== seqRef.current.get(tabId)) {
@@ -539,7 +583,7 @@ export function useTabs(
             dispatch({
               type: "browse",
               tabId,
-              action: { type: "revalidated", location, items },
+              action: { type: "revalidated", location, items, focusPath: null },
             });
           }
         }, reportShellError);
@@ -557,6 +601,7 @@ export function useTabs(
               type: "revalidated",
               location: directoryLocation(response.path),
               items: response.items,
+              focusPath: null,
             },
           });
         },
@@ -727,33 +772,50 @@ export function useTabs(
     if (focused === undefined || focused.isDirectory) {
       return;
     }
+    const dispatchStartedAt = performance.now();
     const multiSelect = active.browse.selected.size > 1;
-    const order = multiSelect
+    const order: Iterable<number> = multiSelect
       ? [...active.browse.selected].sort((a, b) => a - b)
-      : items.map((_item, index) => index);
+      : items.keys();
     let list = fileRowsOf(items, order);
     // Ensure the Focused Item is part of the list (a multi-selection of only directories, or a
     // focus outside the selection, falls back to the whole listing's files).
     if (!list.rows.includes(focusIndex)) {
       list = fileRowsOf(
         items,
-        items.map((_item, index) => index),
+        items.keys(),
       );
     }
     if (list.paths.length === 0) {
       return;
     }
     const position = Math.max(0, list.rows.indexOf(focusIndex));
+    const currentPath = list.paths[position];
+    if (currentPath === undefined) {
+      return;
+    }
     quickLookRef.current = {
       paths: list.paths,
       rows: list.rows,
       index: position,
     };
-    void quickLookShow(list.paths, position).match(() => undefined, (error) => {
-      // The panel never opened, so the mirror must not claim it did.
-      quickLookRef.current = null;
-      reportShellError(error);
-    });
+    // The frontend owns Up/Down navigation, so the native panel needs only the current
+    // preview item. Sending a 50k-directory's complete path list across IPC made Space take
+    // hundreds of milliseconds and made every Arrow key rebuild 50k NSURLs on AppKit's main
+    // thread. Keep the complete session locally and re-point the panel one path at a time.
+    void quickLookShow([currentPath], 0).match(
+      () => {
+        fireTelemetry("quick_look_dispatch_completed", {
+          count: list.paths.length,
+          duration_ms: Math.round(performance.now() - dispatchStartedAt),
+        });
+      },
+      (error) => {
+        // The panel never opened, so the mirror must not claim it did.
+        quickLookRef.current = null;
+        reportShellError(error);
+      },
+    );
   }, []);
 
   // Move through the open Quick Look list (Up/Down, Ctrl+J/K): re-point the panel and move the
@@ -773,7 +835,11 @@ export function useTabs(
       return;
     }
     session.index = next;
-    void quickLookUpdate(session.paths, next).match(
+    const path = session.paths[next];
+    if (path === undefined) {
+      return;
+    }
+    void quickLookUpdate([path], 0).match(
       () => undefined,
       reportShellError,
     );
@@ -2111,6 +2177,35 @@ export function useTabs(
       }
     };
   }, []);
+
+  // QLPreviewPanel is the key AppKit window while visible, so its local event monitor forwards
+  // the Quick Look-only keyboard contract here instead of relying on WebView key delivery.
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void subscribeQuickLookKey((key) => {
+      if (quickLookRef.current === null) {
+        return;
+      }
+      switch (key) {
+        case "next":
+          moveQuickLook(1);
+          break;
+        case "previous":
+          moveQuickLook(-1);
+          break;
+        case "close":
+          closeQuickLook();
+          break;
+      }
+    }).match((fn) => {
+      unlisten = fn;
+    }, reportShellError);
+    return () => {
+      if (unlisten !== null) {
+        unlisten();
+      }
+    };
+  }, [closeQuickLook, moveQuickLook]);
 
   // Combined keyboard contract: Tab shortcuts plus the Browse-mode keys, in the
   // capture phase so Escape can preventDefault before shell.ts's bubble hide.

@@ -82,7 +82,15 @@ export type BrowseAction =
     }
   // Background re-list of the current Location (Tab switch, §11 revalidation):
   // items are replaced but the Focused Item never moves and history/scroll stand.
-  | { type: "revalidated"; location: Location; items: Item[] }
+  | {
+      type: "revalidated";
+      location: Location;
+      items: Item[];
+      // A progressive large-directory completion can still need to land on the file that
+      // Search Reveal requested but which was outside the initial prefix. Null preserves
+      // the current focused/selected paths during ordinary background revalidation.
+      focusPath: string | null;
+    }
   // Append the next page of Recents onto the current view (progressive scroll, §7).
   | { type: "recentsAppended"; items: Item[] }
   // Snapshot the live scroll offset into the Tab (on deactivation).
@@ -365,12 +373,20 @@ export function browseReducer(
       }
       // Re-resolve the Focused and Selected Items by path so the focused row
       // keeps its identity even as indices shift; scroll and history untouched.
-      const restore: HistoryEntry = {
-        location: state.location,
-        focusedPath: focusedPathOf(state),
-        selectedPaths: selectedPathsOf(state),
-        scrollTop: state.scrollTop,
-      };
+      const restore: HistoryEntry =
+        action.focusPath === null
+          ? {
+              location: state.location,
+              focusedPath: focusedPathOf(state),
+              selectedPaths: selectedPathsOf(state),
+              scrollTop: state.scrollTop,
+            }
+          : {
+              location: state.location,
+              focusedPath: action.focusPath,
+              selectedPaths: [action.focusPath],
+              scrollTop: 0,
+            };
       const position = positionFor(restore, action.items);
       return {
         ...state,

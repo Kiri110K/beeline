@@ -22,6 +22,14 @@ export const listLocationSchema = z
   .strict();
 export type ListLocationResponse = z.infer<typeof listLocationSchema>;
 
+export const initialListLocationSchema = listLocationSchema.extend({
+  total: z.number().int().nonnegative(),
+  complete: z.boolean(),
+});
+export type InitialListLocationResponse = z.infer<
+  typeof initialListLocationSchema
+>;
+
 // Mirrors the serde-tagged Rust enum; only codes cross the boundary.
 export const listErrorSchema = z.discriminatedUnion("code", [
   z.object({ code: z.literal("not-found") }).strict(),

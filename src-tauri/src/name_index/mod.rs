@@ -10,6 +10,7 @@
 mod alias;
 mod crawl;
 mod junk;
+mod junk_refresh;
 mod model;
 mod persist;
 mod query;
@@ -33,6 +34,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::telemetry::Telemetry;
 use alias::AliasDictionary;
 use junk::JunkPatterns;
+use junk_refresh::JunkRefresh;
 use model::IndexData;
 use query::{RankContext, SearchHit};
 use visit_journal::{VisitJournal, VisitKind};
@@ -94,6 +96,8 @@ pub struct NameIndex {
     /// The single previous exhaustive scan (the app has one search stream, SPEC §5), so a
     /// strictly-extending keystroke rescans just that match set instead of the whole index.
     reuse: Arc<Mutex<Option<ReuseCache>>>,
+    /// Event-driven battery policy for lazy Junk refreshes (SPEC §10).
+    junk_refresh: JunkRefresh,
 }
 
 impl NameIndex {
@@ -136,6 +140,8 @@ impl NameIndex {
         let data = Arc::new(RwLock::new(
             loaded.unwrap_or_else(|| IndexData::new(root.clone())),
         ));
+        let junk_refresh =
+            JunkRefresh::new(data.clone(), root.clone(), junk.clone(), Some(app.clone()));
 
         {
             let data = data.clone();
@@ -158,7 +164,18 @@ impl NameIndex {
             });
         }
 
-        watcher::spawn(data.clone(), root.clone(), junk.clone());
+        watcher::spawn(
+            data.clone(),
+            root.clone(),
+            junk.clone(),
+            Some(junk_refresh.clone()),
+        );
+        {
+            let junk_refresh = junk_refresh.clone();
+            crate::power::spawn_monitor(move |source| {
+                junk_refresh.power_source_changed(source);
+            });
+        }
 
         let journal = Arc::new(
             VisitJournal::load(&app_data_dir)
@@ -174,6 +191,7 @@ impl NameIndex {
             aliases,
             generation: Arc::new(AtomicU64::new(0)),
             reuse: Arc::new(Mutex::new(None)),
+            junk_refresh,
         })
     }
 
@@ -297,6 +315,7 @@ fn execute_search(
     root: &Path,
     journal: &VisitJournal,
     aliases: &AliasDictionary,
+    junk_refresh: Option<&JunkRefresh>,
     query: &str,
     limit: usize,
     reuse: Option<&ReuseCache>,
@@ -304,7 +323,11 @@ fn execute_search(
 ) -> Executed {
     let query_lower = query.trim().to_lowercase();
     if junk.query_targets_junk(&query_lower) {
-        crawl::drain_junk_dirty(data, root, junk);
+        if let Some(junk_refresh) = junk_refresh {
+            junk_refresh.targeting_query();
+        } else {
+            let _ = crawl::drain_junk_dirty(data, root, junk);
+        }
     }
     let aggregate = journal.aggregate();
     let ctx = RankContext {
@@ -342,7 +365,9 @@ fn run_search(
     limit: usize,
 ) -> SearchResponse {
     let started = Instant::now();
-    let executed = execute_search(data, junk, root, journal, aliases, query, limit, None, None);
+    let executed = execute_search(
+        data, junk, root, journal, aliases, None, query, limit, None, None,
+    );
     SearchResponse {
         revision: executed.revision,
         reused: executed.reused,
@@ -371,6 +396,7 @@ pub async fn search_name_index(
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
+    let junk_refresh = state.junk_refresh.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::qos::set_user_initiated_qos();
         let started = Instant::now();
@@ -382,6 +408,7 @@ pub async fn search_name_index(
             &root,
             &journal,
             &aliases,
+            Some(&junk_refresh),
             &query,
             limit as usize,
             cached.as_ref(),
@@ -727,12 +754,40 @@ mod tests {
         assert!(shared.read().unwrap().junk_dirty.is_empty());
     }
 
+    #[test]
+    fn junk_refresh_defers_on_battery_and_drains_on_external_power() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        touch(&root.join("node_modules/pkg/index.js"));
+        let patterns = JunkPatterns::default();
+        let shared = new_index(root);
+        crawl::initial_crawl(&shared, root.to_path_buf(), &patterns, None);
+
+        let new_file = root.join("node_modules/pkg/from-battery.js");
+        touch(&new_file);
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &new_file, &patterns);
+        }
+
+        let junk = Arc::new(RwLock::new(Arc::new(JunkPatterns::default())));
+        let refresh = JunkRefresh::new(shared.clone(), root.to_path_buf(), junk, None);
+
+        refresh.after_fs_burst_for(crate::power::PowerSource::Battery);
+        assert_eq!(tier_of(&shared, "from-battery.js"), None);
+        assert!(!shared.read().unwrap().junk_dirty.is_empty());
+
+        refresh.after_fs_burst_for(crate::power::PowerSource::External);
+        assert_eq!(tier_of(&shared, "from-battery.js"), Some("junk"));
+        assert!(shared.read().unwrap().junk_dirty.is_empty());
+    }
+
     // FSEvents delivery is environment- and timing-dependent, so the real watcher is
     // only smoke-covered here and ignored by default. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn fsevents_watcher_smoke() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let dir = TempDir::new();
         // Canonicalize: macOS temp dirs live under the `/var` → `/private/var` symlink,
@@ -740,13 +795,23 @@ mod tests {
         let root = fs::canonicalize(dir.path()).unwrap();
         let junk = Arc::new(RwLock::new(Arc::new(JunkPatterns::default())));
         let shared = new_index(&root);
-        watcher::spawn(shared.clone(), root.clone(), junk);
+        let ready = watcher::spawn_for_test(shared.clone(), root.clone(), junk);
+        ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FSEvents watcher did not become ready");
 
-        thread::sleep(Duration::from_millis(300));
         touch(&root.join("live.txt"));
-        thread::sleep(Duration::from_millis(1500));
-
-        assert_eq!(tier_of(&shared, "live.txt"), Some("normal"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if tier_of(&shared, "live.txt") == Some("normal") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "FSEvents watcher did not index live.txt"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
@@ -825,6 +890,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            None,
             "процед",
             50,
             None,
@@ -845,6 +911,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            None,
             "процедура приемки",
             50,
             None,
@@ -856,6 +923,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            None,
             "процедура приемки",
             50,
             Some(&cache),

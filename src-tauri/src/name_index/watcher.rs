@@ -2,15 +2,16 @@
 //!
 //! Energy: this is strictly event-driven. The debounce loop blocks on `recv()` — zero
 //! CPU and zero wakeups while the tree is idle — and only after an event arrives does
-//! it briefly poll with a timeout to coalesce the burst. There is no periodic timer,
-//! satisfying the §10 rule that the hidden resident does no periodic work.
+//! it collect a fixed, short batch. The deadline is fixed rather than reset per event,
+//! so continuous filesystem traffic can never starve index updates. There is no periodic
+//! timer, satisfying the §10 rule that the hidden resident does no periodic work.
 
 use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{mpsc, Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use notify::{recommended_watcher, RecursiveMode, Watcher};
@@ -18,17 +19,44 @@ use notify::{recommended_watcher, RecursiveMode, Watcher};
 use crate::name_index::{
     crawl::{apply_fs_event, set_background_qos},
     junk::JunkPatterns,
-    model::IndexData,
+    junk_refresh::JunkRefresh,
+    model::{IndexData, Tier},
 };
 
-/// How long to keep coalescing a burst of events before applying it.
+/// Maximum time to collect one batch of filesystem events before applying it.
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Start watching the index root recursively and apply changes incrementally. The
 /// watcher and its receiver are owned by the spawned thread, which keeps them alive for
 /// the process lifetime. The Junk patterns are held behind a shared handle so a Settings
 /// change reaches the next classified burst (SPEC §6, §12).
-pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<RwLock<Arc<JunkPatterns>>>) {
+pub fn spawn(
+    shared: Arc<RwLock<IndexData>>,
+    root: PathBuf,
+    junk: Arc<RwLock<Arc<JunkPatterns>>>,
+    junk_refresh: Option<JunkRefresh>,
+) {
+    spawn_inner(shared, root, junk, junk_refresh, None);
+}
+
+#[cfg(test)]
+pub fn spawn_for_test(
+    shared: Arc<RwLock<IndexData>>,
+    root: PathBuf,
+    junk: Arc<RwLock<Arc<JunkPatterns>>>,
+) -> mpsc::Receiver<()> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    spawn_inner(shared, root, junk, None, Some(ready_tx));
+    ready_rx
+}
+
+fn spawn_inner(
+    shared: Arc<RwLock<IndexData>>,
+    root: PathBuf,
+    junk: Arc<RwLock<Arc<JunkPatterns>>>,
+    junk_refresh: Option<JunkRefresh>,
+    ready: Option<mpsc::Sender<()>>,
+) {
     thread::spawn(move || {
         set_background_qos();
 
@@ -48,6 +76,9 @@ pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<RwLock<Arc
             eprintln!("name index watch failed: {error}");
             return;
         }
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
 
         loop {
             // Blocks with zero CPU until the tree changes.
@@ -57,9 +88,15 @@ pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<RwLock<Arc
             };
 
             let mut changed: HashSet<PathBuf> = first.paths.into_iter().collect();
-            // Coalesce the rest of the burst.
+            // Coalesce for at most one fixed window. Resetting the timeout after every
+            // event would starve forever on a busy home directory, exactly when live index
+            // updates matter most.
+            let deadline = Instant::now() + DEBOUNCE;
             loop {
-                match rx.recv_timeout(DEBOUNCE) {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
                     Ok(event) => changed.extend(event.paths),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -69,9 +106,20 @@ pub fn spawn(shared: Arc<RwLock<IndexData>>, root: PathBuf, junk: Arc<RwLock<Arc
             // Snapshot the current Junk patterns once per burst so a live Settings change
             // classifies newly-seen paths without re-locking per path.
             let patterns = junk.read().expect("junk lock poisoned").clone();
+            let mut saw_junk = false;
             for path in changed {
+                if let Ok(relative) = path.strip_prefix(&root) {
+                    saw_junk |= patterns.classify(relative) == Tier::Junk;
+                }
                 let mut index = shared.write().expect("name index lock poisoned");
                 apply_fs_event(&mut index, &path, &patterns);
+            }
+            // Ordinary activity elsewhere in the home directory must not reset the Junk
+            // quiet window. Only another Junk event extends that one-shot delay.
+            if saw_junk {
+                if let Some(junk_refresh) = &junk_refresh {
+                    junk_refresh.after_fs_burst();
+                }
             }
         }
     });

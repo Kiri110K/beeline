@@ -444,21 +444,56 @@ fn diff_rescan_dir(
     }
 }
 
-/// Rescan every dirty Junk directory, then clear the dirty set. Called when a query
-/// targets Junk (SPEC §6). Each dirty directory is emptied and re-crawled fresh.
-pub fn drain_junk_dirty(shared: &Arc<RwLock<IndexData>>, root: &Path, junk: &JunkPatterns) {
+/// One completed lazy Junk refresh, used by energy telemetry.
+pub struct JunkDrainOutcome {
+    pub dirty_dirs: usize,
+    pub duration_ms: u64,
+}
+
+/// Rescan every dirty Junk directory, then clear the dirty set. A targeting query always
+/// calls this; filesystem-idle and external-power callers are gated by the energy policy.
+/// Each dirty directory is emptied and re-crawled fresh.
+pub fn drain_junk_dirty(
+    shared: &Arc<RwLock<IndexData>>,
+    root: &Path,
+    junk: &JunkPatterns,
+) -> JunkDrainOutcome {
+    let started = Instant::now();
     let dirty: Vec<(DirId, PathBuf)> = {
         let mut index = shared.write().expect("name index lock poisoned");
-        let ids: Vec<DirId> = index.junk_dirty.drain().collect();
-        ids.into_iter()
+        let ids: HashSet<DirId> = index.junk_dirty.drain().collect();
+        // FSEvents may report both a Junk directory and one of its descendants in the same
+        // burst. Refresh only the highest dirty ancestor: clearing it already replaces the
+        // descendant, whose old node id must not be recrawled as an orphan afterwards.
+        let roots: Vec<DirId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                let mut parent = index.nodes[*id as usize].parent;
+                while parent != 0 {
+                    if ids.contains(&parent) {
+                        return false;
+                    }
+                    parent = index.nodes[parent as usize].parent;
+                }
+                true
+            })
+            .collect();
+        roots
+            .into_iter()
             .map(|id| (id, index.full_path(id)))
             .collect()
     };
+    let dirty_dirs = dirty.len();
     for (id, path) in dirty {
         {
             let mut index = shared.write().expect("name index lock poisoned");
             index.clear_children(id);
         }
         crawl_walk(shared, id, path, root, junk, None, false);
+    }
+    JunkDrainOutcome {
+        dirty_dirs,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
 }

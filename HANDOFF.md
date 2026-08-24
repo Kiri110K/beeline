@@ -17,6 +17,48 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 комментарий-вердикт. Открытый с assignee = был в работе; смотри его
 комментарии и `git log` — что уже закоммичено.
 
+## Состояние после battery/GUI-прохода #31 24.08
+
+- #31 остаётся открытым. Локально реализована событийная battery policy через
+  IOKit power-source notification, без polling: на батарее дорогой refresh
+  Junk откладывается, после возврата внешнего питания очередь автоматически
+  дренируется. Физический unplug/replug дал `source=battery`,
+  `junk_rescan_deferred dirty_dirs=32`, затем `source=external junk_dirty=57`
+  и `junk_rescan_finished reason=external_power dirty_dirs=23 duration_ms=18334`.
+- Починен потерянный фокус после глобального шортката: пока окно показано,
+  приложение временно переходит Accessory → Regular, на macOS 14 вызывается
+  `NSApplication.activate()`, факт фокуса учитывает active app и key window.
+  Физический прогон: Beeline стал frontmost, фокус установился с первой
+  попытки примерно за 198 мс; после скрытия Dock icon исчезает.
+- Большой каталог больше не блокирует первый кадр метаданными всех файлов:
+  backend сортирует имена и сначала возвращает 64 записи, полные метаданные
+  догружаются в фоне. Финальный release GUI-прогон на 50 000 файлов:
+  initial 104 мс, первый кадр 123 мс (бюджет 150), полный список 853 мс в
+  фоне. После 450 ArrowDown видны непрерывные строки 435–450 без пустот и
+  tearing.
+- Quick Look получает от frontend только текущий path, а AppKit-вызов уходит
+  через отдельный FIFO dispatcher. Финальный прогон: возврат команды 6 мс
+  (бюджет 50), нативное появление 66 мс. Process-local key monitor вернул
+  навигацию при открытом QL: два ArrowDown дали два `quick_look_updated`, на
+  снимках заголовок сменился `file_00450.txt` → `file_00452.txt`, Space закрыл
+  панель. Артефакты: `/tmp/beeline-gui-monitor-pass.QmiPXO`.
+- Автопроверки: 73 Rust-теста прошли, 5 тяжёлых/системных ignored; реальный
+  ignored FSEvents smoke после явного сигнала готовности watcher прошёл три
+  раза подряд (0.38–0.43 с). `pnpm typecheck`, `pnpm lint`, `cargo fmt
+  --check`, `cargo clippy --all-targets -- -D warnings` и `git diff --check`
+  зелёные.
+- Подписанная release-сборка с GUI-фиксами установлена в
+  `/Applications/Beeline.app`, PID финального прогона 50434. Предыдущая
+  установочная копия: `/tmp/beeline-ql-monitor-prev.16bQcs/Beeline.app`.
+  Idle у прежней release-сборки: средний CPU 0.043%, максимум 0.2%, +0.06 CPU
+  seconds за 61 с. RSS около 61–72 MiB, но реальный footprint 525 MiB и peak
+  813 MiB из-за compressed/swapped индекса на 5M записей — этот memory gap не
+  скрывать.
+- До закрытия #31 ещё нужны как минимум post-reboot launch, отдельный живой
+  проход Spaces/fullscreen, сквозной keystroke ≤8 мс, пятиминутная excursion
+  и оставшиеся строки приёмки из SPEC §16. Не закрывать тикет только по этому
+  проходу.
+
 ## Состояние после оптимизации поиска 24.08
 
 - #31 заклеймлен. На чистом живом v2-индексе (5 040 894 записей) повторяемый
