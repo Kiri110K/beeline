@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.app.json && tsc -p tsconfig.node.json",
     "lint": "eslint .",
+    "test": "pnpm test:contract",
+    "test:contract": "node scripts/settings-contract.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {

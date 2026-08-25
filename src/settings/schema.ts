@@ -80,6 +80,12 @@ export const settingsSchema = z
     editorBundleId: z.string().nullable(),
     aliases: z.array(aliasEntrySchema),
     junkPatterns: z.array(z.string()),
+    // The seed version behind `junkPatterns` (SPEC §12). Internal persistence, like
+    // `firstRunDismissed`: never rendered in the Settings UI, but parsed and carried so it
+    // round-trips back through `set_settings` unchanged. If the frontend dropped it, the
+    // backend would re-read a stale/zero version and re-run the Junk-seed migration, undoing
+    // a user's deletion of a built-in Junk pattern.
+    junkSeedVersion: z.number().int().nonnegative(),
     firstRunDismissed: z.boolean(),
   })
   .strict();
@@ -98,7 +104,18 @@ export const DEFAULT_JUNK_PATTERNS: readonly string[] = [
   "Caches",
   ".claude",
   ".codex",
+  // Junk seed v2 (mirrors `junk::V2_SEED_NAMES`): macOS app-data directories.
+  "Containers",
+  "Group Containers",
+  "Application Support",
+  "Logs",
+  "Saved Application State",
 ];
+
+// The current Junk seed version, mirroring `CURRENT_JUNK_SEED_VERSION` in `settings.rs` (the
+// two languages cannot share the constant). Bumped in lockstep with `DEFAULT_JUNK_PATTERNS`
+// whenever new built-in Junk names ship, so the fallback defaults below carry the right stamp.
+export const CURRENT_JUNK_SEED_VERSION = 2;
 
 // The pre-load fallback (SPEC §12 defaults). The real values arrive from `get_settings`
 // immediately on startup; this only bridges the first render.
@@ -114,6 +131,7 @@ export const DEFAULT_SETTINGS: Settings = {
   editorBundleId: null,
   aliases: [],
   junkPatterns: [...DEFAULT_JUNK_PATTERNS],
+  junkSeedVersion: CURRENT_JUNK_SEED_VERSION,
   // Assume dismissed until `get_settings` says otherwise, so the first-run banner never
   // flashes (and never fires `first_run_shown`) for a returning user before the load lands.
   // A genuine first run reports `firstRunDismissed: false` and the banner then appears (§13).
