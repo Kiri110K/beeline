@@ -28,7 +28,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-use listing::{list_location, list_location_initial};
+use listing::{list_location, list_location_initial, validate_directory};
 use name_index::{record_visit, search_name_index, NameIndex};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
@@ -626,7 +626,8 @@ pub fn run() {
             search_name_index,
             set_settings,
             telemetry_event,
-            trash_items
+            trash_items,
+            validate_directory
         ])
         .setup(move |app| {
             // Replace tauri's default macOS menu with a minimal one. The default File >

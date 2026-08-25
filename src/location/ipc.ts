@@ -43,6 +43,17 @@ export function listLocation(
   ).mapErr(classifyListError);
 }
 
+// Validate a Default Entry Point candidate (SPEC §4, §12): a cheap metadata-only check that
+// resolves to the accepted path or the same tagged domain error as a listing, so Settings can
+// gate the Folder choice without ever persisting an empty, missing, or file path.
+export function validateDirectory(
+  path: string,
+): ResultAsync<string, ListErrorPayload> {
+  return fromTauri("validate_directory", z.string(), () =>
+    invoke("validate_directory", { path }),
+  ).mapErr(classifyListError);
+}
+
 export function homeDirectory(): ResultAsync<string, ShellError> {
   return fromTauri("home_directory", homeDirectorySchema, () =>
     invoke("home_directory"),

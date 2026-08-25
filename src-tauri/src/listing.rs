@@ -128,6 +128,18 @@ fn sorted_entries(path: &str) -> Result<Vec<SortableEntry>, ListError> {
     Ok(entries)
 }
 
+// Validate a proposed Location for the Default Entry Point (SPEC §4, §12) using a single
+// metadata call — no directory enumeration or sort. An empty, missing, or file path is
+// rejected with the same tagged cause as a listing, so the UI can never persist a
+// non-directory entry point. On success the accepted path is echoed back.
+fn validate_directory_path(path: &str) -> Result<String, ListError> {
+    let metadata = fs::metadata(path).map_err(|error| map_io_error(&error))?;
+    if !metadata.is_dir() {
+        return Err(ListError::NotADirectory);
+    }
+    Ok(path.to_owned())
+}
+
 fn read_location(path: &str) -> Result<ListLocation, ListError> {
     let items = sorted_entries(path)?
         .into_iter()
@@ -220,6 +232,15 @@ pub async fn list_location(
     listing
 }
 
+// Validate a Default Entry Point candidate off the IPC thread (SPEC §4, §12). Cheap: a
+// single metadata call, no listing, so it can gate a Settings keystroke without cost.
+#[tauri::command]
+pub async fn validate_directory(path: String) -> Result<String, ListError> {
+    tauri::async_runtime::spawn_blocking(move || validate_directory_path(&path))
+        .await
+        .map_err(|_| ListError::Io)?
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,5 +290,32 @@ mod tests {
             initial.items.last().map(|item| item.name.as_str()),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn validate_directory_accepts_a_directory() {
+        let dir = TestDir::new();
+        let path = dir.0.to_str().expect("utf-8 test path");
+        let accepted = validate_directory_path(path).expect("directory accepted");
+        assert_eq!(accepted, path);
+    }
+
+    #[test]
+    fn validate_directory_rejects_a_regular_file() {
+        let dir = TestDir::new();
+        let file = dir.0.join("entry.txt");
+        fs::write(&file, b"x").expect("write file fixture");
+        let error = validate_directory_path(file.to_str().expect("utf-8 test path"))
+            .expect_err("regular file rejected");
+        assert!(matches!(error, ListError::NotADirectory));
+    }
+
+    #[test]
+    fn validate_directory_rejects_a_missing_path() {
+        let dir = TestDir::new();
+        let missing = dir.0.join("does-not-exist");
+        let error = validate_directory_path(missing.to_str().expect("utf-8 test path"))
+            .expect_err("missing path rejected");
+        assert!(matches!(error, ListError::NotFound));
     }
 }

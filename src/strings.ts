@@ -121,6 +121,15 @@ export const strings = {
       recents: "Recents",
       directory: "Folder",
       pathPlaceholder: "/Users/…",
+      // Short inline reasons a typed Folder path was rejected (SPEC §4): a domain sentence per
+      // ListError code, never raw backend text.
+      errors: {
+        empty: "Enter a folder path",
+        notFound: "That folder does not exist",
+        notADirectory: "That path is a file, not a folder",
+        permissionDenied: "No access to that folder",
+        io: "That folder could not be opened",
+      },
     },
     lifetime: {
       label: "Temporary tab lifetime",

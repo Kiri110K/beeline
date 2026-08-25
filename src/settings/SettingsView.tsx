@@ -1,13 +1,17 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement,
   type ReactNode,
 } from "react";
 import { type ResultAsync } from "neverthrow";
+import { match } from "ts-pattern";
 
+import { validateDirectory } from "../location/ipc";
+import { type ListErrorPayload } from "../location/schema";
 import {
   AFTER_ACTION_IDS,
   type AfterActionId,
@@ -48,6 +52,28 @@ function bundleLabel(id: string): string {
 
 const s = strings.settings;
 
+// Why a typed Folder entry point was rejected (SPEC §4): either an empty field or one of the
+// backend's tagged ListError causes. Kept as a value so the view stays a pure render of state.
+type FolderError = { code: "empty" } | ListErrorPayload;
+
+// The Folder-path editing status: idle (nothing to report), a validation in flight, or an
+// inline rejection. A directory is only ever persisted from the idle-after-success path, so an
+// empty or invalid path can never reach the store.
+type FolderStatus =
+  | { kind: "idle" }
+  | { kind: "validating" }
+  | { kind: "invalid"; error: FolderError };
+
+function entryErrorLabel(error: FolderError): string {
+  return match(error)
+    .with({ code: "empty" }, () => s.entryPoint.errors.empty)
+    .with({ code: "not-found" }, () => s.entryPoint.errors.notFound)
+    .with({ code: "not-a-directory" }, () => s.entryPoint.errors.notADirectory)
+    .with({ code: "permission-denied" }, () => s.entryPoint.errors.permissionDenied)
+    .with({ code: "io" }, () => s.entryPoint.errors.io)
+    .exhaustive();
+}
+
 // The in-app Settings view (SPEC §12): a single-page form over the complete v1 inventory,
 // keyboard-first (native inputs, natural tab order, Escape to close — handled by the Tabs
 // controller) and mouse-complete. Edits are held in a local draft and persisted through the
@@ -66,6 +92,30 @@ export function SettingsView({
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   // Which known apps are installed, for the slot pickers (SPEC §8 detection).
   const [installed, setInstalled] = useState<ReadonlySet<string>>(new Set());
+
+  // The Default Entry Point (SPEC §4) is held as a draft: the radio selection and the typed
+  // Folder path are local until a path validates, so an unchecked directory never lands in the
+  // store. `folderPath` outlives a hop to Recents and back, so the last Folder path is not lost
+  // during a Settings session.
+  const [entrySelection, setEntrySelection] = useState<"recents" | "directory">(
+    settings.defaultEntryPoint.kind,
+  );
+  const [folderPath, setFolderPath] = useState<string>(
+    settings.defaultEntryPoint.kind === "directory"
+      ? settings.defaultEntryPoint.path
+      : "",
+  );
+  const [folderStatus, setFolderStatus] = useState<FolderStatus>({ kind: "idle" });
+  // Every edit or selection change invalidates an older async metadata check. A stale result
+  // must never persist the path the user has already replaced (SPEC §10).
+  const folderValidationSequence = useRef(0);
+
+  // The latest draft, read by the async validator so a concurrent field edit is not clobbered
+  // when a validated Folder path lands (mirrors the store's `settingsRef`).
+  const draftRef = useRef(draft);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   useEffect(() => {
     const candidates = [...TERMINAL_BUNDLE_IDS, ...EDITOR_BUNDLE_IDS];
@@ -109,6 +159,90 @@ export function SettingsView({
     [save, settings.globalShortcut],
   );
 
+  // Validate a proposed Folder path and, only on success, persist it as the Default Entry
+  // Point (SPEC §4). An empty or rejected path stays editable with an inline domain reason and
+  // is never persisted. `closeOnSuccess` lets the Done button gate closing on a valid path.
+  const validateAndPersist = useCallback(
+    (path: string, closeOnSuccess: boolean): void => {
+      const sequence = folderValidationSequence.current + 1;
+      folderValidationSequence.current = sequence;
+      if (path.trim() === "") {
+        setFolderStatus({ kind: "invalid", error: { code: "empty" } });
+        return;
+      }
+      setFolderStatus({ kind: "validating" });
+      void validateDirectory(path).match(
+        (accepted) => {
+          if (sequence !== folderValidationSequence.current) {
+            return;
+          }
+          setFolderPath(accepted);
+          setFolderStatus({ kind: "idle" });
+          commit({
+            ...draftRef.current,
+            defaultEntryPoint: { kind: "directory", path: accepted },
+          });
+          if (closeOnSuccess) {
+            onClose();
+          }
+        },
+        (error) => {
+          if (sequence !== folderValidationSequence.current) {
+            return;
+          }
+          setFolderStatus({ kind: "invalid", error });
+        },
+      );
+    },
+    [commit, onClose],
+  );
+
+  // Switch to Recents: persist it at once, but keep the typed Folder path so returning to
+  // Folder in the same session does not start blank (SPEC §4).
+  const selectRecents = (): void => {
+    folderValidationSequence.current += 1;
+    setEntrySelection("recents");
+    setFolderStatus({ kind: "idle" });
+    commit({ ...draftRef.current, defaultEntryPoint: { kind: "recents" } });
+  };
+
+  // Switch to Folder: validate and persist the remembered path immediately, so a previously
+  // valid Folder path takes effect on the click (SPEC §4).
+  const selectFolder = (): void => {
+    setEntrySelection("directory");
+    validateAndPersist(folderPath, false);
+  };
+
+  // Commit the typed path on blur/Enter. An empty field is left idle (no error, nothing
+  // persisted); a non-empty field is validated.
+  const commitFolderPath = (): void => {
+    if (folderPath.trim() === "") {
+      setFolderStatus({ kind: "idle" });
+      return;
+    }
+    validateAndPersist(folderPath, false);
+  };
+
+  // Whether a Folder selection is chosen but not yet persisted as the current entry point —
+  // the case Done must resolve rather than silently discard (SPEC §4).
+  const folderPersisted =
+    draft.defaultEntryPoint.kind === "directory" &&
+    draft.defaultEntryPoint.path === folderPath &&
+    folderPath.trim() !== "";
+  const folderPending =
+    entrySelection === "directory" &&
+    !(folderPersisted && folderStatus.kind === "idle");
+
+  // Done closes only when the entry point is settled; a pending Folder path is validated first
+  // and closing waits for it to succeed, so an invalid choice surfaces instead of being lost.
+  const handleDone = (): void => {
+    if (folderPending) {
+      validateAndPersist(folderPath, true);
+      return;
+    }
+    onClose();
+  };
+
   const captureShortcut = useCallback(
     (event: ReactKeyboardEvent): void => {
       event.preventDefault();
@@ -150,7 +284,7 @@ export function SettingsView({
         <h1 className="text-sm font-semibold">{s.title}</h1>
         <button
           type="button"
-          onClick={onClose}
+          onClick={handleDone}
           className="rounded bg-blue-600 px-3 py-1 text-white hover:bg-blue-500"
         >
           {s.done}
@@ -190,10 +324,8 @@ export function SettingsView({
                 <input
                   type="radio"
                   name="entryPoint"
-                  checked={draft.defaultEntryPoint.kind === "recents"}
-                  onChange={() => {
-                    commit({ ...draft, defaultEntryPoint: { kind: "recents" } });
-                  }}
+                  checked={entrySelection === "recents"}
+                  onChange={selectRecents}
                 />
                 {s.entryPoint.recents}
               </label>
@@ -201,43 +333,35 @@ export function SettingsView({
                 <input
                   type="radio"
                   name="entryPoint"
-                  checked={draft.defaultEntryPoint.kind === "directory"}
-                  onChange={() => {
-                    const path =
-                      draft.defaultEntryPoint.kind === "directory"
-                        ? draft.defaultEntryPoint.path
-                        : "";
-                    setDraft({
-                      ...draft,
-                      defaultEntryPoint: { kind: "directory", path },
-                    });
-                  }}
+                  checked={entrySelection === "directory"}
+                  onChange={selectFolder}
                 />
                 {s.entryPoint.directory}
                 <input
                   type="text"
-                  disabled={draft.defaultEntryPoint.kind !== "directory"}
-                  value={
-                    draft.defaultEntryPoint.kind === "directory"
-                      ? draft.defaultEntryPoint.path
-                      : ""
-                  }
+                  disabled={entrySelection !== "directory"}
+                  value={folderPath}
                   placeholder={s.entryPoint.pathPlaceholder}
                   onChange={(event) => {
-                    setDraft({
-                      ...draft,
-                      defaultEntryPoint: {
-                        kind: "directory",
-                        path: event.target.value,
-                      },
-                    });
+                    folderValidationSequence.current += 1;
+                    setFolderPath(event.target.value);
+                    setFolderStatus({ kind: "idle" });
                   }}
-                  onBlur={() => {
-                    commit(draft);
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitFolderPath();
+                    }
                   }}
+                  onBlur={commitFolderPath}
                   className="flex-1 rounded border border-neutral-600 bg-neutral-800 px-2 py-1 disabled:opacity-40"
                 />
               </label>
+              {folderStatus.kind === "invalid" ? (
+                <span className="text-[12px] text-amber-400">
+                  {entryErrorLabel(folderStatus.error)}
+                </span>
+              ) : null}
             </div>
           </Field>
 
