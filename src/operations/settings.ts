@@ -14,3 +14,30 @@ export const EDITOR_BUNDLE_IDS = [
 ] as const;
 
 export type Slot = "terminal" | "editor";
+
+// The two auto-seeded slots as one value, so the seed decision below is a pure function of the
+// current settings and the freshly detected candidates.
+export interface SlotBundleIds {
+  terminalBundleId: string | null;
+  editorBundleId: string | null;
+}
+
+// The combined slot update for first-run auto-seeding (SPEC §8, §12), or `null` when nothing
+// changes. Rules: fill an empty slot with its detected candidate, never overwrite a slot the
+// user (or another write in flight) already filled, and leave an empty slot empty when no
+// candidate is installed. `current` is read at save time, so a slot filled during detection is
+// preserved; `resolved` carries what the priority lists detected for the then-empty slots.
+export function seededSlotUpdate(
+  current: SlotBundleIds,
+  resolved: SlotBundleIds,
+): SlotBundleIds | null {
+  const terminalBundleId = current.terminalBundleId ?? resolved.terminalBundleId;
+  const editorBundleId = current.editorBundleId ?? resolved.editorBundleId;
+  if (
+    terminalBundleId === current.terminalBundleId &&
+    editorBundleId === current.editorBundleId
+  ) {
+    return null;
+  }
+  return { terminalBundleId, editorBundleId };
+}

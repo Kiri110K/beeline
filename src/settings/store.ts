@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type ResultAsync } from "neverthrow";
 
+import { resolveInstalledBundle } from "../operations/ipc";
+import {
+  EDITOR_BUNDLE_IDS,
+  seededSlotUpdate,
+  TERMINAL_BUNDLE_IDS,
+} from "../operations/settings";
 import { recordTelemetry, reportShellError, type ShellError } from "../shell";
 import {
   getSettings,
@@ -29,26 +35,6 @@ export function useSettingsStore(): SettingsStore {
     settingsRef.current = settings;
   }, [settings]);
 
-  const pull = useCallback((): void => {
-    void getSettings().match((loaded) => {
-      settingsRef.current = loaded;
-      setSettingsState(loaded);
-    }, reportShellError);
-  }, []);
-
-  useEffect(() => {
-    pull();
-    let unlisten: (() => void) | null = null;
-    void subscribeSettingsChanged(pull).match((fn) => {
-      unlisten = fn;
-    }, reportShellError);
-    return () => {
-      if (unlisten !== null) {
-        unlisten();
-      }
-    };
-  }, [pull]);
-
   const save = useCallback(
     (next: Settings): ResultAsync<SetSettingsOutcome, ShellError> => {
       // No optimistic write: the draft reaches live consumers only through the
@@ -70,6 +56,79 @@ export function useSettingsStore(): SettingsStore {
     },
     [],
   );
+
+  // First-run auto-seeding of the Terminal/Editor slots (SPEC §8, §12), run exactly once after
+  // the first settings load lands. Detect a candidate for each empty slot from its priority
+  // list, resolve both before persisting, then write at most one combined update — and only for
+  // slots still empty at save time, so a slot the user (or another write) filled during
+  // detection is never overwritten. The `seededRef` guard means the `settings-changed` re-pull
+  // this save triggers never re-seeds, so there is no effect loop.
+  const seededRef = useRef(false);
+  const seedApplicationSlots = useCallback(
+    (loaded: Settings): void => {
+      if (loaded.terminalBundleId !== null && loaded.editorBundleId !== null) {
+        return; // both slots already configured — nothing to detect
+      }
+      const detect = (
+        empty: boolean,
+        ids: readonly string[],
+      ): Promise<string | null> =>
+        empty
+          ? resolveInstalledBundle([...ids]).match(
+              (value) => value,
+              (error) => {
+                reportShellError(error);
+                return null;
+              },
+            )
+          : Promise.resolve<string | null>(null);
+      void Promise.all([
+        detect(loaded.terminalBundleId === null, TERMINAL_BUNDLE_IDS),
+        detect(loaded.editorBundleId === null, EDITOR_BUNDLE_IDS),
+      ]).then(([terminal, editor]) => {
+        // Read the freshest settings, not `loaded`: a user or another write may have filled a
+        // slot while detection was in flight, and `seededSlotUpdate` must preserve it.
+        const base = settingsRef.current;
+        const update = seededSlotUpdate(
+          {
+            terminalBundleId: base.terminalBundleId,
+            editorBundleId: base.editorBundleId,
+          },
+          { terminalBundleId: terminal, editorBundleId: editor },
+        );
+        if (update === null) {
+          return; // no candidate installed for any empty slot
+        }
+        const next: Settings = { ...base, ...update };
+        void save(next).match(() => undefined, reportShellError);
+      }, reportShellError);
+    },
+    [save],
+  );
+
+  const pull = useCallback((): void => {
+    void getSettings().match((loaded) => {
+      settingsRef.current = loaded;
+      setSettingsState(loaded);
+      if (!seededRef.current) {
+        seededRef.current = true;
+        seedApplicationSlots(loaded);
+      }
+    }, reportShellError);
+  }, [seedApplicationSlots]);
+
+  useEffect(() => {
+    pull();
+    let unlisten: (() => void) | null = null;
+    void subscribeSettingsChanged(pull).match((fn) => {
+      unlisten = fn;
+    }, reportShellError);
+    return () => {
+      if (unlisten !== null) {
+        unlisten();
+      }
+    };
+  }, [pull]);
 
   return { settings, save };
 }

@@ -1613,16 +1613,27 @@ export function useTabs(
     afterAction("new_folder");
   }, [navigate, afterAction]);
 
-  // Resolve a Terminal/Editor slot (§8): the persisted bundle id if seeded, otherwise the
-  // first installed app in the priority list — persisted on first resolve. null means none
-  // is installed, so the caller routes to a Status Strip problem (Settings UI is #30).
+  // Resolve a Terminal/Editor slot (§8): the configured bundle id when its app is still
+  // installed, otherwise the first installed app in the priority list — persisted on first
+  // resolve. `null` means none is installed, so the caller keeps the action visible and routes
+  // to Settings (§8: a configured-but-missing app never silently swaps to another).
   const resolveSlot = useCallback(
     async (slot: Slot): Promise<string | null> => {
       const current = settingsRef.current;
       const existing =
         slot === "terminal" ? current.terminalBundleId : current.editorBundleId;
       if (existing !== null) {
-        return existing;
+        // Verify the recorded app is still installed (SPEC §8). A single-id probe returns the
+        // id when installed, else `null`; a probe failure is treated as not installed so the
+        // action routes to Settings rather than dispatching to a missing app. The configured id
+        // is left untouched so Settings can still show it as "not installed".
+        return resolveInstalledBundle([existing]).match(
+          (value) => (value === existing ? existing : null),
+          (error) => {
+            reportShellError(error);
+            return null;
+          },
+        );
       }
       const ids = slot === "terminal" ? TERMINAL_BUNDLE_IDS : EDITOR_BUNDLE_IDS;
       const resolved = await resolveInstalledBundle([...ids]).match(
