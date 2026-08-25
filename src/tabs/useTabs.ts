@@ -715,6 +715,11 @@ export function useTabs(
             directoryLocation(action.path),
             "enter",
           );
+          // The user's primary Enter Location action on a directory (double-click, Enter/Right,
+          // or the Action Menu's Open) — the one call site for user directory entry (§12
+          // Enter Directory). Background hydration, Tab creation, lifecycle reset, and Open in
+          // New Tab drive `navigate` directly, so they never reach this After Action.
+          afterAction("enter_directory");
           break;
         case "open":
           openFile(action.path);
@@ -724,7 +729,7 @@ export function useTabs(
           break;
       }
     },
-    [navigate, openFile, openItemMenu],
+    [navigate, openFile, openItemMenu, afterAction],
   );
 
   const select = useCallback((index: number, mode: SelectMode): void => {
@@ -1033,16 +1038,20 @@ export function useTabs(
     const entry = active?.browse.history[active.browse.history.length - 1];
     if (active !== undefined && entry !== undefined) {
       navigate(active.id, entry.location, "back");
+      // User-initiated Back is Navigation (§12).
+      afterAction("navigation");
     }
-  }, [navigate]);
+  }, [navigate, afterAction]);
 
   const goForward = useCallback((): void => {
     const active = tabById(stateRef.current, stateRef.current.activeId);
     const entry = active?.browse.future[active.browse.future.length - 1];
     if (active !== undefined && entry !== undefined) {
       navigate(active.id, entry.location, "forward");
+      // User-initiated Forward is Navigation (§12).
+      afterAction("navigation");
     }
-  }, [navigate]);
+  }, [navigate, afterAction]);
 
   const activateTab = useCallback((id: TabId): void => {
     const current = stateRef.current;
@@ -1152,8 +1161,12 @@ export function useTabs(
         openOrReuseTemporary(target, focusPath, originId);
       }
       fireTelemetry("reveal_performed", { kind: isDir ? "directory" : "file" });
+      // A Search Result Reveal is Navigation (§12). It fires once here regardless of which
+      // routing branch above ran (activate a Pinned Tab, reuse the Temporary origin, or open a
+      // Temporary Tab) — none of those helpers apply an After Action themselves.
+      afterAction("navigation");
     },
-    [activateTab, navigate, openOrReuseTemporary, clearSlowTimer],
+    [activateTab, navigate, openOrReuseTemporary, clearSlowTimer, afterAction],
   );
 
   const revealResultAt = useCallback(
@@ -1190,12 +1203,16 @@ export function useTabs(
       if (id === current.activeId) {
         if (tab.kind === "pinned" && isOnExcursion(tab)) {
           navigate(id, directoryLocation(tab.anchorPath), "reset");
+          // The user clicking an active Pinned Tab to return it from its Excursion to its
+          // Anchor is Navigation (§12). The automatic background reset shares the "reset"
+          // NavKind but drives `navigate` directly, so it never fires this After Action.
+          afterAction("navigation");
         }
         return;
       }
       activateTab(id);
     },
-    [activateTab, navigate],
+    [activateTab, navigate, afterAction],
   );
 
   const newTemporaryTab = useCallback((): void => {
@@ -1546,6 +1563,9 @@ export function useTabs(
           if (location !== undefined) {
             navigate(activeId, location, "replace", newPath);
           }
+          // Rename fires its After Action only on a successful renameItem (§12): the collision
+          // and other-failure branches below deliberately never reach it.
+          afterAction("rename");
         },
         (error) => {
           if (error.code === "name-collision") {
@@ -1561,7 +1581,7 @@ export function useTabs(
         },
       );
     },
-    [navigate],
+    [navigate, afterAction],
   );
 
   // New Folder (§8): create in the current Location, then enter inline rename on the new
