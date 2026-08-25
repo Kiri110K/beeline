@@ -17,6 +17,43 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 комментарий-вердикт. Открытый с assignee = был в работе; смотри его
 комментарии и `git log` — что уже закоммичено.
 
+## Состояние после доведения Settings #30 25.08
+
+- Settings #30 полностью доработан локально пятью коммитами `490c48f..cd6a1c5`.
+  Frontend снова принимает и сохраняет backend-поле `junkSeedVersion`, а
+  удалённые пользователем мигрированные Junk patterns не появляются повторно.
+- Default Entry Point теперь проверяет путь в backend. Обычный файл и
+  отсутствующий путь дают inline-ошибку, не сохраняются и не закрывают
+  Settings; корректная папка сохраняется, выбор Recents можно восстановить.
+- Настройки применяются только после подтверждённого backend-сохранения.
+  Отказ при смене global shortcut больше не выглядит успешным; first-run текст
+  честно отправляет за FDA в System Settings, а за автозапуском — в Login Items.
+- Подключены все 15 After Action policies. Пустые Terminal/Editor slots
+  автоматически заполняются установленными известными приложениями; сохранённый
+  bundle ID отсутствующего приложения остаётся на месте и показывается как
+  `not installed`.
+- Дешёвые проверки зелёные: `pnpm test`, `pnpm typecheck`, `pnpm lint`,
+  `pnpm build`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`. Rust: 76 passed, 5 ignored, 0 failed.
+- После 386 секунд HID inactivity независимый GUI-прогон установленной
+  `/Applications/Beeline.app` 0.1.0 дал PASS. Проверены нормальная загрузка
+  Settings, Preview, Ghostty/Zed slots, ошибка для файла в Default Entry Point,
+  сохранение временной папки, Navigation → Hide window и сохранение удаления
+  Junk pattern. Все значения восстановлены, Beeline снова остановлен.
+  Артефакты: `/private/tmp/codex-computer-use.beeline30.eahs14`.
+- Shortcut-conflict и чистый first-run профиль живьём не трогали: первый мог
+  перехватить ввод Кирилла, второй — затронуть системные настройки. Их логика
+  проверена contract/unit tests; это явно отмечено в комментарии #30.
+- Свежая release-сборка установлена в `/Applications/Beeline.app`. Предыдущая
+  копия сохранена в
+  `/private/tmp/beeline-issue30-backup.O56y1D/Beeline.app`.
+- Обрезанный Action Menu у нижней строки вынесен в redesign backlog #39 без
+  исходного скриншота: на нём были рабочие имена файлов и превью документа.
+- #30 обновлён итоговым комментарием, но оставлен открытым: пять коммитов пока
+  только локальные. `main` опережает `origin/main` на пять коммитов; push без
+  отдельного согласия Кирилла не делать. Пользовательская `.claude/` остаётся
+  нетронутой и untracked.
+
 ## Состояние после battery/GUI-прохода #31 24.08
 
 - #31 остаётся открытым. Локально реализована событийная battery policy через
