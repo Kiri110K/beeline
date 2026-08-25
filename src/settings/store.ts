@@ -8,44 +8,18 @@ import {
   subscribeSettingsChanged,
   type SetSettingsOutcome,
 } from "./ipc";
+import { changedTrackedFields } from "./saveTelemetry";
 import { DEFAULT_SETTINGS, type Settings } from "./schema";
 
 // The one settings store the app reads (SPEC §12): the live settings plus a `save` that
-// persists them, records `settings_changed {field}` telemetry, and lets the backend apply
-// the live consumers. Loaded once on mount and re-pulled on `beeline://settings-changed`
-// (which the backend emits on every write), so a change from the Settings view or the
-// first-run flow reaches every consumer.
+// persists them and records `settings_changed {field}` telemetry. The store never applies a
+// draft optimistically — the live settings only ever move forward to what the backend
+// confirms. It is loaded once on mount and re-pulled on `beeline://settings-changed` (which
+// the backend emits on every successful write), so a confirmed change from the Settings view
+// or the first-run flow reaches every consumer, and a failed write leaves them untouched.
 export interface SettingsStore {
   settings: Settings;
   save: (next: Settings) => ResultAsync<SetSettingsOutcome, ShellError>;
-}
-
-// The user-facing fields whose change is worth a `settings_changed {field}` event (no
-// values, SPEC telemetry point). `firstRunDismissed` is internal (§13) and excluded — its
-// own `first_run_dismissed` event covers it.
-const TRACKED_FIELDS = [
-  "globalShortcut",
-  "defaultEntryPoint",
-  "temporaryTabLifetime",
-  "primaryActionDirectory",
-  "primaryActionFile",
-  "afterAction",
-  "previewPanelVisible",
-  "terminalBundleId",
-  "editorBundleId",
-  "aliases",
-  "junkPatterns",
-] as const;
-
-function fireChangedTelemetry(prev: Settings, next: Settings): void {
-  for (const field of TRACKED_FIELDS) {
-    if (JSON.stringify(prev[field]) !== JSON.stringify(next[field])) {
-      void recordTelemetry("settings_changed", { field }).match(
-        () => undefined,
-        reportShellError,
-      );
-    }
-  }
 }
 
 export function useSettingsStore(): SettingsStore {
@@ -77,12 +51,22 @@ export function useSettingsStore(): SettingsStore {
 
   const save = useCallback(
     (next: Settings): ResultAsync<SetSettingsOutcome, ShellError> => {
-      fireChangedTelemetry(settingsRef.current, next);
-      // Reflect immediately; the settings-changed re-pull reconciles anything the backend
-      // adjusted (e.g. a rejected shortcut rolled back to the previous one).
-      settingsRef.current = next;
-      setSettingsState(next);
-      return setSettings(next);
+      // No optimistic write: the draft reaches live consumers only through the
+      // `settings-changed` re-pull the backend emits on success, so a failed write leaves
+      // every consumer on the last confirmed settings and an older failure can never roll
+      // back a newer success — the store only advances to what `get_settings` returns.
+      const prev = settingsRef.current;
+      return setSettings(next).map((outcome) => {
+        // Telemetry fires only for a landed change, and never for a shortcut the backend
+        // rejected and rolled back to the previous one (SPEC §2).
+        for (const field of changedTrackedFields(prev, next, outcome)) {
+          void recordTelemetry("settings_changed", { field }).match(
+            () => undefined,
+            reportShellError,
+          );
+        }
+        return outcome;
+      });
     },
     [],
   );

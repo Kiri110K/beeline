@@ -198,7 +198,7 @@ export const strings = {
   },
   firstRun: {
     title: "Welcome to Beeline",
-    body: "Beeline works best with Full Disk Access and starting at login. Both are optional — you can change them later in Settings.",
+    body: "Beeline works best with Full Disk Access and starting at login, though both are optional. Full Disk Access is managed in macOS System Settings, and you can change the startup item later in macOS Login Items.",
     fullDiskAccess: "Grant Full Disk Access",
     loginItem: "Start at login",
     dismiss: "Dismiss",
