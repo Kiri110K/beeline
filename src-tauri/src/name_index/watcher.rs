@@ -26,27 +26,25 @@ use crate::name_index::{
 /// Maximum time to collect one batch of filesystem events before applying it.
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Start watching the index root recursively and apply changes incrementally. The
-/// watcher and its receiver are owned by the spawned thread, which keeps them alive for
-/// the process lifetime. The Junk patterns are held behind a shared handle so a Settings
-/// change reaches the next classified burst (SPEC §6, §12).
-pub fn spawn(
+/// Register the recursive watcher immediately, but defer applying its queued events until
+/// startup has produced the mapped base. This closes the crawl/watch race without letting a
+/// large event subtree compete with the initial crawl for the index write lock.
+pub fn spawn_deferred(
     shared: Arc<RwLock<IndexData>>,
     root: PathBuf,
     junk: Arc<RwLock<Arc<JunkPatterns>>>,
     junk_refresh: Option<JunkRefresh>,
-) {
-    spawn_inner(shared, root, junk, junk_refresh, None);
-}
-
-#[cfg(test)]
-pub fn spawn_for_test(
-    shared: Arc<RwLock<IndexData>>,
-    root: PathBuf,
-    junk: Arc<RwLock<Arc<JunkPatterns>>>,
+    start: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
-    spawn_inner(shared, root, junk, None, Some(ready_tx));
+    spawn_inner(
+        shared,
+        root,
+        junk,
+        junk_refresh,
+        Some(start),
+        Some(ready_tx),
+    );
     ready_rx
 }
 
@@ -55,6 +53,7 @@ fn spawn_inner(
     root: PathBuf,
     junk: Arc<RwLock<Arc<JunkPatterns>>>,
     junk_refresh: Option<JunkRefresh>,
+    start: Option<mpsc::Receiver<()>>,
     ready: Option<mpsc::Sender<()>>,
 ) {
     thread::spawn(move || {
@@ -78,6 +77,9 @@ fn spawn_inner(
         }
         if let Some(ready) = ready {
             let _ = ready.send(());
+        }
+        if start.is_some_and(|start| start.recv().is_err()) {
+            return;
         }
 
         loop {

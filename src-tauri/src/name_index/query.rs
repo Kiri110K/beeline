@@ -33,7 +33,7 @@ use serde::Serialize;
 
 use crate::name_index::{
     alias::AliasDictionary,
-    model::{name_filter, DirId, Entry, IndexData, Tier},
+    model::{name_filter, DirId, EntryRef, IndexData, Tier},
     visit_journal::Aggregate,
 };
 
@@ -182,7 +182,7 @@ struct Candidate {
 
 #[derive(Clone, Copy)]
 struct SearchItem<'a> {
-    entry: &'a Entry,
+    entry: EntryRef<'a>,
     name_filter: u64,
 }
 
@@ -442,12 +442,17 @@ impl DirMaskCache {
             }
             return mask;
         }
-        let parent = index.nodes[dir as usize].parent;
+        let parent = index.node(dir).expect("indexed directory node").parent;
         // Recurse first, then borrow this node's name. Borrowing after the recursive mutable
         // `self` call avoids cloning the boxed component — on the reference index that clone
         // meant hundreds of thousands of tiny allocations during every cold multi-token scan.
         let parent_mask = self.mask_for(index, parent, needles, scratch);
-        parent_mask | component_bits(&index.nodes[dir as usize].name, needles, scratch)
+        parent_mask
+            | component_bits(
+                index.node(dir).expect("indexed directory node").name,
+                needles,
+                scratch,
+            )
     }
 }
 
@@ -458,7 +463,7 @@ impl DirMaskCache {
 /// nothing for it.
 fn new_dir_masks(index: &IndexData, prep: &Prepared) -> Option<DirMaskCache> {
     prep.use_path_mask
-        .then(|| DirMaskCache::new(index.nodes.len()))
+        .then(|| DirMaskCache::new(index.node_len()))
 }
 
 /// The bits of `needles` that occur (case-insensitive substring) in one path `component`.
@@ -502,7 +507,7 @@ pub fn run(
     let shards = if reuse.is_some() {
         1
     } else {
-        resolve_shards(index.entries.len())
+        resolve_shards(index.slot_len())
     };
     run_impl(index, ctx, query, limit, reuse, cancel, shards)
 }
@@ -622,7 +627,7 @@ fn scan_full(
     cancel: Option<&Cancel>,
     shards: usize,
 ) -> (Vec<Candidate>, usize, bool, bool) {
-    let n = index.entries.len();
+    let n = index.slot_len();
     if shards <= 1 || n < PAR_THRESHOLD {
         let (mut local, scanned, aborted) = scan_range(index, prep, ctx, 0, n, cancel);
         let capped = local.len() >= MAX_CANDIDATES;
@@ -690,18 +695,14 @@ fn scan_range(
                 return (local, scanned, true);
             }
         }
-        let item_filter = index.name_filters[slot];
-        if item_filter == 0 {
+        let Some(entry) = index.entry(slot) else {
             continue;
-        }
+        };
+        let item_filter = entry.filter;
         scanned += 1;
         if !prep.name_only_may_match(item_filter) {
             continue;
         }
-        let Some(entry) = &index.entries[slot] else {
-            debug_assert!(false, "nonzero name filter on a tombstone");
-            continue;
-        };
         let item = SearchItem {
             entry,
             name_filter: item_filter,
@@ -747,18 +748,14 @@ fn scan_reuse(
                 return (local, scanned, true, false);
             }
         }
-        let item_filter = index.name_filters[slot as usize];
-        if item_filter == 0 {
+        let Some(entry) = index.entry(slot as usize) else {
             continue;
-        }
+        };
+        let item_filter = entry.filter;
         scanned += 1;
         if !prep.name_only_may_match(item_filter) {
             continue;
         }
-        let Some(entry) = &index.entries[slot as usize] else {
-            debug_assert!(false, "nonzero name filter on a tombstone");
-            continue;
-        };
         let item = SearchItem {
             entry,
             name_filter: item_filter,
@@ -813,7 +810,7 @@ fn score_plain(
     scratch: &mut String,
 ) -> Option<(i64, String)> {
     let (mut score, corrected_match) = if let Some(quality) = quality_match(
-        &item.entry.name,
+        item.entry.name,
         item.name_filter,
         &prep.query_lower,
         prep.query_name_filter,
@@ -830,7 +827,7 @@ fn score_plain(
                 continue;
             }
             if let Some(quality) = quality_match(
-                &item.entry.name,
+                item.entry.name,
                 item.name_filter,
                 needle,
                 *needle_filter,
@@ -959,7 +956,7 @@ fn token_quality(
     scratch: &mut String,
 ) -> Option<i64> {
     if let Some(quality) = quality_match(
-        &item.entry.name,
+        item.entry.name,
         item.name_filter,
         token,
         prep.path_needle_name_filters[flat_index],
@@ -1003,7 +1000,7 @@ fn score_path_shaped(
     let (last, prefix) = prep.segments.split_last()?;
     let last_filter = *prep.segment_name_filters.last()?;
     let mut score = quality_match(
-        &item.entry.name,
+        item.entry.name,
         item.name_filter,
         last,
         last_filter,
@@ -1062,8 +1059,8 @@ fn ancestor_contains(
     scratch: &mut String,
 ) -> bool {
     while dir != 0 {
-        let node = &index.nodes[dir as usize];
-        if contains_ci(&node.name, needle, scratch) {
+        let node = index.node(dir).expect("indexed directory node");
+        if contains_ci(node.name, needle, scratch) {
             return true;
         }
         dir = node.parent;
@@ -1088,7 +1085,7 @@ fn ancestor_names(index: &IndexData, dir: DirId) -> Vec<String> {
     let mut names = Vec::new();
     let mut current = dir;
     while current != 0 {
-        let node = &index.nodes[current as usize];
+        let node = index.node(current).expect("indexed directory node");
         names.push(node.name.to_lowercase());
         current = node.parent;
     }
@@ -1365,21 +1362,11 @@ fn find_entry(index: &IndexData, path: &Path) -> Option<(bool, Tier)> {
 
     let mut current: DirId = 0;
     for parent in parents {
-        current = *index.nodes[current as usize]
-            .child_dirs
-            .get(parent.as_str())?;
+        current = index.child_dir(current, parent)?;
     }
-    if let Some(&dir_id) = index.nodes[current as usize].child_dirs.get(name.as_str()) {
-        return Some((true, index.nodes[dir_id as usize].tier));
-    }
-    for &entry_index in &index.nodes[current as usize].entries {
-        if let Some(entry) = &index.entries[entry_index as usize] {
-            if &*entry.name == name.as_str() {
-                return Some((entry.is_directory, entry.tier));
-            }
-        }
-    }
-    None
+    let slot = index.child_slot(current, name)?;
+    let entry = index.entry(slot as usize)?;
+    Some((entry.is_directory, entry.tier))
 }
 
 #[cfg(test)]
@@ -1722,7 +1709,7 @@ mod tests {
                 index.add_file(dir, &format!("f{d:03}_{f:04}.txt"), Tier::Normal);
             }
         }
-        assert!(index.entries.len() > super::PAR_THRESHOLD);
+        assert!(index.slot_len() > super::PAR_THRESHOLD);
 
         let ctx = RankContext::empty();
         // A selective query with matches that fall in a late shard.

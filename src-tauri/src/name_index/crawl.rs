@@ -209,6 +209,14 @@ fn index_subtree_into(data: &mut IndexData, dir_id: DirId, path: &Path, junk: &J
 /// rescanned; the containing directory is marked dirty for a later lazy refresh
 /// (SPEC §6). Non-Junk changes are applied immediately.
 pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
+    if path == data.root {
+        let root = data.root.clone();
+        let mtime = fs::metadata(path)
+            .map(|metadata| mtime_ms(&metadata))
+            .unwrap_or(0);
+        reconcile_dir_children(data, 0, &root, mtime, junk);
+        return;
+    }
     let Ok(relative) = path.strip_prefix(&data.root) else {
         return;
     };
@@ -240,10 +248,7 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
                 // FSEvents on a dir means its direct children changed. Reconcile an
                 // already-indexed dir in place; re-running index_subtree_into (unchecked
                 // add_file) would duplicate the whole subtree on every event.
-                let existing = data.nodes[parent as usize]
-                    .child_dirs
-                    .get(name.as_str())
-                    .copied();
+                let existing = data.child_dir(parent, &name);
                 if let Some(dir_id) = existing {
                     reconcile_dir_children(data, dir_id, path, mtime_ms(&metadata), junk);
                 } else {
@@ -278,14 +283,10 @@ fn reconcile_dir_children(
     let on_disk: HashSet<&str> = disk.iter().map(|child| child.name.as_str()).collect();
 
     // Drop index children no longer present on disk.
-    let indexed: Vec<String> = data.nodes[dir_id as usize]
-        .entries
-        .iter()
-        .filter_map(|&index| {
-            data.entries[index as usize]
-                .as_ref()
-                .map(|entry| entry.name.to_string())
-        })
+    let indexed: Vec<String> = data
+        .direct_children(dir_id)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
     for name in &indexed {
         if !on_disk.contains(name.as_str()) {
@@ -295,14 +296,10 @@ fn reconcile_dir_children(
 
     // Add disk children absent from the post-removal index. A HashSet gives O(1)
     // membership instead of an O(children) `has_child` probe per candidate.
-    let known: HashSet<String> = data.nodes[dir_id as usize]
-        .entries
-        .iter()
-        .filter_map(|&index| {
-            data.entries[index as usize]
-                .as_ref()
-                .map(|entry| entry.name.to_string())
-        })
+    let known: HashSet<String> = data
+        .direct_children(dir_id)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
     for child in disk {
         if known.contains(&child.name) {
@@ -316,7 +313,7 @@ fn reconcile_dir_children(
         }
     }
 
-    data.nodes[dir_id as usize].mtime_ms = mtime;
+    data.set_node_mtime(dir_id, mtime);
 }
 
 /// Reconcile one directory's direct children with disk: add appeared items, remove
@@ -340,15 +337,7 @@ fn reconcile_dir(
     // Snapshot current index children (names + whether directory).
     let index_children: Vec<(String, bool)> = {
         let index = shared.read().expect("name index lock poisoned");
-        index.nodes[dir_id as usize]
-            .entries
-            .iter()
-            .filter_map(|&entry_index| {
-                index.entries[entry_index as usize]
-                    .as_ref()
-                    .map(|entry| (entry.name.to_string(), entry.is_directory))
-            })
-            .collect()
+        index.direct_children(dir_id)
     };
 
     let mut new_subdirs: Vec<(DirId, PathBuf)> = Vec::new();
@@ -374,7 +363,7 @@ fn reconcile_dir(
                 index.add_file(dir_id, &child.name, child.tier);
             }
         }
-        index.nodes[dir_id as usize].mtime_ms = disk_mtime;
+        index.set_node_mtime(dir_id, disk_mtime);
     }
 
     for (id, subdir_path) in new_subdirs {
@@ -415,7 +404,7 @@ fn diff_rescan_dir(
 ) {
     let (stored_mtime, tier) = {
         let index = shared.read().expect("name index lock poisoned");
-        let node = &index.nodes[dir_id as usize];
+        let node = index.node(dir_id).expect("indexed directory node");
         (node.mtime_ms, node.tier)
     };
     if tier == Tier::Junk {
@@ -433,11 +422,7 @@ fn diff_rescan_dir(
 
     let children: Vec<(String, DirId)> = {
         let index = shared.read().expect("name index lock poisoned");
-        index.nodes[dir_id as usize]
-            .child_dirs
-            .iter()
-            .map(|(name, &id)| (name.to_string(), id))
-            .collect()
+        index.child_dirs(dir_id)
     };
     for (name, id) in children {
         diff_rescan_dir(shared, id, path.join(name), root, junk);
@@ -469,12 +454,12 @@ pub fn drain_junk_dirty(
             .iter()
             .copied()
             .filter(|id| {
-                let mut parent = index.nodes[*id as usize].parent;
+                let mut parent = index.node(*id).expect("dirty directory node").parent;
                 while parent != 0 {
                     if ids.contains(&parent) {
                         return false;
                     }
-                    parent = index.nodes[parent as usize].parent;
+                    parent = index.node(parent).expect("dirty ancestor node").parent;
                 }
                 true
             })

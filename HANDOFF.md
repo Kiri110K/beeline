@@ -17,6 +17,45 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 комментарий-вердикт. Открытый с assignee = был в работе; смотри его
 комментарии и `git log` — что уже закоммичено.
 
+## Состояние после Name Index v4 25.08
+
+- Локально реализован прямой переход Name Index v3→v4 без миграции и обратной
+  совместимости. Не-v4 файл считается отсутствующим, после чего обычный полный
+  crawl сразу пишет v4.
+- V4 хранит неизменяемую базу в read-only `mmap`: фиксированные записи каталогов
+  и Items плюс единая UTF-8 arena. Изменения живут в маленьком overlay: tombstones,
+  новые записи/каталоги и mtime overrides. Сохранение потоковое, с checksum,
+  проверкой структуры, удалением недостижимых узлов и атомарной заменой файла.
+- Первый физический app-pass нашёл реальную гонку: watcher применял FSEvents
+  одновременно с initial crawl, мог повторно обходить большое поддерево и держать
+  write-lock. Поиск зависал, а грязный heap на повторном запуске разрастался до
+  12–14 ГБ. Теперь watcher регистрируется до crawl, складывает события в очередь и
+  применяет их только после сборки mmap-базы. Реальный ignored FSEvents smoke это
+  поведение проверяет.
+- Повторный чистый app-pass дал PASS. Полный crawl: 5 150 527 записей за 101.757 с;
+  первый v4-файл 309 859 773 байта. `процедура приемки` и wrong-layout
+  `ghjwtlehf ghbtvrb` вернули по 2 результата за 64/58 мс сквозным временем и
+  57/56 мс backend. После рестарта `index_loaded` пришёл за 982 мс от команды
+  запуска, нового crawl не было; контрольный поиск занял 57/54 мс.
+- После рестарта RSS около 419 MiB включает 308 MiB чистых mapped pages. Charged
+  physical footprint стабилизировался на 68.6 MiB и не рос за четыре замера;
+  peak 71.2 MiB. На первом запуске после compaction footprint стабилизировался на
+  110.6 MiB. Отчёт:
+  `/private/tmp/codex-computer-use.beeline-v4-fixed.08afZo/report.md`.
+- Автопроверки зелёные: `pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build`,
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`;
+  Rust: 78 passed, 6 ignored, 0 failed. Синтетика 5.08М: mutable-crawl запрос
+  22 мс, mapped cold queries 7–29 мс. Живой mapped-файл грузится за 609–613 мс,
+  медианы запросов 12–43 мс.
+- Подписанный release-бандл собран в
+  `/Users/kiri110k/lab/beeline/src-tauri/target/release/bundle/macos/Beeline.app`,
+  но `/Applications/Beeline.app` не заменялся. Текущий реальный `home.idx` уже v4;
+  предыдущий v4 сохранён в `/private/tmp/beeline-v4-pre-fix-backup.XTOjOr/home.idx`,
+  исходный v3 — в `/private/tmp/beeline-v3-backup.zRJKFP/home.idx`.
+- Изменения пока не закоммичены и не запушены. Пользовательская `.claude/`
+  остаётся нетронутой и untracked. Прототип и замеры лежат в
+  `prototypes/name-index-v4/`.
+
 ## Состояние после доведения Settings #30 25.08
 
 - Settings #30 полностью доработан пятью коммитами `490c48f..cd6a1c5` и

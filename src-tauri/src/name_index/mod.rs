@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        mpsc, Arc, Mutex, RwLock,
     },
     thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -142,34 +142,42 @@ impl NameIndex {
         ));
         let junk_refresh =
             JunkRefresh::new(data.clone(), root.clone(), junk.clone(), Some(app.clone()));
+        let (watcher_start_tx, watcher_start_rx) = mpsc::channel();
+        let watcher_ready = watcher::spawn_deferred(
+            data.clone(),
+            root.clone(),
+            junk.clone(),
+            Some(junk_refresh.clone()),
+            watcher_start_rx,
+        );
 
         {
             let data = data.clone();
-            let junk = junk.read().expect("junk lock poisoned").clone();
+            let crawl_junk = junk.read().expect("junk lock poisoned").clone();
             let root = root.clone();
             let app = app.clone();
             let index_file = index_file.clone();
             thread::spawn(move || {
                 crawl::set_crawl_qos();
+                // The watcher is registered before the crawl begins, so changes made during
+                // the crawl are queued. Applying them waits until compaction finishes below.
+                let _ = watcher_ready.recv();
                 if had_persisted {
                     let entries = data.read().expect("name index lock poisoned").len();
                     record(&app, "index_loaded", json!({ "entries": entries }));
-                    crawl::diff_rescan(&data, root, &junk, Some(&app));
+                    crawl::diff_rescan(&data, root, &crawl_junk, Some(&app));
                 } else {
-                    crawl::initial_crawl(&data, root, &junk, Some(&app));
+                    crawl::initial_crawl(&data, root, &crawl_junk, Some(&app));
                 }
                 if let Err(error) = persist::save(&data, &index_file) {
                     eprintln!("name index persist after crawl failed: {error}");
                 }
+                // Applying FSEvents concurrently with the first crawl can discover the same
+                // large subtree twice, hold the write lock for minutes, and starve the first
+                // Search Query. Release the queued events only after the mapped base is live.
+                let _ = watcher_start_tx.send(());
             });
         }
-
-        watcher::spawn(
-            data.clone(),
-            root.clone(),
-            junk.clone(),
-            Some(junk_refresh.clone()),
-        );
         {
             let junk_refresh = junk_refresh.clone();
             crate::power::spawn_monitor(move |source| {
@@ -663,8 +671,8 @@ mod tests {
         persist::save(&shared, &file).expect("save");
         let loaded = persist::load(&file, dir.path()).expect("load");
         assert_eq!(loaded.len(), before);
-        assert_eq!(loaded.name_filters.len(), loaded.entries.len());
-        assert!(loaded.name_filters.iter().all(|filter| *filter != 0));
+        assert_eq!(loaded.slot_len(), before);
+        assert!((0..loaded.slot_len()).all(|slot| loaded.entry(slot).is_some()));
 
         let reloaded = Arc::new(RwLock::new(loaded));
         assert_eq!(tier_of(&reloaded, "index.js"), Some("junk"));
@@ -672,6 +680,55 @@ mod tests {
 
         // A root mismatch is rejected (per-volume identity).
         assert!(persist::load(&file, Path::new("/nonexistent/root")).is_none());
+    }
+
+    #[test]
+    fn persistence_rejects_v3_and_corrupt_v4() {
+        let dir = TempDir::new();
+        let old = dir.path().join("old.idx");
+        let mut v3_header = Vec::from(*b"BLNI");
+        v3_header.extend_from_slice(&3u32.to_le_bytes());
+        fs::write(&old, v3_header).unwrap();
+        assert!(persist::load(&old, dir.path()).is_none());
+
+        let shared = new_index(dir.path());
+        shared
+            .write()
+            .unwrap()
+            .add_file(0, "kept.txt", model::Tier::Normal);
+        let corrupt = dir.path().join("corrupt.idx");
+        persist::save(&shared, &corrupt).unwrap();
+        let mut bytes = fs::read(&corrupt).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x80;
+        fs::write(&corrupt, bytes).unwrap();
+        assert!(persist::load(&corrupt, dir.path()).is_none());
+    }
+
+    #[test]
+    fn mapped_base_overlay_rebuild_round_trip() {
+        let dir = TempDir::new();
+        let file = dir.path().join("overlay.idx");
+        let shared = new_index(dir.path());
+        {
+            let mut index = shared.write().unwrap();
+            let docs = index.add_dir(0, "docs", model::Tier::Normal, 10);
+            index.add_file(docs, "old.txt", model::Tier::Normal);
+        }
+        persist::save(&shared, &file).unwrap();
+        {
+            let mut index = shared.write().unwrap();
+            let docs = index.resolve_dir(&dir.path().join("docs")).unwrap();
+            assert!(index.remove_child(docs, "old.txt"));
+            index.add_file(docs, "new.txt", model::Tier::Normal);
+            index.set_node_mtime(docs, 99);
+        }
+        persist::save(&shared, &file).unwrap();
+        let loaded = persist::load(&file, dir.path()).unwrap();
+        let docs = loaded.resolve_dir(&dir.path().join("docs")).unwrap();
+        assert!(!loaded.has_child(docs, "old.txt"));
+        assert!(loaded.has_child(docs, "new.txt"));
+        assert_eq!(loaded.node(docs).unwrap().mtime_ms, 99);
     }
 
     #[test]
@@ -795,12 +852,23 @@ mod tests {
         let root = fs::canonicalize(dir.path()).unwrap();
         let junk = Arc::new(RwLock::new(Arc::new(JunkPatterns::default())));
         let shared = new_index(&root);
-        let ready = watcher::spawn_for_test(shared.clone(), root.clone(), junk);
+        let mapped_dir = TempDir::new();
+        persist::save(&shared, &mapped_dir.path().join("watcher-v4.idx"))
+            .expect("start watcher from mapped v4 base");
+        let (start_tx, start_rx) = mpsc::channel();
+        let ready = watcher::spawn_deferred(shared.clone(), root.clone(), junk, None, start_rx);
         ready
             .recv_timeout(Duration::from_secs(5))
             .expect("FSEvents watcher did not become ready");
 
         touch(&root.join("live.txt"));
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            tier_of(&shared, "live.txt"),
+            None,
+            "deferred watcher applied an event before startup compaction"
+        );
+        start_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if tier_of(&shared, "live.txt") == Some("normal") {
@@ -947,6 +1015,36 @@ mod tests {
     // depth, and tier distribution (#31).
     #[test]
     #[ignore]
+    fn live_rebuild_v4_from_filesystem() {
+        let root = std::env::var_os("BEELINE_V4_REBUILD_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_V4_REBUILD_ROOT to the filesystem root to crawl");
+        let output = std::env::var_os("BEELINE_V4_REBUILD_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_V4_REBUILD_OUTPUT to a temporary v4 path");
+        let shared = new_index(&root);
+        let junk = JunkPatterns::default();
+        let crawl_started = Instant::now();
+        crawl::initial_crawl(&shared, root.clone(), &junk, None);
+        let crawl_seconds = crawl_started.elapsed().as_secs_f64();
+        let entries = shared.read().unwrap().len();
+        let persist_started = Instant::now();
+        persist::save(&shared, &output).expect("persist live v4 rebuild");
+        let persist_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+        let bytes = fs::metadata(&output).expect("stat live v4").len();
+        let index = shared.read().unwrap();
+        println!(
+            "live v4 rebuild: {} entries / {} dirs, crawl {:.2} s, persist+map {:.2} ms, {:.1} MiB",
+            entries,
+            index.node_len(),
+            crawl_seconds,
+            persist_ms,
+            bytes as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    #[test]
+    #[ignore]
     fn live_persisted_index_query_timing() {
         use std::time::Instant;
 
@@ -959,42 +1057,32 @@ mod tests {
         let load_started = Instant::now();
         let index = persist::load(&index_path, &root).expect("load live persisted index");
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
-        let cores = query::resolve_shards(index.entries.len());
-        let non_ascii = index
-            .entries
-            .iter()
-            .flatten()
+        let cores = query::resolve_shards(index.slot_len());
+        let non_ascii = (0..index.slot_len())
+            .filter_map(|slot| index.entry(slot))
             .filter(|entry| !entry.name.is_ascii())
             .count();
-        let name_bytes: usize = index
-            .entries
-            .iter()
-            .flatten()
+        let name_bytes: usize = (0..index.slot_len())
+            .filter_map(|slot| index.entry(slot))
             .map(|entry| entry.name.len())
             .sum();
-        let max_name_bytes = index
-            .entries
-            .iter()
-            .flatten()
+        let max_name_bytes = (0..index.slot_len())
+            .filter_map(|slot| index.entry(slot))
             .map(|entry| entry.name.len())
             .max()
             .unwrap_or(0);
-        let junk = index
-            .entries
-            .iter()
-            .flatten()
+        let junk = (0..index.slot_len())
+            .filter_map(|slot| index.entry(slot))
             .filter(|entry| entry.tier == model::Tier::Junk)
             .count();
-        let hidden = index
-            .entries
-            .iter()
-            .flatten()
+        let hidden = (0..index.slot_len())
+            .filter_map(|slot| index.entry(slot))
             .filter(|entry| entry.tier == model::Tier::Hidden)
             .count();
         println!(
             "loaded {} entries / {} dirs in {load_ms:.2} ms across {cores} shards; names {:.1} bytes avg / {max_name_bytes} max, non-ASCII {non_ascii}, hidden {hidden}, junk {junk}",
             index.len(),
-            index.nodes.len(),
+            index.node_len(),
             name_bytes as f64 / index.len() as f64
         );
 
@@ -1061,19 +1149,28 @@ mod tests {
         }
 
         let upgraded_dir = TempDir::new();
-        let upgraded_path = upgraded_dir.path().join("home-v3.idx");
+        let upgraded_path = upgraded_dir.path().join("home-v4.idx");
         let shared = Arc::new(RwLock::new(index));
         persist::save(&shared, &upgraded_path).expect("save upgraded live index");
         drop(shared);
-        let upgraded_bytes = fs::metadata(&upgraded_path).expect("stat v3 index").len();
+        let upgraded_bytes = fs::metadata(&upgraded_path).expect("stat v4 index").len();
         let upgraded_started = Instant::now();
         let upgraded = persist::load(&upgraded_path, &root).expect("reload v3 live index");
         println!(
-            "v3 reload: {} entries / {:.1} MiB in {:.2} ms",
+            "v4 reload: {} entries / {:.1} MiB in {:.2} ms",
             upgraded.len(),
             upgraded_bytes as f64 / 1024.0 / 1024.0,
             upgraded_started.elapsed().as_secs_f64() * 1000.0
         );
+        if let Some(seconds) = std::env::var_os("BEELINE_V4_HOLD_SECS")
+            .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        {
+            println!(
+                "holding pid {} with mapped v4 for {seconds} seconds",
+                std::process::id()
+            );
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+        }
     }
 
     // Benchmark-style timing on a synthetic 5M-entry index shaped like the reference
@@ -1128,12 +1225,35 @@ mod tests {
             );
         }
 
+        // First-launch searches can run after the crawl but before the atomic v4 rebuild has
+        // swapped the mutable crawl representation for its mapped base. Keep that path under
+        // the same latency budget as the steady-state mapping.
+        {
+            let index = shared.read().unwrap();
+            let ctx = RankContext::empty();
+            let cores = query::resolve_shards(index.slot_len());
+            let started = Instant::now();
+            let outcome = query::run_impl(&index, &ctx, "процедура приемки", 50, None, None, cores);
+            println!(
+                "mutable crawl query: {} hits / {} scanned in {:.2} ms",
+                outcome.hits.len(),
+                outcome.scanned,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        // Rebuild into the production v4 layout before timing. This drops the large mutable
+        // crawl representation and makes the benchmark exercise the mapped base.
+        let mapped_dir = TempDir::new();
+        let mapped_path = mapped_dir.path().join("synthetic-v4.idx");
+        persist::save(&shared, &mapped_path).expect("persist synthetic v4");
+
         let index = shared.read().unwrap();
         let ctx = RankContext::empty();
-        let cores = query::resolve_shards(index.entries.len());
+        let cores = query::resolve_shards(index.slot_len());
         println!(
             "scanning {} entries across {cores} shards\n",
-            index.entries.len()
+            index.slot_len()
         );
 
         // Warm the allocator / caches with one selective query.

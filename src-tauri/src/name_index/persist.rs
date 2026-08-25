@@ -1,239 +1,265 @@
-//! On-disk persistence for the Name Index (SPEC §11).
+//! Atomic persistence for the mapped Name Index v4.
 //!
-//! Format choice: a hand-rolled, length-prefixed binary layout rather than
-//! `serde_json`. At the reference machine's scale (3.2 M entries) a JSON document is
-//! hundreds of MB and parses in well over a second; the binary format below is a flat
-//! sequence of fixed-width integers and length-prefixed UTF-8, so a load is a single
-//! `read` plus a linear scan with no tokenizing — tens of ms, and a much smaller file.
-//!
-//! Compaction: only live entries are written, so tombstones from churn disappear on
-//! every save. Directory *node* ids are preserved (entries reference them), so a few
-//! orphaned nodes from deep removals can accumulate across save/load cycles — a slow,
-//! bounded leak, noted as an open question rather than solved here.
-//!
-//! The file is written atomically (temp + rename): a crash mid-write can never leave a
-//! half-written index.
+//! Version 3 and older are deliberately not migrated. A non-v4 file loads as absent and
+//! the normal initial crawl replaces it. Saves stream records and the UTF-8 arena directly
+//! to the temporary file; no whole-index encode or decode buffer exists.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
-use crate::name_index::model::{name_filter, DirNode, Entry, IndexData, Tier, NO_DIR};
+use crate::name_index::model::{
+    hash_bytes, IndexData, MappedBase, ENTRY_RECORD_LEN, FNV_OFFSET, HEADER_LEN, MAGIC,
+    NODE_RECORD_LEN, NO_DIR, VERSION,
+};
 
-const MAGIC: &[u8; 4] = b"BLNI";
-/// v1 files are bloated with duplicate subtree entries from the FSEvents reconcile bug and
-/// remain rejected. v2 is accepted for an in-place upgrade: its name filters are derived once
-/// while loading, then the next save writes v3 with each filter persisted beside its Item.
-const VERSION: u32 = 3;
-const OLDEST_SUPPORTED_VERSION: u32 = 2;
-
-fn put_u32(buffer: &mut Vec<u8>, value: u32) {
-    buffer.extend_from_slice(&value.to_le_bytes());
+struct Layout {
+    nodes: Vec<u32>,
+    node_ranges: Vec<(u32, u32)>,
+    entries: Vec<u32>,
+    dir_mapping: Vec<u32>,
+    arena_len: usize,
+    node_name_bytes: usize,
 }
 
-fn put_i64(buffer: &mut Vec<u8>, value: i64) {
-    buffer.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(buffer: &mut Vec<u8>, value: u64) {
-    buffer.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_str(buffer: &mut Vec<u8>, value: &str) {
-    put_u32(buffer, value.len() as u32);
-    buffer.extend_from_slice(value.as_bytes());
-}
-
-/// Cursor over the loaded bytes; every read is bounds-checked and yields `None` on a
-/// short or malformed buffer, so a corrupt file degrades to "no index" not a panic.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+fn build_layout(index: &IndexData) -> std::io::Result<Layout> {
+    let mut nodes = vec![0u32];
+    let mut node_ranges = Vec::new();
+    let mut entries = Vec::with_capacity(index.len());
+    let mut dir_mapping = vec![NO_DIR; index.node_len()];
+    dir_mapping[0] = 0;
+    let mut cursor = 0usize;
+    while cursor < nodes.len() {
+        let dir = nodes[cursor];
+        let mut direct = index.direct_entry_slots(dir);
+        direct.sort_unstable_by(|left, right| {
+            let left = index.entry(*left as usize).expect("live direct entry");
+            let right = index.entry(*right as usize).expect("live direct entry");
+            left.name.as_bytes().cmp(right.name.as_bytes())
+        });
+        let first = u32::try_from(entries.len())
+            .map_err(|_| std::io::Error::other("Name Index exceeds u32 entries"))?;
+        for &slot in &direct {
+            let entry = index.entry(slot as usize).expect("live direct entry");
+            if entry.is_directory && dir_mapping[entry.dir_id as usize] == NO_DIR {
+                let next = u32::try_from(nodes.len())
+                    .map_err(|_| std::io::Error::other("Name Index exceeds u32 nodes"))?;
+                dir_mapping[entry.dir_id as usize] = next;
+                nodes.push(entry.dir_id);
+            }
+        }
+        let count = u32::try_from(direct.len())
+            .map_err(|_| std::io::Error::other("directory exceeds u32 children"))?;
+        node_ranges.push((first, count));
+        entries.extend(direct);
+        cursor += 1;
     }
 
-    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        let end = self.offset.checked_add(count)?;
-        let slice = self.bytes.get(self.offset..end)?;
-        self.offset = end;
-        Some(slice)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        let bytes = self.take(4)?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
-    }
-
-    fn i64(&mut self) -> Option<i64> {
-        let bytes = self.take(8)?;
-        Some(i64::from_le_bytes(bytes.try_into().ok()?))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        let bytes = self.take(8)?;
-        Some(u64::from_le_bytes(bytes.try_into().ok()?))
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn string(&mut self) -> Option<String> {
-        let length = self.u32()? as usize;
-        let bytes = self.take(length)?;
-        String::from_utf8(bytes.to_vec()).ok()
-    }
-}
-
-/// Serialize the index into the binary layout.
-fn encode(index: &IndexData) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    buffer.extend_from_slice(MAGIC);
-    put_u32(&mut buffer, VERSION);
-    put_str(&mut buffer, &index.root.to_string_lossy());
-
-    put_u32(&mut buffer, index.nodes.len() as u32);
-    for node in &index.nodes {
-        put_u32(&mut buffer, node.parent);
-        buffer.push(node.tier as u8);
-        put_i64(&mut buffer, node.mtime_ms);
-        put_str(&mut buffer, &node.name);
-    }
-
-    let live = index.entries.iter().flatten().count();
-    put_u32(&mut buffer, live as u32);
-    for (entry, filter) in index
-        .entries
-        .iter()
-        .zip(&index.name_filters)
-        .filter_map(|(entry, filter)| entry.as_ref().map(|entry| (entry, filter)))
-    {
-        put_u32(&mut buffer, entry.parent);
-        buffer.push(u8::from(entry.is_directory));
-        buffer.push(entry.tier as u8);
-        put_u32(&mut buffer, entry.dir_id);
-        put_str(&mut buffer, &entry.name);
-        put_u64(&mut buffer, *filter);
-    }
-    buffer
-}
-
-/// Parse the binary layout back into an [`IndexData`], rebuilding the derived
-/// `child_dirs` and per-directory `entries` lists from the flat records. Returns
-/// `None` on any corruption or a root that no longer matches `expected_root`.
-fn decode(bytes: &[u8], expected_root: &Path) -> Option<IndexData> {
-    let mut reader = Reader::new(bytes);
-    if reader.take(4)? != MAGIC {
-        return None;
-    }
-    let version = reader.u32()?;
-    if !(OLDEST_SUPPORTED_VERSION..=VERSION).contains(&version) {
-        return None;
-    }
-    let root = PathBuf::from(reader.string()?);
-    if root != expected_root {
-        return None;
-    }
-
-    let node_count = reader.u32()? as usize;
-    let mut nodes: Vec<DirNode> = Vec::with_capacity(node_count);
-    for _ in 0..node_count {
-        let parent = reader.u32()?;
-        let tier = Tier::from_u8(reader.u8()?);
-        let mtime_ms = reader.i64()?;
-        let name = reader.string()?;
-        nodes.push(DirNode::from_parts(
-            name.into_boxed_str(),
-            parent,
-            tier,
-            mtime_ms,
+    let node_name_bytes = nodes.iter().try_fold(0usize, |total, id| {
+        let len = index
+            .node(*id)
+            .ok_or_else(|| std::io::Error::other("reachable directory node is missing"))?
+            .name
+            .len();
+        total
+            .checked_add(len)
+            .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))
+    })?;
+    let arena_len = entries.iter().try_fold(node_name_bytes, |total, slot| {
+        let len = index
+            .entry(*slot as usize)
+            .ok_or_else(|| std::io::Error::other("reachable Item is missing"))?
+            .name
+            .len();
+        total
+            .checked_add(len)
+            .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))
+    })?;
+    if arena_len > u32::MAX as usize {
+        return Err(std::io::Error::other(
+            "Name Index name arena exceeds u32 offsets",
         ));
     }
-    if nodes.is_empty() {
-        return None; // Must contain at least the root node.
-    }
-
-    let entry_count = reader.u32()? as usize;
-    let mut entries: Vec<Option<Entry>> = Vec::with_capacity(entry_count);
-    let mut name_filters: Vec<u64> = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        let parent = reader.u32()?;
-        let is_directory = reader.u8()? != 0;
-        let tier = Tier::from_u8(reader.u8()?);
-        let dir_id = reader.u32()?;
-        let name = reader.string()?.into_boxed_str();
-
-        if parent as usize >= nodes.len() {
-            return None;
-        }
-        let index = entries.len() as u32;
-        nodes[parent as usize].entries.push(index);
-        if is_directory {
-            if dir_id as usize >= nodes.len() {
-                return None;
-            }
-            nodes[parent as usize]
-                .child_dirs
-                .insert(name.clone(), dir_id);
-        }
-        name_filters.push(if version >= 3 {
-            reader.u64()?
-        } else {
-            name_filter(&name)
-        });
-        entries.push(Some(Entry {
-            name,
-            parent,
-            is_directory,
-            dir_id: if is_directory { dir_id } else { NO_DIR },
-            tier,
-        }));
-    }
-
-    let live = entries.len();
-    Some(IndexData {
-        root,
+    Ok(Layout {
         nodes,
+        node_ranges,
         entries,
-        name_filters,
-        live,
-        junk_dirty: std::collections::HashSet::new(),
-        // A freshly loaded index starts a new generation; the diff-rescan that follows
-        // bumps it as it applies changes.
-        revision: 0,
+        dir_mapping,
+        arena_len,
+        node_name_bytes,
     })
 }
 
-/// Path of the index file for a volume key, e.g. `name_index/home.idx`.
+fn node_record(
+    index: &IndexData,
+    layout: &Layout,
+    position: usize,
+    name_offset: u32,
+) -> std::io::Result<[u8; NODE_RECORD_LEN]> {
+    let old_id = layout.nodes[position];
+    let node = index
+        .node(old_id)
+        .ok_or_else(|| std::io::Error::other("directory disappeared during save"))?;
+    let parent = if position == 0 {
+        0
+    } else {
+        layout.dir_mapping[node.parent as usize]
+    };
+    if parent == NO_DIR {
+        return Err(std::io::Error::other("directory parent is unreachable"));
+    }
+    let name_len = u16::try_from(node.name.len())
+        .map_err(|_| std::io::Error::other("directory name exceeds u16 bytes"))?;
+    let (first, count) = layout.node_ranges[position];
+    let mut record = [0u8; NODE_RECORD_LEN];
+    record[0..8].copy_from_slice(&node.mtime_ms.to_le_bytes());
+    record[8..12].copy_from_slice(&parent.to_le_bytes());
+    record[12..16].copy_from_slice(&first.to_le_bytes());
+    record[16..20].copy_from_slice(&count.to_le_bytes());
+    record[20..24].copy_from_slice(&name_offset.to_le_bytes());
+    record[24..26].copy_from_slice(&name_len.to_le_bytes());
+    record[26] = node.tier as u8;
+    Ok(record)
+}
+
+fn entry_record(
+    index: &IndexData,
+    layout: &Layout,
+    slot: u32,
+    name_offset: u32,
+) -> std::io::Result<[u8; ENTRY_RECORD_LEN]> {
+    let entry = index
+        .entry(slot as usize)
+        .ok_or_else(|| std::io::Error::other("Item disappeared during save"))?;
+    let parent = layout.dir_mapping[entry.parent as usize];
+    if parent == NO_DIR {
+        return Err(std::io::Error::other("Item parent is unreachable"));
+    }
+    let dir_id = if entry.is_directory {
+        let mapped = layout.dir_mapping[entry.dir_id as usize];
+        if mapped == NO_DIR {
+            return Err(std::io::Error::other("directory Item is unreachable"));
+        }
+        mapped
+    } else {
+        NO_DIR
+    };
+    let name_len = u16::try_from(entry.name.len())
+        .map_err(|_| std::io::Error::other("Item name exceeds u16 bytes"))?;
+    let mut record = [0u8; ENTRY_RECORD_LEN];
+    record[0..8].copy_from_slice(&entry.filter.to_le_bytes());
+    record[8..12].copy_from_slice(&parent.to_le_bytes());
+    record[12..16].copy_from_slice(&dir_id.to_le_bytes());
+    record[16..20].copy_from_slice(&name_offset.to_le_bytes());
+    record[20..22].copy_from_slice(&name_len.to_le_bytes());
+    record[22] = u8::from(entry.is_directory) | ((entry.tier as u8) << 1);
+    Ok(record)
+}
+
+fn visit_payload(
+    index: &IndexData,
+    layout: &Layout,
+    mut visit: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    visit(index.root.to_string_lossy().as_bytes())?;
+    let mut name_offset = 0u32;
+    for position in 0..layout.nodes.len() {
+        let record = node_record(index, layout, position, name_offset)?;
+        visit(&record)?;
+        name_offset = name_offset
+            .checked_add(
+                u32::try_from(index.node(layout.nodes[position]).unwrap().name.len()).unwrap(),
+            )
+            .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))?;
+    }
+    debug_assert_eq!(name_offset as usize, layout.node_name_bytes);
+    for &slot in &layout.entries {
+        let record = entry_record(index, layout, slot, name_offset)?;
+        visit(&record)?;
+        name_offset = name_offset
+            .checked_add(u32::try_from(index.entry(slot as usize).unwrap().name.len()).unwrap())
+            .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))?;
+    }
+    for &id in &layout.nodes {
+        visit(index.node(id).unwrap().name.as_bytes())?;
+    }
+    for &slot in &layout.entries {
+        visit(index.entry(slot as usize).unwrap().name.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_index(index: &IndexData, path: &Path) -> std::io::Result<()> {
+    let layout = build_layout(index)?;
+    let root = index.root.to_string_lossy();
+    let root_len = u32::try_from(root.len())
+        .map_err(|_| std::io::Error::other("Name Index root exceeds u32 bytes"))?;
+    let node_count = u32::try_from(layout.nodes.len())
+        .map_err(|_| std::io::Error::other("Name Index exceeds u32 nodes"))?;
+    let entry_count = u32::try_from(layout.entries.len())
+        .map_err(|_| std::io::Error::other("Name Index exceeds u32 entries"))?;
+
+    let mut hash = FNV_OFFSET;
+    visit_payload(index, &layout, |bytes| {
+        hash_bytes(&mut hash, bytes);
+        Ok(())
+    })?;
+
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(MAGIC);
+    header[4..8].copy_from_slice(&VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&root_len.to_le_bytes());
+    header[16..20].copy_from_slice(&node_count.to_le_bytes());
+    header[20..24].copy_from_slice(&entry_count.to_le_bytes());
+    header[24..32].copy_from_slice(&(layout.arena_len as u64).to_le_bytes());
+    header[32..40].copy_from_slice(&hash.to_le_bytes());
+
+    let file = File::create(path)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    writer.write_all(&header)?;
+    visit_payload(index, &layout, |bytes| writer.write_all(bytes))?;
+    writer.flush()?;
+    writer.get_ref().sync_all()
+}
+
 pub fn index_path(app_data_dir: &Path, volume_key: &str) -> PathBuf {
     app_data_dir
         .join("name_index")
         .join(format!("{volume_key}.idx"))
 }
 
-/// Load a persisted index, or `None` if absent / corrupt / root-mismatched.
 pub fn load(path: &Path, expected_root: &Path) -> Option<IndexData> {
-    let bytes = fs::read(path).ok()?;
-    decode(&bytes, expected_root)
+    MappedBase::open(path, expected_root)
+        .ok()
+        .flatten()
+        .map(|base| IndexData::from_base(expected_root.to_path_buf(), base))
 }
 
-/// Atomically write the index to `path` (temp file + rename). No filesystem IO happens
-/// while the read lock is held: the bytes are built under the lock, then flushed after.
 pub fn save(shared: &Arc<RwLock<IndexData>>, path: &Path) -> std::io::Result<()> {
-    let bytes = {
-        let index = shared.read().expect("name index lock poisoned");
-        encode(&index)
-    };
+    if path.exists() && !shared.read().expect("name index lock poisoned").is_dirty() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let temp_path = path.with_extension("idx.tmp");
-    fs::write(&temp_path, &bytes)?;
-    fs::rename(&temp_path, path)
+    let revision = {
+        let index = shared.read().expect("name index lock poisoned");
+        let revision = index.revision;
+        write_index(&index, &temp_path)?;
+        revision
+    };
+    fs::rename(&temp_path, path)?;
+    let Some(base) = MappedBase::open(path, &shared.read().unwrap().root)? else {
+        return Err(std::io::Error::other("new Name Index v4 failed validation"));
+    };
+    let mut index = shared.write().expect("name index lock poisoned");
+    if index.revision == revision {
+        index.replace_base(base);
+    }
+    Ok(())
 }
