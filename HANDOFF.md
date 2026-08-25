@@ -49,12 +49,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   медианы запросов 12–43 мс.
 - Подписанный release-бандл собран в
   `/Users/kiri110k/lab/beeline/src-tauri/target/release/bundle/macos/Beeline.app`,
-  но `/Applications/Beeline.app` не заменялся. Текущий реальный `home.idx` уже v4;
-  предыдущий v4 сохранён в `/private/tmp/beeline-v4-pre-fix-backup.XTOjOr/home.idx`,
-  исходный v3 — в `/private/tmp/beeline-v3-backup.zRJKFP/home.idx`.
-- Изменения пока не закоммичены и не запушены. Пользовательская `.claude/`
-  остаётся нетронутой и untracked. Прототип и замеры лежат в
-  `prototypes/name-index-v4/`.
+  установлен в `/Applications/Beeline.app`; предыдущая установленная сборка
+  сохранена в `/private/tmp/beeline-name-index-v4-install-backup.Cip6Xs/Beeline.app`.
+  Текущий реальный `home.idx` уже v4; предыдущий v4 сохранён в
+  `/private/tmp/beeline-v4-pre-fix-backup.XTOjOr/home.idx`, исходный v3 — в
+  `/private/tmp/beeline-v3-backup.zRJKFP/home.idx`.
+- Реализация, прототип и замеры закоммичены как `767f4e1` и запушены в `main`.
+  Пользовательская `.claude/` остаётся нетронутой и untracked.
 
 ## Состояние после доведения Settings #30 25.08
 
