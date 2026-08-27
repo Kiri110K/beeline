@@ -70,6 +70,7 @@ function entryErrorLabel(error: FolderError): string {
     .with({ code: "not-found" }, () => s.entryPoint.errors.notFound)
     .with({ code: "not-a-directory" }, () => s.entryPoint.errors.notADirectory)
     .with({ code: "permission-denied" }, () => s.entryPoint.errors.permissionDenied)
+    .with({ code: "session-expired" }, () => s.entryPoint.errors.io)
     .with({ code: "io" }, () => s.entryPoint.errors.io)
     .exhaustive();
 }

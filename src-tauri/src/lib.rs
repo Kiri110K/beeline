@@ -28,7 +28,10 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-use listing::{list_location, list_location_initial, validate_directory};
+use listing::{
+    list_location_file_neighbor, list_location_initial, list_location_selection_paths,
+    list_location_window, validate_directory, ListingSessions,
+};
 use name_index::{record_visit, search_name_index, NameIndex};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
@@ -604,8 +607,10 @@ pub fn run() {
             get_settings,
             hide_window,
             home_directory,
-            list_location,
+            list_location_file_neighbor,
             list_location_initial,
+            list_location_selection_paths,
+            list_location_window,
             load_pinned_tabs,
             open_in_app,
             paste_copy,
@@ -677,6 +682,7 @@ pub fn run() {
             // Load the last-success Recents cache so the first get_recents paints from it
             // instantly; the refresh is triggered lazily by that first call (§7, §11).
             app.manage(RecentsCache::load(&app.path().app_data_dir()?));
+            app.manage(ListingSessions::new());
 
             let window = app
                 .get_webview_window(MAIN_WINDOW_LABEL)

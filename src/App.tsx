@@ -50,6 +50,7 @@ export default function App(): ReactElement {
             onCommitRename={tabs.commitRename}
             onCancelRename={tabs.cancelRename}
             onReachEnd={tabs.loadMoreRecents}
+            onVisibleRange={tabs.onVisibleRange}
           />
           {search.mode === "search" ? (
             <SearchResults

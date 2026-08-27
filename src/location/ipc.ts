@@ -5,11 +5,16 @@ import { z } from "zod";
 import { fromTauri, type ShellError } from "../shell";
 import {
   initialListLocationSchema,
+  listingFileNeighborSchema,
   listErrorSchema,
-  listLocationSchema,
+  listLocationWindowSchema,
+  resolvedPathsSchema,
   type InitialListLocationResponse,
+  type ListingFileNeighborResponse,
+  type ListingSessionId,
   type ListErrorPayload,
-  type ListLocationResponse,
+  type ListLocationWindowResponse,
+  type ResolvedPath,
 } from "./schema";
 
 const homeDirectorySchema = z.string();
@@ -29,17 +34,53 @@ function classifyListError(error: ShellError): ListErrorPayload {
 
 export function listLocationInitial(
   path: string,
+  ownerId: string,
+  ownerGeneration: number,
+  focusPath: string | null,
+  selectedPaths: string[],
+  preferredIndex: number | null,
 ): ResultAsync<InitialListLocationResponse, ListErrorPayload> {
   return fromTauri("list_location_initial", initialListLocationSchema, () =>
-    invoke("list_location_initial", { path }),
+    invoke("list_location_initial", {
+      request: {
+        path,
+        ownerId,
+        ownerGeneration,
+        focusPath,
+        selectedPaths,
+        preferredIndex,
+      },
+    }),
   ).mapErr(classifyListError);
 }
 
-export function listLocation(
-  path: string,
-): ResultAsync<ListLocationResponse, ListErrorPayload> {
-  return fromTauri("list_location", listLocationSchema, () =>
-    invoke("list_location", { path }),
+export function listLocationWindow(
+  sessionId: ListingSessionId,
+  offset: number,
+  limit: number,
+): ResultAsync<ListLocationWindowResponse, ListErrorPayload> {
+  return fromTauri("list_location_window", listLocationWindowSchema, () =>
+    invoke("list_location_window", { sessionId, offset, limit }),
+  ).mapErr(classifyListError);
+}
+
+export function listLocationFileNeighbor(
+  sessionId: ListingSessionId,
+  index: number,
+  delta: -1 | 1,
+  limit: number,
+): ResultAsync<ListingFileNeighborResponse, ListErrorPayload> {
+  return fromTauri("list_location_file_neighbor", listingFileNeighborSchema, () =>
+    invoke("list_location_file_neighbor", { sessionId, index, delta, limit }),
+  ).mapErr(classifyListError);
+}
+
+export function listLocationSelectionPaths(
+  sessionId: ListingSessionId,
+  indices: number[],
+): ResultAsync<ResolvedPath[], ListErrorPayload> {
+  return fromTauri("list_location_selection_paths", resolvedPathsSchema, () =>
+    invoke("list_location_selection_paths", { sessionId, indices }),
   ).mapErr(classifyListError);
 }
 

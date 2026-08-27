@@ -28,6 +28,9 @@ interface FileTableProps {
   onCancelRename: () => void;
   // Called when the table nears its end, so a Recents view can load its next page (§7).
   onReachEnd: () => void;
+  // The directory listing keeps only a metadata window. Report the visible rows so the
+  // controller can prefetch before scrolling reaches the edge of that window.
+  onVisibleRange: (first: number, last: number) => void;
 }
 
 function errorText(error: ListErrorPayload, location: string): string {
@@ -35,6 +38,9 @@ function errorText(error: ListErrorPayload, location: string): string {
     .with({ code: "not-found" }, () => strings.rowState.notFound(location))
     .with({ code: "not-a-directory" }, () => strings.rowState.noAccess(location))
     .with({ code: "permission-denied" }, () =>
+      strings.rowState.noAccess(location),
+    )
+    .with({ code: "session-expired" }, () =>
       strings.rowState.noAccess(location),
     )
     .with({ code: "io" }, () => strings.rowState.noAccess(location))
@@ -61,6 +67,7 @@ export function FileTable({
   onCommitRename,
   onCancelRename,
   onReachEnd,
+  onVisibleRange,
 }: FileTableProps): ReactElement {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -109,6 +116,18 @@ export function FileTable({
     // Keyed on the generation so a same-value offset still re-applies.
   }, [scrollGeneration, pendingScrollTop, onScrollTop]);
 
+  useEffect(() => {
+    if (load.status !== "ready" || load.total === 0) {
+      return;
+    }
+    const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+    const last = Math.min(
+      load.total,
+      Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
+    );
+    onVisibleRange(first, last);
+  }, [load, scrollTop, viewportHeight, onVisibleRange]);
+
   const content: ReactNode = match(load)
     .with({ status: "idle" }, () => null)
     .with({ status: "loading" }, () => null)
@@ -124,8 +143,8 @@ export function FileTable({
       // Recents is degraded: one honest explanatory line (SPEC §7).
       <RowStateLine text={strings.recents.unavailable[reason]} />
     ))
-    .with({ status: "ready" }, ({ items }) => {
-      if (items.length === 0) {
+    .with({ status: "ready" }, ({ items, offset, total }) => {
+      if (total === 0) {
         // Honest empty: Recents distinguishes "no recent files" from an empty folder.
         const text =
           location.kind === "recents"
@@ -133,16 +152,18 @@ export function FileTable({
             : strings.rowState.empty;
         return <RowStateLine text={text} />;
       }
-      const count = items.length;
+      const count = total;
       const first = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
       const last = Math.min(
         count,
         Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN,
       );
+      const loadedFirst = Math.max(first, offset);
+      const loadedLast = Math.min(last, offset + items.length);
       return (
         <div className="relative" style={{ height: count * ROW_HEIGHT }}>
-          {items.slice(first, last).map((item, offset) => {
-            const index = first + offset;
+          {items.slice(loadedFirst - offset, loadedLast - offset).map((item, row) => {
+            const index = loadedFirst + row;
             return (
               <FileRow
                 key={item.path}

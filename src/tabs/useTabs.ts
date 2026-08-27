@@ -41,21 +41,35 @@ import {
   type OpsState,
 } from "../operations/state";
 import {
+  focusedItemOf,
   hasSelectionBeyondFocus,
   initialBrowseState,
+  itemAt,
+  selectedPathsOf,
   type BrowseState,
   type LoadResult,
+  type LoadedItems,
   type NavKind,
   type SelectMode,
 } from "../browse/state";
-import { listLocation, listLocationInitial } from "../location/ipc";
+import {
+  listLocationFileNeighbor,
+  listLocationInitial,
+  listLocationSelectionPaths,
+  listLocationWindow,
+} from "../location/ipc";
 import {
   directoryLocation,
   recentsLocation,
   type Location,
 } from "../location/location";
 import { getRecents } from "../location/recents";
-import type { Item } from "../location/schema";
+import type {
+  InitialListLocationResponse,
+  Item,
+  ListingSessionId,
+  ListLocationWindowResponse,
+} from "../location/schema";
 import {
   recordVisit,
   searchNameIndex,
@@ -110,6 +124,7 @@ import {
   type TabsState,
 } from "./state";
 import { strings } from "../strings";
+import { ROW_HEIGHT } from "../components/layout";
 
 // Search tuning (SPEC §6, §10). The overlay shows the top ranked hits; a query is
 // "slow" once it is still in flight after this many ms; telemetry is sampled to
@@ -123,6 +138,71 @@ const SEARCH_TELEMETRY_SAMPLE = 20;
 // the cache, later pages arrive on scroll with no hard cap.
 const RECENTS_BATCH = 100;
 
+// WebContent holds only this many metadata-rich rows from a directory. Fetch the next
+// window while the viewport is still this far from an edge, so wheel and key scrolling do
+// not catch the asynchronous IPC boundary (issue #38).
+const DIRECTORY_WINDOW_ITEMS = 2_048;
+const DIRECTORY_WINDOW_PREFETCH = 512;
+
+function directoryWindowOffset(total: number, preferredIndex: number): number {
+  const count = Math.min(total, DIRECTORY_WINDOW_ITEMS);
+  return Math.min(
+    Math.max(0, preferredIndex - Math.floor(count / 2)),
+    Math.max(0, total - count),
+  );
+}
+
+function loadedInitial(response: InitialListLocationResponse): LoadedItems {
+  return {
+    items: response.items,
+    offset: response.offset,
+    total: response.total,
+    sessionId: response.sessionId,
+    focusIndex: response.focusIndex,
+    selected: response.selected,
+  };
+}
+
+function loadedWindow(
+  response: ListLocationWindowResponse,
+  initial: InitialListLocationResponse,
+): LoadedItems {
+  return {
+    items: response.items,
+    offset: response.offset,
+    total: response.total,
+    sessionId: response.sessionId,
+    focusIndex: initial.focusIndex,
+    selected: initial.selected,
+  };
+}
+
+function loadedLocal(
+  items: Item[],
+  focusPath: string | null,
+  selectedPaths: readonly string[],
+): LoadedItems {
+  const focusIndex =
+    focusPath === null
+      ? null
+      : (() => {
+          const index = items.findIndex((item) => item.path === focusPath);
+          return index >= 0 ? index : null;
+        })();
+  const selected = selectedPaths.flatMap((path) => {
+    const index = items.findIndex((item) => item.path === path);
+    return index >= 0 ? [{ path, index }] : [];
+  });
+  return {
+    items,
+    offset: 0,
+    total: items.length,
+    sessionId: null,
+    focusIndex,
+    selected,
+  };
+}
+
 // The kind of Tab a group boundary drop lands in — the signal that a drag
 // crossed the Pinned/Temporary divide and must pin or unpin (§4, point 7).
 export type TabGroup = "pinned" | "temporary";
@@ -131,22 +211,35 @@ export type TabGroup = "pinned" | "temporary";
 // position within it, and the parallel Browse row index of each file so Up/Down can move the
 // app's Focused Item in sync (SPEC §9). `null` whenever the panel is closed — the honest
 // mirror the Escape order reads (kept truthful by the closed event, SPEC §5).
-interface QuickLookSession {
+interface LocalQuickLookSession {
+  kind: "local";
   paths: string[];
   rows: number[];
   index: number;
 }
 
+interface PagedQuickLookSession {
+  kind: "paged";
+  sessionId: ListingSessionId;
+  row: number;
+  request: number;
+}
+
+type QuickLookSession = LocalQuickLookSession | PagedQuickLookSession;
+
 // The files-only rows of a Browse listing, in the given row order — the Quick Look list and
 // its Focused-Item mapping (SPEC §9: "files only"). Directories are skipped.
 function fileRowsOf(
-  items: readonly Item[],
+  browse: BrowseState,
   rowOrder: Iterable<number>,
 ): { paths: string[]; rows: number[] } {
+  if (browse.load.status !== "ready") {
+    return { paths: [], rows: [] };
+  }
   const paths: string[] = [];
   const rows: number[] = [];
   for (const index of rowOrder) {
-    const item = items[index];
+    const item = itemAt(browse.load, index);
     if (item !== undefined && !item.isDirectory) {
       paths.push(item.path);
       rows.push(index);
@@ -164,6 +257,7 @@ export interface Tabs {
   select: (index: number, mode: SelectMode) => void;
   activateItem: (item: Item) => void;
   onScrollTop: (top: number) => void;
+  onVisibleRange: (first: number, last: number) => void;
   // Pull the next page of Recents when the table nears its end (§7).
   loadMoreRecents: () => void;
   // Search interactions on the active Tab (§5, §6).
@@ -281,32 +375,6 @@ function fireTelemetry(name: string, fields: Record<string, unknown>): void {
   void recordTelemetry(name, fields).match(() => undefined, reportShellError);
 }
 
-// The paths of the Selected Items of a browse view, in row order; empty unless the view is
-// ready (SPEC §8: operations act on Selected Items).
-function selectedPaths(browse: BrowseState): string[] {
-  if (browse.load.status !== "ready") {
-    return [];
-  }
-  const items = browse.load.items;
-  const paths: string[] = [];
-  for (const index of browse.selected) {
-    const item = items[index];
-    if (item !== undefined) {
-      paths.push(item.path);
-    }
-  }
-  return paths;
-}
-
-// The single Focused Item of a browse view (anchors Rename, Reveal, Open in Terminal/Editor,
-// Open in New Tab), or undefined when the view is not ready or empty.
-function focusedItemOf(browse: BrowseState): Item | undefined {
-  if (browse.load.status !== "ready") {
-    return undefined;
-  }
-  return browse.load.items[browse.focusedIndex];
-}
-
 // The directory path a paste / New Folder targets, or null when there is none — a Recents
 // Tab has no target directory, so Paste and New Folder are disabled there (SPEC §8, point 1).
 function currentDirPath(browse: BrowseState): string | null {
@@ -410,6 +478,61 @@ export function useTabs(
     return seq;
   }, []);
 
+  const windowRequestRef = useRef(
+    new Map<TabId, { sessionId: ListingSessionId; offset: number }>(),
+  );
+  const retryListingRef = useRef<(tabId: TabId) => void>(() => undefined);
+
+  const requestDirectoryWindow = useCallback(
+    (
+      tabId: TabId,
+      sessionId: ListingSessionId,
+      total: number,
+      preferredIndex: number,
+    ): void => {
+      const offset = directoryWindowOffset(total, preferredIndex);
+      const pending = windowRequestRef.current.get(tabId);
+      if (pending?.sessionId === sessionId && pending.offset === offset) {
+        return;
+      }
+      windowRequestRef.current.set(tabId, { sessionId, offset });
+      void listLocationWindow(
+        sessionId,
+        offset,
+        DIRECTORY_WINDOW_ITEMS,
+      ).match(
+        (response) => {
+          const latest = windowRequestRef.current.get(tabId);
+          if (latest?.sessionId !== sessionId || latest.offset !== offset) {
+            return;
+          }
+          windowRequestRef.current.delete(tabId);
+          dispatch({
+            type: "browse",
+            tabId,
+            action: {
+              type: "windowLoaded",
+              sessionId: response.sessionId,
+              items: response.items,
+              offset: response.offset,
+              total: response.total,
+            },
+          });
+        },
+        (error) => {
+          const latest = windowRequestRef.current.get(tabId);
+          if (latest?.sessionId === sessionId && latest.offset === offset) {
+            windowRequestRef.current.delete(tabId);
+          }
+          if (error.code === "session-expired") {
+            retryListingRef.current(tabId);
+          }
+        },
+      );
+    },
+    [],
+  );
+
   // Per-Tab search request id (cancel-on-newer, §10) and the pending slow-line
   // timer per Tab, plus a sampling counter for search telemetry.
   const searchSeqRef = useRef(new Map<TabId, number>());
@@ -438,6 +561,20 @@ export function useTabs(
         tabId === current.activeId
           ? scrollTopRef.current
           : (tabById(current, tabId)?.browse.scrollTop ?? 0);
+      const tab = tabById(current, tabId);
+      const restore =
+        nav === "back"
+          ? (tab?.browse.history[tab.browse.history.length - 1] ?? null)
+          : nav === "forward"
+            ? (tab?.browse.future[tab.browse.future.length - 1] ?? null)
+            : null;
+      const requestedFocusPath = focusPath ?? restore?.focusedPath ?? null;
+      const requestedSelectedPaths =
+        focusPath === undefined
+          ? (restore?.selectedPaths ?? [])
+          : [focusPath];
+      const preferredIndex =
+        restore === null ? null : Math.floor(restore.scrollTop / ROW_HEIGHT);
       // Commit a landed load. The Location entered is recorded (SPEC §6) only for a
       // directory; programmatic `replace` loads are silent unless forced by a Reveal.
       const commit = (location: Location, result: LoadResult): void => {
@@ -478,11 +615,21 @@ export function useTabs(
                   total: response.total,
                   loading: false,
                 });
-                commit(recentsLocation, { kind: "items", items: response.items });
+                commit(recentsLocation, {
+                  kind: "items",
+                  load: loadedLocal(
+                    response.items,
+                    requestedFocusPath,
+                    requestedSelectedPaths,
+                  ),
+                });
                 break;
               case "empty":
                 recentsMetaRef.current.set(tabId, { total: 0, loading: false });
-                commit(recentsLocation, { kind: "items", items: [] });
+                commit(recentsLocation, {
+                  kind: "items",
+                  load: loadedLocal([], null, []),
+                });
                 break;
               case "spotlight_unavailable":
                 commit(recentsLocation, {
@@ -501,14 +648,21 @@ export function useTabs(
       }
 
       const listingStartedAt = performance.now();
-      void listLocationInitial(target.path).match(
+      void listLocationInitial(
+        target.path,
+        tabId,
+        seq,
+        requestedFocusPath,
+        requestedSelectedPaths,
+        preferredIndex,
+      ).match(
         (response) => {
           if (seq !== seqRef.current.get(tabId)) {
             return;
           }
           commit(directoryLocation(response.path), {
             kind: "items",
-            items: response.items,
+            load: loadedInitial(response),
           });
           // Two animation frames give React a paint opportunity after the listing state
           // commits. This is an upper-bound measurement from navigation through the first
@@ -528,25 +682,11 @@ export function useTabs(
             });
           });
           if (!response.complete) {
-            // The sorted prefix is already interactive. Fill in the remaining metadata-rich
-            // rows as one background replacement, preserving the visible row by path.
-            void listLocation(target.path).match(
-              (full) => {
-                if (seq !== seqRef.current.get(tabId)) {
-                  return;
-                }
-                dispatch({
-                  type: "browse",
-                  tabId,
-                  action: {
-                    type: "revalidated",
-                    location: directoryLocation(full.path),
-                    items: full.items,
-                    focusPath: focusPath ?? null,
-                  },
-                });
-              },
-              () => undefined,
+            requestDirectoryWindow(
+              tabId,
+              response.sessionId,
+              response.total,
+              preferredIndex ?? response.focusIndex ?? response.offset,
             );
           }
         },
@@ -562,7 +702,7 @@ export function useTabs(
         },
       );
     },
-    [nextSeq],
+    [nextSeq, requestDirectoryWindow],
   );
 
   // Re-list the current Location in the background, keeping the Focused Item put. A
@@ -579,18 +719,44 @@ export function useTabs(
           if (response.state === "ok" || response.state === "empty") {
             const total = response.state === "ok" ? response.total : 0;
             const items = response.state === "ok" ? response.items : [];
+            const currentTab = tabById(stateRef.current, tabId);
+            const currentFocus = currentTab?.browse.focusedPath ?? null;
+            const currentSelection =
+              currentTab === undefined ? [] : selectedPathsOf(currentTab.browse);
             recentsMetaRef.current.set(tabId, { total, loading: false });
             dispatch({
               type: "browse",
               tabId,
-              action: { type: "revalidated", location, items, focusPath: null },
+              action: {
+                type: "revalidated",
+                location,
+                load: loadedLocal(items, currentFocus, currentSelection),
+                focusPath: null,
+              },
             });
           }
         }, reportShellError);
         return;
       }
-      void listLocation(location.path).match(
-        (response) => {
+      const tab = tabById(stateRef.current, tabId);
+      if (tab === undefined) {
+        return;
+      }
+      const focusPath = tab.browse.focusedPath;
+      const selectedPaths = selectedPathsOf(tab.browse);
+      const preferredIndex = Math.floor(tab.browse.scrollTop / ROW_HEIGHT);
+      void listLocationInitial(
+        location.path,
+        tabId,
+        seq,
+        focusPath,
+        selectedPaths,
+        preferredIndex,
+      ).match((initial) => {
+        if (seq !== seqRef.current.get(tabId)) {
+          return;
+        }
+        const commit = (load: LoadedItems): void => {
           if (seq !== seqRef.current.get(tabId)) {
             return;
           }
@@ -599,18 +765,40 @@ export function useTabs(
             tabId,
             action: {
               type: "revalidated",
-              location: directoryLocation(response.path),
-              items: response.items,
+              location: directoryLocation(initial.path),
+              load,
               focusPath: null,
             },
           });
-        },
-        // A failed revalidation keeps the cached listing on screen.
-        () => undefined,
-      );
+        };
+        if (initial.complete) {
+          commit(loadedInitial(initial));
+          return;
+        }
+        const offset = directoryWindowOffset(initial.total, preferredIndex);
+        void listLocationWindow(
+          initial.sessionId,
+          offset,
+          DIRECTORY_WINDOW_ITEMS,
+        ).match(
+          (window) => {
+            commit(loadedWindow(window, initial));
+          },
+          () => undefined,
+        );
+      }, () => undefined);
     },
     [nextSeq],
   );
+
+  useEffect(() => {
+    retryListingRef.current = (tabId): void => {
+      const tab = tabById(stateRef.current, tabId);
+      if (tab !== undefined) {
+        revalidate(tabId, tab.browse.location);
+      }
+    };
+  }, [revalidate]);
 
   // Pull the next Recents page when the table nears its end (§7). No-op unless the active
   // Tab is a ready Recents view with more cached rows than shown and no fetch in flight.
@@ -688,12 +876,13 @@ export function useTabs(
     if (active === undefined || active.browse.load.status !== "ready") {
       return;
     }
-    const index = active.browse.load.items.findIndex(
+    const localIndex = active.browse.load.items.findIndex(
       (candidate) => candidate.path === item.path,
     );
-    if (index === -1) {
+    if (localIndex === -1) {
       return;
     }
+    const index = active.browse.load.offset + localIndex;
     if (!active.browse.selected.has(index)) {
       dispatch({
         type: "browse",
@@ -733,24 +922,160 @@ export function useTabs(
   );
 
   const select = useCallback((index: number, mode: SelectMode): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
     dispatch({
       type: "browse",
       tabId: stateRef.current.activeId,
       action: { type: "select", index, mode },
     });
+    if (
+      mode !== "range" ||
+      active === undefined ||
+      active.browse.load.status !== "ready" ||
+      active.browse.load.sessionId === null
+    ) {
+      return;
+    }
+    const end = Math.min(Math.max(index, 0), active.browse.load.total - 1);
+    const first = Math.min(active.browse.anchorIndex, end);
+    const last = Math.max(active.browse.anchorIndex, end);
+    const indices = Array.from({ length: last - first + 1 }, (_, offset) =>
+      first + offset,
+    );
+    const sessionId = active.browse.load.sessionId;
+    void listLocationSelectionPaths(sessionId, indices).match(
+      (selected) => {
+        dispatch({
+          type: "browse",
+          tabId: active.id,
+          action: { type: "selectionPathsResolved", sessionId, selected },
+        });
+      },
+      () => undefined,
+    );
   }, []);
 
   const onScrollTop = useCallback((top: number): void => {
     scrollTopRef.current = top;
   }, []);
 
+  const onVisibleRange = useCallback(
+    (first: number, last: number): void => {
+      const current = stateRef.current;
+      const active = tabById(current, current.activeId);
+      if (active === undefined || active.browse.load.status !== "ready") {
+        return;
+      }
+      const load = active.browse.load;
+      if (load.sessionId === null) {
+        return;
+      }
+      const loadedEnd = load.offset + load.items.length;
+      const safeFirst =
+        load.offset === 0 ? 0 : load.offset + DIRECTORY_WINDOW_PREFETCH;
+      const safeLast =
+        loadedEnd >= load.total
+          ? load.total
+          : loadedEnd - DIRECTORY_WINDOW_PREFETCH;
+      if (first >= safeFirst && last <= safeLast) {
+        return;
+      }
+      const preferred = Math.floor((first + Math.max(first, last - 1)) / 2);
+      const desiredOffset = directoryWindowOffset(load.total, preferred);
+      if (desiredOffset === load.offset) {
+        return;
+      }
+      requestDirectoryWindow(
+        active.id,
+        load.sessionId,
+        load.total,
+        preferred,
+      );
+    },
+    [requestDirectoryWindow],
+  );
+
+  const focusRequestRef = useRef(new Map<TabId, number>());
   const focusDelta = useCallback((delta: number, extend: boolean): void => {
-    dispatch({
-      type: "browse",
-      tabId: stateRef.current.activeId,
-      action: { type: "focusDelta", delta, extend },
-    });
+    const current = stateRef.current;
+    const active = tabById(current, current.activeId);
+    if (active === undefined || active.browse.load.status !== "ready") {
+      return;
+    }
+    const load = active.browse.load;
+    if (load.total === 0) {
+      return;
+    }
+    const target = Math.min(
+      Math.max(active.browse.focusedIndex + delta, 0),
+      Math.max(0, load.total - 1),
+    );
+    if (itemAt(load, target) !== undefined || load.sessionId === null) {
+      dispatch({
+        type: "browse",
+        tabId: active.id,
+        action: { type: "focusDelta", delta, extend },
+      });
+      return;
+    }
+    const request = (focusRequestRef.current.get(active.id) ?? 0) + 1;
+    focusRequestRef.current.set(active.id, request);
+    const offset = directoryWindowOffset(load.total, target);
+    void listLocationWindow(
+      load.sessionId,
+      offset,
+      DIRECTORY_WINDOW_ITEMS,
+    ).match(
+      (response) => {
+        if (focusRequestRef.current.get(active.id) !== request) {
+          return;
+        }
+        dispatch({
+          type: "browse",
+          tabId: active.id,
+          action: {
+            type: "windowLoaded",
+            sessionId: response.sessionId,
+            items: response.items,
+            offset: response.offset,
+            total: response.total,
+          },
+        });
+        dispatch({
+          type: "browse",
+          tabId: active.id,
+          action: { type: "focusDelta", delta, extend },
+        });
+      },
+      (error) => {
+        if (error.code === "session-expired") {
+          retryListingRef.current(active.id);
+        }
+      },
+    );
   }, []);
+
+  const withSelectedPaths = useCallback(
+    (browse: BrowseState, run: (paths: string[]) => void): void => {
+      const cached = selectedPathsOf(browse);
+      if (
+        cached.length === browse.selected.size ||
+        browse.load.status !== "ready" ||
+        browse.load.sessionId === null
+      ) {
+        run(cached);
+        return;
+      }
+      const indices = [...browse.selected].sort((a, b) => a - b);
+      void listLocationSelectionPaths(browse.load.sessionId, indices).match(
+        (selected) => {
+          run(selected.map((resolved) => resolved.path));
+        },
+        () => undefined,
+      );
+    },
+    [],
+  );
 
   // ---- Quick Look (§5, §9) ----------------------------------------------------------
   // Space toggles the native Quick Look panel over the current file list, focused at the
@@ -771,47 +1096,52 @@ export function useTabs(
     ) {
       return;
     }
-    const items = active.browse.load.items;
+    const load = active.browse.load;
     const focusIndex = active.browse.focusedIndex;
-    const focused = items[focusIndex];
+    const focused = itemAt(load, focusIndex);
     if (focused === undefined || focused.isDirectory) {
       return;
     }
     const dispatchStartedAt = performance.now();
     const multiSelect = active.browse.selected.size > 1;
-    const order: Iterable<number> = multiSelect
-      ? [...active.browse.selected].sort((a, b) => a - b)
-      : items.keys();
-    let list = fileRowsOf(items, order);
-    // Ensure the Focused Item is part of the list (a multi-selection of only directories, or a
-    // focus outside the selection, falls back to the whole listing's files).
-    if (!list.rows.includes(focusIndex)) {
-      list = fileRowsOf(
-        items,
-        items.keys(),
-      );
+    let count: number;
+    if (!multiSelect && load.sessionId !== null && load.total > load.items.length) {
+      // A large Location keeps its order in Rust. WebContent retains the session id, current
+      // row, and one metadata window; crossing that window asks Rust for the next file.
+      quickLookRef.current = {
+        kind: "paged",
+        sessionId: load.sessionId,
+        row: focusIndex,
+        request: 0,
+      };
+      count = load.total;
+    } else {
+      const order: Iterable<number> = multiSelect
+        ? [...active.browse.selected].sort((a, b) => a - b)
+        : Array.from({ length: load.total }, (_, index) => index);
+      let list = fileRowsOf(active.browse, order);
+      if (!list.rows.includes(focusIndex)) {
+        list = fileRowsOf(
+          active.browse,
+          Array.from({ length: load.total }, (_, index) => index),
+        );
+      }
+      if (list.paths.length === 0) {
+        return;
+      }
+      const position = Math.max(0, list.rows.indexOf(focusIndex));
+      quickLookRef.current = {
+        kind: "local",
+        paths: list.paths,
+        rows: list.rows,
+        index: position,
+      };
+      count = list.paths.length;
     }
-    if (list.paths.length === 0) {
-      return;
-    }
-    const position = Math.max(0, list.rows.indexOf(focusIndex));
-    const currentPath = list.paths[position];
-    if (currentPath === undefined) {
-      return;
-    }
-    quickLookRef.current = {
-      paths: list.paths,
-      rows: list.rows,
-      index: position,
-    };
-    // The frontend owns Up/Down navigation, so the native panel needs only the current
-    // preview item. Sending a 50k-directory's complete path list across IPC made Space take
-    // hundreds of milliseconds and made every Arrow key rebuild 50k NSURLs on AppKit's main
-    // thread. Keep the complete session locally and re-point the panel one path at a time.
-    void quickLookShow([currentPath], 0).match(
+    void quickLookShow([focused.path], 0).match(
       () => {
         fireTelemetry("quick_look_dispatch_completed", {
-          count: list.paths.length,
+          count,
           duration_ms: Math.round(performance.now() - dispatchStartedAt),
         });
       },
@@ -830,6 +1160,95 @@ export function useTabs(
   const moveQuickLook = useCallback((delta: number): void => {
     const session = quickLookRef.current;
     if (session === null) {
+      return;
+    }
+    if (session.kind === "paged") {
+      const direction: -1 | 1 = delta < 0 ? -1 : 1;
+      const active = tabById(stateRef.current, stateRef.current.activeId);
+      if (
+        active !== undefined &&
+        active.browse.load.status === "ready" &&
+        active.browse.load.sessionId === session.sessionId
+      ) {
+        const load = active.browse.load;
+        const loadedFirst = load.offset;
+        const loadedLast = load.offset + load.items.length - 1;
+        let candidate = session.row + direction;
+        while (candidate >= loadedFirst && candidate <= loadedLast) {
+          const item = itemAt(load, candidate);
+          if (item !== undefined && !item.isDirectory) {
+            session.row = candidate;
+            void quickLookUpdate([item.path], 0).match(
+              () => undefined,
+              reportShellError,
+            );
+            dispatch({
+              type: "browse",
+              tabId: active.id,
+              action: { type: "refocus", index: candidate, path: item.path },
+            });
+            return;
+          }
+          candidate += direction;
+        }
+      }
+      session.request += 1;
+      const request = session.request;
+      void listLocationFileNeighbor(
+        session.sessionId,
+        session.row,
+        direction,
+        DIRECTORY_WINDOW_ITEMS,
+      ).match(
+        (response) => {
+          const current = quickLookRef.current;
+          if (
+            response === null ||
+            current?.kind !== "paged" ||
+            current.sessionId !== session.sessionId ||
+            current.request !== request
+          ) {
+            return;
+          }
+          const item = response.items[response.focusIndex - response.offset];
+          if (item === undefined) {
+            return;
+          }
+          current.row = response.focusIndex;
+          void quickLookUpdate([item.path], 0).match(
+            () => undefined,
+            reportShellError,
+          );
+          const tabId = stateRef.current.activeId;
+          dispatch({
+            type: "browse",
+            tabId,
+            action: {
+              type: "windowLoaded",
+              sessionId: response.sessionId,
+              items: response.items,
+              offset: response.offset,
+              total: response.total,
+            },
+          });
+          dispatch({
+            type: "browse",
+            tabId,
+            action: {
+              type: "refocus",
+              index: response.focusIndex,
+              path: item.path,
+            },
+          });
+        },
+        (error) => {
+          if (error.code === "session-expired") {
+            quickLookRef.current = null;
+            void quickLookHide().match(() => undefined, reportShellError);
+            retryListingRef.current(stateRef.current.activeId);
+          }
+        },
+      );
       return;
     }
     const next = Math.min(
@@ -853,7 +1272,7 @@ export function useTabs(
       dispatch({
         type: "browse",
         tabId: stateRef.current.activeId,
-        action: { type: "refocus", index: row },
+        action: { type: "refocus", index: row, path },
       });
     }
   }, []);
@@ -1027,7 +1446,7 @@ export function useTabs(
     if (active === undefined || active.browse.load.status !== "ready") {
       return;
     }
-    const focused = active.browse.load.items[active.browse.focusedIndex];
+    const focused = itemAt(active.browse.load, active.browse.focusedIndex);
     if (focused !== undefined) {
       activateItem(focused);
     }
@@ -1365,15 +1784,16 @@ export function useTabs(
     if (active === undefined) {
       return;
     }
-    const paths = selectedPaths(active.browse);
-    if (paths.length === 0) {
-      return;
-    }
-    opsDispatch({ type: "setClipboard", paths });
-    void copyToClipboard(paths.join("\n")).match(() => undefined, reportShellError);
-    fireTelemetry("clipboard_copied", { count: paths.length });
-    afterAction("copy_file");
-  }, [afterAction]);
+    withSelectedPaths(active.browse, (paths) => {
+      if (paths.length === 0) {
+        return;
+      }
+      opsDispatch({ type: "setClipboard", paths });
+      void copyToClipboard(paths.join("\n")).match(() => undefined, reportShellError);
+      fireTelemetry("clipboard_copied", { count: paths.length });
+      afterAction("copy_file");
+    });
+  }, [afterAction, withSelectedPaths]);
 
   // Copy Path: textual only (§8) — the path(s) to the system clipboard, newline-separated.
   // Does not touch the in-app file-reference clipboard. Copy Path hides the window (§12).
@@ -1382,14 +1802,15 @@ export function useTabs(
     if (active === undefined) {
       return;
     }
-    const paths = selectedPaths(active.browse);
-    if (paths.length === 0) {
-      return;
-    }
-    void copyToClipboard(paths.join("\n")).match(() => {
-      afterAction("copy_path");
-    }, reportShellError);
-  }, [afterAction]);
+    withSelectedPaths(active.browse, (paths) => {
+      if (paths.length === 0) {
+        return;
+      }
+      void copyToClipboard(paths.join("\n")).match(() => {
+        afterAction("copy_path");
+      }, reportShellError);
+    });
+  }, [afterAction, withSelectedPaths]);
 
   // Cmd+V / Paste: paste-copy the clipboard file references into the current Location; a
   // same-Location paste duplicates (the engine suffixes). No-op without a clipboard or a
@@ -1456,29 +1877,30 @@ export function useTabs(
     if (active === undefined) {
       return;
     }
-    const paths = selectedPaths(active.browse);
-    if (paths.length === 0) {
-      return;
-    }
-    void trashItems(paths).match(
-      (jobId) => {
-        opsDispatch({
-          type: "jobStarted",
-          jobId,
-          label: strings.operations.status.trashing,
-          total: paths.length,
-        });
-      },
-      (error) => {
-        opsDispatch({
-          type: "pushProblem",
-          path: paths[0] ?? "",
-          cause: opErrorMessage(error),
-        });
-      },
-    );
-    afterAction("trash");
-  }, [afterAction]);
+    withSelectedPaths(active.browse, (paths) => {
+      if (paths.length === 0) {
+        return;
+      }
+      void trashItems(paths).match(
+        (jobId) => {
+          opsDispatch({
+            type: "jobStarted",
+            jobId,
+            label: strings.operations.status.trashing,
+            total: paths.length,
+          });
+        },
+        (error) => {
+          opsDispatch({
+            type: "pushProblem",
+            path: paths[0] ?? "",
+            cause: opErrorMessage(error),
+          });
+        },
+      );
+      afterAction("trash");
+    });
+  }, [afterAction, withSelectedPaths]);
 
   // Opt+Cmd+Delete / Delete Permanently: always opens the confirm (§8, no "don't ask
   // again"); the delete itself runs only on confirm.
@@ -1487,12 +1909,12 @@ export function useTabs(
     if (active === undefined) {
       return;
     }
-    const paths = selectedPaths(active.browse);
-    if (paths.length === 0) {
-      return;
-    }
-    opsDispatch({ type: "openConfirm", paths });
-  }, []);
+    withSelectedPaths(active.browse, (paths) => {
+      if (paths.length > 0) {
+        opsDispatch({ type: "openConfirm", paths });
+      }
+    });
+  }, [withSelectedPaths]);
 
   const confirmDelete = useCallback((): void => {
     const confirm = opsRef.current.confirm;
@@ -1874,7 +2296,7 @@ export function useTabs(
   const menuItems = useMemo<MenuItem[]>(() => {
     const active = state.tabs.find((tab) => tab.id === state.activeId);
     const browse = active?.browse;
-    const selCount = browse === undefined ? 0 : selectedPaths(browse).length;
+    const selCount = browse?.selected.size ?? 0;
     if (browse === undefined || selCount === 0) {
       // Application actions (§5): reachable via Cmd+K with an empty selection.
       const menu = strings.operations.menu;
@@ -2574,6 +2996,7 @@ export function useTabs(
     select,
     activateItem,
     onScrollTop,
+    onVisibleRange,
     loadMoreRecents,
     setInputEl,
     activateSearch,

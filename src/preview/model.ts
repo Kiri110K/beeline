@@ -1,4 +1,4 @@
-import type { BrowseState } from "../browse/state";
+import { itemAt, type BrowseState } from "../browse/state";
 import { displayedHits, type SearchState } from "../search/state";
 import type { Settings } from "../settings/schema";
 
@@ -27,7 +27,7 @@ export function previewTargetFor(
     return { path: hit.path, name: hit.name, isDirectory: hit.isDirectory };
   }
   if (browse.load.status === "ready") {
-    const item = browse.load.items[browse.focusedIndex];
+    const item = itemAt(browse.load, browse.focusedIndex);
     if (item !== undefined) {
       return { path: item.path, name: item.name, isDirectory: item.isDirectory };
     }

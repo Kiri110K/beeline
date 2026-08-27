@@ -4,32 +4,45 @@ import {
   type Location,
 } from "../location/location";
 import type { RecentsUnavailableReason } from "../location/recents";
-import type { Item, ListErrorPayload } from "../location/schema";
+import type {
+  Item,
+  ListingSessionId,
+  ListErrorPayload,
+  ResolvedPath,
+} from "../location/schema";
 
-// Why a load produced no usable list. The three Spotlight reasons (SPEC §7) plus
-// "unknown" for a boundary failure that never resolved to one of them.
 export type LoadUnavailableReason = RecentsUnavailableReason | "unknown";
 
-// One variant per real state; `items` is only reachable once `ready`. `unavailable` is
-// produced only by Recents (a degraded Spotlight), never by a directory listing (§7).
+export interface LoadedItems {
+  items: Item[];
+  offset: number;
+  total: number;
+  sessionId: ListingSessionId | null;
+  focusIndex: number | null;
+  selected: ResolvedPath[];
+}
+
+export type ReadyLoadState = {
+  status: "ready";
+  items: Item[];
+  offset: number;
+  total: number;
+  sessionId: ListingSessionId | null;
+};
+
 export type LoadState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; error: ListErrorPayload }
   | { status: "unavailable"; reason: LoadUnavailableReason }
-  | { status: "ready"; items: Item[] };
+  | ReadyLoadState;
 
-// The outcome of loading a Location: a list of Items, or a degraded Recents state. One
-// type so the `listed` transition does its history bookkeeping once for both.
 export type LoadResult =
-  | { kind: "items"; items: Item[] }
+  | { kind: "items"; load: LoadedItems }
   | { kind: "unavailable"; reason: LoadUnavailableReason };
 
-// How a mouse gesture changes selection. Keyboard uses `focusDelta`/`clearSelection`.
 export type SelectMode = "plain" | "range" | "toggle";
 
-// A saved browsing position: the Focused Item, the Selected Items, and the
-// scroll offset, all keyed by path so they survive re-listing a Location.
 export interface HistoryEntry {
   location: Location;
   focusedPath: string | null;
@@ -37,37 +50,28 @@ export interface HistoryEntry {
   scrollTop: number;
 }
 
-// Single implicit Tab for chunk A/B, shaped so chunk C can lift it into many Tabs.
 export interface BrowseState {
   location: Location;
   load: LoadState;
-  // Exactly one Focused Item; `anchorIndex` is the fixed end of a range selection.
   focusedIndex: number;
+  focusedPath: string | null;
   anchorIndex: number;
-  // Selected Items as a set of row indices. Empty only for an empty Location.
   selected: ReadonlySet<number>;
+  // Paths survive outside the metadata window, so operations and history still address the
+  // exact Selected Items after their rows have scrolled out of WebContent memory.
+  selectedPaths: ReadonlyMap<number, string>;
   history: HistoryEntry[];
   future: HistoryEntry[];
-  // Saved scroll offset of this view, retained across Tab switches. The live
-  // offset lives in the table; this is snapshotted when the Tab is deactivated.
   scrollTop: number;
-  // Scroll offset to apply after a restore listing; `scrollGeneration` bumps once
-  // per landed listing (or Tab reactivation) so the table re-applies it exactly once.
   pendingScrollTop: number;
   scrollGeneration: number;
 }
 
-// enter: new navigation into a Location. back/forward: history stack moves.
-// replace: the initial load, which records no history. reset: like replace but
-// also drops both stacks (returning a Pinned Tab to its Anchor).
 export type NavKind = "enter" | "back" | "forward" | "replace" | "reset";
 
 export type BrowseAction =
   | { type: "focusDelta"; delta: number; extend: boolean }
-  // Move the Focused Item to a specific row without touching the Selected Items — used to
-  // keep the Focused Item in sync with Quick Look navigation while preserving the original
-  // selection on close (SPEC §9).
-  | { type: "refocus"; index: number }
+  | { type: "refocus"; index: number; path: string }
   | { type: "select"; index: number; mode: SelectMode }
   | { type: "clearSelection" }
   | {
@@ -76,26 +80,28 @@ export type BrowseAction =
       result: LoadResult;
       nav: NavKind;
       originScrollTop: number;
-      // A specific path to focus on arrival (a file Reveal focuses its target,
-      // §6); null lets history restore or the first row take focus.
       focusPath: string | null;
     }
-  // Background re-list of the current Location (Tab switch, §11 revalidation):
-  // items are replaced but the Focused Item never moves and history/scroll stand.
   | {
       type: "revalidated";
       location: Location;
-      items: Item[];
-      // A progressive large-directory completion can still need to land on the file that
-      // Search Reveal requested but which was outside the initial prefix. Null preserves
-      // the current focused/selected paths during ordinary background revalidation.
+      load: LoadedItems;
       focusPath: string | null;
     }
-  // Append the next page of Recents onto the current view (progressive scroll, §7).
+  | {
+      type: "windowLoaded";
+      sessionId: ListingSessionId;
+      items: Item[];
+      offset: number;
+      total: number;
+    }
+  | {
+      type: "selectionPathsResolved";
+      sessionId: ListingSessionId;
+      selected: ResolvedPath[];
+    }
   | { type: "recentsAppended"; items: Item[] }
-  // Snapshot the live scroll offset into the Tab (on deactivation).
   | { type: "saveScroll"; top: number }
-  // Reapply the saved scroll offset without a new listing (Tab reactivation).
   | { type: "restoreScroll" }
   | { type: "failed"; location: Location; error: ListErrorPayload };
 
@@ -103,8 +109,10 @@ export const initialBrowseState: BrowseState = {
   location: directoryLocation(""),
   load: { status: "loading" },
   focusedIndex: 0,
+  focusedPath: null,
   anchorIndex: 0,
   selected: new Set<number>(),
+  selectedPaths: new Map<number, string>(),
   history: [],
   future: [],
   scrollTop: 0,
@@ -132,72 +140,97 @@ function rangeSet(a: number, b: number): Set<number> {
   return set;
 }
 
-function focusedPathOf(state: BrowseState): string | null {
-  if (state.load.status !== "ready") {
-    return null;
-  }
-  return state.load.items[state.focusedIndex]?.path ?? null;
+export function itemAt(load: ReadyLoadState, index: number): Item | undefined {
+  return load.items[index - load.offset];
 }
 
-function selectedPathsOf(state: BrowseState): string[] {
-  if (state.load.status !== "ready") {
-    return [];
-  }
-  const items = state.load.items;
+function itemAtLoaded(load: LoadedItems, index: number): Item | undefined {
+  return load.items[index - load.offset];
+}
+
+export function focusedItemOf(state: BrowseState): Item | undefined {
+  return state.load.status === "ready"
+    ? itemAt(state.load, state.focusedIndex)
+    : undefined;
+}
+
+export function selectedPathsOf(state: BrowseState): string[] {
   const paths: string[] = [];
-  for (const index of state.selected) {
-    const item = items[index];
-    if (item !== undefined) {
-      paths.push(item.path);
+  const indices = [...state.selected].sort((a, b) => a - b);
+  for (const index of indices) {
+    const path = state.selectedPaths.get(index);
+    if (path !== undefined) {
+      paths.push(path);
     }
   }
   return paths;
 }
 
-// True when Selected Items holds more than the bare focused row — the case in
-// which Escape collapses selection instead of hiding the window (§5).
-export function hasSelectionBeyondFocus(state: BrowseState): boolean {
-  if (state.load.status !== "ready") {
-    return false;
-  }
-  const selected = state.selected;
-  if (selected.size === 0) {
-    return false;
-  }
-  if (selected.size === 1 && selected.has(state.focusedIndex)) {
-    return false;
-  }
-  return true;
-}
-
-// Resolve a saved position (or a fresh entry) against the freshly listed items.
-function positionFor(
-  restore: HistoryEntry | null,
-  items: Item[],
-): { focusedIndex: number; selected: Set<number>; scrollTop: number } {
-  const focusPath = restore?.focusedPath ?? null;
-  const focusedIndex =
-    focusPath === null
-      ? 0
-      : Math.max(
-          0,
-          items.findIndex((item) => item.path === focusPath),
-        );
-  const selected = new Set<number>();
-  if (restore !== null) {
-    for (const path of restore.selectedPaths) {
-      const index = items.findIndex((item) => item.path === path);
-      if (index >= 0) {
-        selected.add(index);
-      }
+function pathsForSelection(
+  state: BrowseState,
+  selected: ReadonlySet<number>,
+): Map<number, string> {
+  const paths = new Map<number, string>();
+  for (const index of selected) {
+    const path =
+      state.selectedPaths.get(index) ??
+      (state.load.status === "ready" ? itemAt(state.load, index)?.path : undefined);
+    if (path !== undefined) {
+      paths.set(index, path);
     }
   }
-  // A fresh Location (or one whose saved selection vanished) collapses onto the
-  // Focused Item so there is always at least the bare focused row.
-  if (selected.size === 0 && items.length > 0) {
-    selected.add(focusedIndex);
+  return paths;
+}
+
+export function hasSelectionBeyondFocus(state: BrowseState): boolean {
+  if (state.load.status !== "ready" || state.selected.size === 0) {
+    return false;
   }
-  return { focusedIndex, selected, scrollTop: restore?.scrollTop ?? 0 };
+  return !(state.selected.size === 1 && state.selected.has(state.focusedIndex));
+}
+
+interface Position {
+  focusedIndex: number;
+  focusedPath: string | null;
+  selected: Set<number>;
+  selectedPaths: Map<number, string>;
+  scrollTop: number;
+}
+
+function positionFor(restore: HistoryEntry | null, load: LoadedItems): Position {
+  const requestedFocusPath = restore?.focusedPath ?? null;
+  const localFocusIndex =
+    requestedFocusPath === null
+      ? -1
+      : load.items.findIndex((item) => item.path === requestedFocusPath);
+  const focusedIndex =
+    load.focusIndex ?? (localFocusIndex >= 0 ? load.offset + localFocusIndex : 0);
+  const localFocused = itemAtLoaded(load, focusedIndex);
+  const focusedPath =
+    load.focusIndex !== null && requestedFocusPath !== null
+      ? requestedFocusPath
+      : (localFocused?.path ?? null);
+
+  const selected = new Set<number>();
+  const selectedPaths = new Map<number, string>();
+  for (const resolved of load.selected) {
+    selected.add(resolved.index);
+    selectedPaths.set(resolved.index, resolved.path);
+  }
+  if (selected.size === 0 && load.total > 0) {
+    selected.add(focusedIndex);
+    const path = focusedPath ?? localFocused?.path;
+    if (path !== undefined) {
+      selectedPaths.set(focusedIndex, path);
+    }
+  }
+  return {
+    focusedIndex,
+    focusedPath,
+    selected,
+    selectedPaths,
+    scrollTop: restore?.scrollTop ?? 0,
+  };
 }
 
 function applySelect(
@@ -205,39 +238,53 @@ function applySelect(
   rawIndex: number,
   mode: SelectMode,
 ): BrowseState {
-  if (state.load.status !== "ready") {
+  if (state.load.status !== "ready" || state.load.total === 0) {
     return state;
   }
-  const count = state.load.items.length;
-  if (count === 0) {
+  const index = clamp(rawIndex, 0, state.load.total - 1);
+  const item = itemAt(state.load, index);
+  if (item === undefined) {
     return state;
   }
-  const index = clamp(rawIndex, 0, count - 1);
   switch (mode) {
     case "plain":
-      // A plain click focuses the row and collapses selection onto it.
       return {
         ...state,
         focusedIndex: index,
+        focusedPath: item.path,
         anchorIndex: index,
         selected: new Set<number>([index]),
+        selectedPaths: new Map<number, string>([[index, item.path]]),
       };
-    case "range":
-      // Shift+Click extends the range from the fixed anchor to the click.
+    case "range": {
+      const selected = rangeSet(state.anchorIndex, index);
       return {
         ...state,
         focusedIndex: index,
-        selected: rangeSet(state.anchorIndex, index),
+        focusedPath: item.path,
+        selected,
+        selectedPaths: pathsForSelection(state, selected),
       };
+    }
     case "toggle": {
-      // Cmd+Click flips one row and re-anchors on it.
       const selected = new Set<number>(state.selected);
       if (selected.has(index)) {
         selected.delete(index);
       } else {
         selected.add(index);
       }
-      return { ...state, focusedIndex: index, anchorIndex: index, selected };
+      const selectedPaths = pathsForSelection(state, selected);
+      if (selected.has(index)) {
+        selectedPaths.set(index, item.path);
+      }
+      return {
+        ...state,
+        focusedIndex: index,
+        focusedPath: item.path,
+        anchorIndex: index,
+        selected,
+        selectedPaths,
+      };
     }
   }
 }
@@ -248,61 +295,70 @@ export function browseReducer(
 ): BrowseState {
   switch (action.type) {
     case "focusDelta": {
-      if (state.load.status !== "ready") {
+      if (state.load.status !== "ready" || state.load.total === 0) {
         return state;
       }
-      const count = state.load.items.length;
-      if (count === 0) {
+      const next = clamp(
+        state.focusedIndex + action.delta,
+        0,
+        state.load.total - 1,
+      );
+      const item = itemAt(state.load, next);
+      if (item === undefined) {
         return state;
       }
-      const next = clamp(state.focusedIndex + action.delta, 0, count - 1);
       if (action.extend) {
-        // Shift+arrows extend the range from the fixed anchor to the new focus.
+        const selected = rangeSet(state.anchorIndex, next);
+        const selectedPaths = pathsForSelection(state, selected);
+        selectedPaths.set(next, item.path);
         return {
           ...state,
           focusedIndex: next,
-          selected: rangeSet(state.anchorIndex, next),
+          focusedPath: item.path,
+          selected,
+          selectedPaths,
         };
       }
-      // Plain arrows collapse selection onto the focused row and reset the anchor.
       return {
         ...state,
         focusedIndex: next,
+        focusedPath: item.path,
         anchorIndex: next,
         selected: new Set<number>([next]),
+        selectedPaths: new Map<number, string>([[next, item.path]]),
       };
     }
     case "refocus": {
-      if (state.load.status !== "ready") {
+      if (state.load.status !== "ready" || state.load.total === 0) {
         return state;
       }
-      const count = state.load.items.length;
-      if (count === 0) {
-        return state;
-      }
-      const index = clamp(action.index, 0, count - 1);
-      // Focus (and the range anchor) move to the row; the Selected Items stand, so closing
-      // Quick Look restores the original selection with the Focused Item on the last file.
-      return { ...state, focusedIndex: index, anchorIndex: index };
+      const index = clamp(action.index, 0, state.load.total - 1);
+      return {
+        ...state,
+        focusedIndex: index,
+        focusedPath: action.path,
+        anchorIndex: index,
+      };
     }
     case "select":
       return applySelect(state, action.index, action.mode);
     case "clearSelection": {
-      if (state.load.status !== "ready") {
+      if (state.load.status !== "ready" || state.focusedPath === null) {
         return state;
       }
       return {
         ...state,
         anchorIndex: state.focusedIndex,
         selected: new Set<number>([state.focusedIndex]),
+        selectedPaths: new Map<number, string>([
+          [state.focusedIndex, state.focusedPath],
+        ]),
       };
     }
     case "listed": {
-      const items =
-        action.result.kind === "items" ? action.result.items : [];
       const outgoing: HistoryEntry = {
         location: state.location,
-        focusedPath: focusedPathOf(state),
+        focusedPath: state.focusedPath,
         selectedPaths: selectedPathsOf(state),
         scrollTop: action.originScrollTop,
       };
@@ -311,7 +367,6 @@ export function browseReducer(
       let restore: HistoryEntry | null = null;
       switch (action.nav) {
         case "enter":
-          // A new navigation records the origin and drops any redo path.
           history = [...state.history, outgoing];
           future = [];
           break;
@@ -328,34 +383,50 @@ export function browseReducer(
         case "replace":
           break;
         case "reset":
-          // Returning a Pinned Tab to its Anchor: no history in either direction.
           history = [];
           future = [];
           break;
       }
-      // A Reveal target overrides history restoration: focus (and select) it.
-      const position =
-        action.focusPath !== null
-          ? positionFor(
-              {
-                location: action.location,
-                focusedPath: action.focusPath,
-                selectedPaths: [action.focusPath],
-                scrollTop: 0,
-              },
-              items,
-            )
-          : positionFor(restore, items);
-      const load: LoadState =
-        action.result.kind === "items"
-          ? { status: "ready", items }
-          : { status: "unavailable", reason: action.result.reason };
+      if (action.result.kind === "unavailable") {
+        return {
+          location: action.location,
+          load: { status: "unavailable", reason: action.result.reason },
+          focusedIndex: 0,
+          focusedPath: null,
+          anchorIndex: 0,
+          selected: new Set<number>(),
+          selectedPaths: new Map<number, string>(),
+          history,
+          future,
+          scrollTop: 0,
+          pendingScrollTop: 0,
+          scrollGeneration: state.scrollGeneration + 1,
+        };
+      }
+      const requestedRestore: HistoryEntry | null =
+        action.focusPath === null
+          ? restore
+          : {
+              location: action.location,
+              focusedPath: action.focusPath,
+              selectedPaths: [action.focusPath],
+              scrollTop: 0,
+            };
+      const position = positionFor(requestedRestore, action.result.load);
       return {
         location: action.location,
-        load,
+        load: {
+          status: "ready",
+          items: action.result.load.items,
+          offset: action.result.load.offset,
+          total: action.result.load.total,
+          sessionId: action.result.load.sessionId,
+        },
         focusedIndex: position.focusedIndex,
+        focusedPath: position.focusedPath,
         anchorIndex: position.focusedIndex,
         selected: position.selected,
+        selectedPaths: position.selectedPaths,
         history,
         future,
         scrollTop: position.scrollTop,
@@ -364,20 +435,17 @@ export function browseReducer(
       };
     }
     case "revalidated": {
-      // A stale background result for a Location we have since left is dropped.
       if (
         state.load.status !== "ready" ||
         !locationEquals(action.location, state.location)
       ) {
         return state;
       }
-      // Re-resolve the Focused and Selected Items by path so the focused row
-      // keeps its identity even as indices shift; scroll and history untouched.
       const restore: HistoryEntry =
         action.focusPath === null
           ? {
               location: state.location,
-              focusedPath: focusedPathOf(state),
+              focusedPath: state.focusedPath,
               selectedPaths: selectedPathsOf(state),
               scrollTop: state.scrollTop,
             }
@@ -387,20 +455,61 @@ export function browseReducer(
               selectedPaths: [action.focusPath],
               scrollTop: 0,
             };
-      const position = positionFor(restore, action.items);
+      const position = positionFor(restore, action.load);
       return {
         ...state,
-        load: { status: "ready", items: action.items },
+        load: {
+          status: "ready",
+          items: action.load.items,
+          offset: action.load.offset,
+          total: action.load.total,
+          sessionId: action.load.sessionId,
+        },
         focusedIndex: position.focusedIndex,
+        focusedPath: position.focusedPath,
         anchorIndex: position.focusedIndex,
         selected: position.selected,
+        selectedPaths: position.selectedPaths,
       };
     }
+    case "windowLoaded":
+      if (
+        state.load.status !== "ready" ||
+        state.load.sessionId !== action.sessionId
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        load: {
+          status: "ready",
+          items: action.items,
+          offset: action.offset,
+          total: action.total,
+          sessionId: action.sessionId,
+        },
+      };
+    case "selectionPathsResolved": {
+      if (
+        state.load.status !== "ready" ||
+        state.load.sessionId !== action.sessionId
+      ) {
+        return state;
+      }
+      const selectedPaths = new Map(state.selectedPaths);
+      for (const resolved of action.selected) {
+        if (state.selected.has(resolved.index)) {
+          selectedPaths.set(resolved.index, resolved.path);
+        }
+      }
+      return { ...state, selectedPaths };
+    }
     case "recentsAppended": {
-      // Append the next Recents page onto the current view without disturbing the
-      // Focused Item, selection, or scroll (indices are stable — rows only grow at the
-      // end). Guarded to the Recents view so a stale page can never land elsewhere (§7).
-      if (state.load.status !== "ready" || state.location.kind !== "recents") {
+      if (
+        state.load.status !== "ready" ||
+        state.location.kind !== "recents" ||
+        state.load.sessionId !== null
+      ) {
         return state;
       }
       const seen = new Set(state.load.items.map((item) => item.path));
@@ -408,9 +517,10 @@ export function browseReducer(
       if (fresh.length === 0) {
         return state;
       }
+      const items = [...state.load.items, ...fresh];
       return {
         ...state,
-        load: { status: "ready", items: [...state.load.items, ...fresh] },
+        load: { ...state.load, items, total: items.length },
       };
     }
     case "saveScroll":
@@ -422,7 +532,6 @@ export function browseReducer(
         scrollGeneration: state.scrollGeneration + 1,
       };
     case "failed":
-      // A failed navigation from a working view leaves that view intact.
       if (state.load.status === "ready") {
         return state;
       }
