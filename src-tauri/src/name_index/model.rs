@@ -392,17 +392,27 @@ impl MappedBase {
     }
 
     fn node_record(&self, id: usize) -> Option<&[u8]> {
+        if id >= self.node_count {
+            return None;
+        }
         let start = self
             .node_start
             .checked_add(id.checked_mul(NODE_RECORD_LEN)?)?;
-        self.mapping.bytes().get(start..start + NODE_RECORD_LEN)
+        self.mapping
+            .bytes()
+            .get(start..start.checked_add(NODE_RECORD_LEN)?)
     }
 
     fn entry_record(&self, slot: usize) -> Option<&[u8]> {
+        if slot >= self.entry_count {
+            return None;
+        }
         let start = self
             .entry_start
             .checked_add(slot.checked_mul(ENTRY_RECORD_LEN)?)?;
-        self.mapping.bytes().get(start..start + ENTRY_RECORD_LEN)
+        self.mapping
+            .bytes()
+            .get(start..start.checked_add(ENTRY_RECORD_LEN)?)
     }
 
     fn arena_name(&self, offset: usize, len: usize) -> Option<&str> {
@@ -757,6 +767,7 @@ impl IndexData {
         dirs
     }
 
+    #[cfg(test)]
     pub fn has_child(&self, parent: DirId, name: &str) -> bool {
         self.child_slot(parent, name).is_some()
     }
@@ -821,6 +832,7 @@ impl IndexData {
         });
     }
 
+    #[cfg(test)]
     pub fn add_dir(&mut self, parent: DirId, name: &str, tier: Tier, mtime_ms: i64) -> DirId {
         if let Some(existing) = self.child_dir(parent, name) {
             self.set_node_mtime(existing, mtime_ms);
@@ -860,18 +872,22 @@ impl IndexData {
     }
 
     pub fn remove_child(&mut self, parent: DirId, name: &str) -> bool {
-        let Some(slot) = self.child_slot(parent, name) else {
-            return false;
-        };
-        self.remove_slot(slot as usize)
+        self.remove_child_count(parent, name) > 0
     }
 
-    fn remove_slot(&mut self, slot: usize) -> bool {
+    pub(crate) fn remove_child_count(&mut self, parent: DirId, name: &str) -> usize {
+        let Some(slot) = self.child_slot(parent, name) else {
+            return 0;
+        };
+        self.remove_slot_count(slot as usize)
+    }
+
+    fn remove_slot_count(&mut self, slot: usize) -> usize {
         let Some(entry) = self.entry(slot) else {
-            return false;
+            return 0;
         };
         if !entry.is_directory {
-            return self.remove_slot_shallow(slot);
+            return usize::from(self.remove_slot_shallow(slot));
         }
         let dir_id = entry.dir_id;
         let has_base_children = self
@@ -885,9 +901,9 @@ impl IndexData {
                 .any(|child| self.entry(*child as usize).is_some())
         });
         if !has_base_children && !has_overlay_children {
-            return self.remove_slot_shallow(slot);
+            return usize::from(self.remove_slot_shallow(slot));
         }
-        self.remove_slots(vec![slot as u32]) > 0
+        self.remove_slots(vec![slot as u32])
     }
 
     pub fn clear_children(&mut self, dir_id: DirId) {
@@ -899,26 +915,15 @@ impl IndexData {
     /// real v4 index previously recursed through `remove_slot`/`clear_children` 10,102 times,
     /// retained every sibling buffer on that stack, and then aborted on the stack guard.
     fn remove_slots(&mut self, roots: Vec<u32>) -> usize {
-        fn enqueue_once(slot: u32, seen: &mut [u64], pending: &mut Vec<u32>) {
-            let slot = slot as usize;
-            let Some(word) = seen.get_mut(slot / 64) else {
-                return;
-            };
-            let bit = 1u64 << (slot % 64);
-            if *word & bit == 0 {
-                *word |= bit;
-                pending.push(slot as u32);
-            }
-        }
-
         if roots.is_empty() {
             return 0;
         }
-        let mut pending = Vec::new();
-        let mut seen = vec![0u64; self.slot_len().div_ceil(64)];
-        for slot in roots {
-            enqueue_once(slot, &mut seen, &mut pending);
-        }
+        // Every live Item has one parent, and validated v4 directory links form a tree.
+        // Roots from `clear_children` are siblings, so their subtrees cannot overlap. A
+        // global `seen` bitset used to zero one bit per slot in the entire 5M-Item index for
+        // every small directory removed by an FSEvents batch. Walking the pending subtree
+        // directly keeps both CPU and scratch memory proportional to the removal itself.
+        let mut pending = roots;
         let mut removed = 0usize;
 
         while let Some(slot) = pending.pop() {
@@ -933,7 +938,7 @@ impl IndexData {
                     .and_then(|base| base.direct_slots(dir_id))
                 {
                     for child in range.filter(|child| !self.base_removed(*child)) {
-                        enqueue_once(child as u32, &mut seen, &mut pending);
+                        pending.push(child as u32);
                     }
                 }
                 if let Some(added) = self.added_by_parent.remove(&dir_id) {
@@ -941,7 +946,7 @@ impl IndexData {
                         .into_iter()
                         .filter(|child| self.entry(*child as usize).is_some())
                     {
-                        enqueue_once(child, &mut seen, &mut pending);
+                        pending.push(child);
                     }
                 }
             }

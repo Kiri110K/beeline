@@ -148,6 +148,7 @@ impl NameIndex {
             root.clone(),
             junk.clone(),
             Some(junk_refresh.clone()),
+            Some(app.clone()),
             watcher_start_rx,
         );
 
@@ -668,6 +669,69 @@ mod tests {
     }
 
     #[test]
+    fn incremental_rename_recreate_and_type_changes_replace_old_entries() {
+        let dir = TempDir::new();
+        let path = dir.path().join("changing");
+        touch(&path);
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+
+        fs::remove_file(&path).unwrap();
+        touch(&path.join("inside.txt"));
+        let to_directory = {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &path, &junk)
+        };
+        assert_eq!(to_directory.added, 2);
+        assert_eq!(to_directory.removed, 1);
+        assert!(to_directory.indexed_subtree);
+        assert!(shared.read().unwrap().resolve_dir(&path).is_some());
+        assert_eq!(tier_of(&shared, "inside.txt"), Some("normal"));
+
+        fs::remove_dir_all(&path).unwrap();
+        touch(&path);
+        let to_file = {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &path, &junk)
+        };
+        assert_eq!(to_file.added, 1);
+        assert_eq!(to_file.removed, 2);
+        assert!(!to_file.indexed_subtree);
+        let index = shared.read().unwrap();
+        assert!(index.resolve_dir(&path).is_none());
+        assert!(index.has_child(0, "changing"));
+        drop(index);
+
+        let renamed = dir.path().join("renamed");
+        fs::rename(&path, &renamed).unwrap();
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &renamed, &junk);
+            crawl::apply_fs_event(&mut index, &path, &junk);
+        }
+        let index = shared.read().unwrap();
+        assert!(!index.has_child(0, "changing"));
+        assert!(index.has_child(0, "renamed"));
+        drop(index);
+
+        fs::remove_file(&renamed).unwrap();
+        {
+            let mut index = shared.write().unwrap();
+            assert_eq!(
+                crawl::apply_fs_event(&mut index, &renamed, &junk).removed,
+                1
+            );
+        }
+        touch(&renamed);
+        {
+            let mut index = shared.write().unwrap();
+            assert_eq!(crawl::apply_fs_event(&mut index, &renamed, &junk).added, 1);
+        }
+        assert!(shared.read().unwrap().has_child(0, "renamed"));
+    }
+
+    #[test]
     fn dir_event_on_existing_dir_does_not_duplicate() {
         // Regression: a directory FSEvent must reconcile direct children, not re-index the
         // subtree — two events on an unchanged dir leave the entry count untouched.
@@ -774,7 +838,7 @@ mod tests {
         }
 
         assert_eq!(index.len(), 20_000);
-        assert!(index.remove_child(0, "level-0"));
+        assert_eq!(index.remove_child_count(0, "level-0"), 20_000);
         assert_eq!(index.len(), 0);
         assert!(index.child_dirs(0).is_empty());
     }
@@ -867,7 +931,7 @@ mod tests {
         persist::save(&shared, &file).unwrap();
 
         let mut loaded = persist::load(&file, dir.path()).unwrap();
-        assert!(loaded.remove_child(0, "docs"));
+        assert_eq!(loaded.remove_child_count(0, "docs"), 3);
         assert_eq!(loaded.len(), 0);
         assert!(loaded.node(docs).is_none());
         assert!(loaded.child_dirs(0).is_empty());
@@ -877,6 +941,69 @@ mod tests {
         let reloaded = persist::load(&file, dir.path()).unwrap();
         assert_eq!(reloaded.len(), 0);
         assert!(reloaded.child_dirs(0).is_empty());
+    }
+
+    #[test]
+    fn mapped_base_does_not_expose_records_as_overlay_children() {
+        let dir = TempDir::new();
+        let file = dir.path().join("mapped-overlay.idx");
+        let shared = new_index(dir.path());
+        {
+            let mut index = shared.write().unwrap();
+            let base = index.add_dir(0, "base", model::Tier::Normal, 10);
+            index.add_file(base, "anchor.txt", model::Tier::Normal);
+            index.add_file(0, "root.txt", model::Tier::Normal);
+        }
+        persist::save(&shared, &file).unwrap();
+
+        let mut loaded = persist::load(&file, dir.path()).unwrap();
+        let overlay = loaded.add_dir_known_absent(0, "overlay", model::Tier::Normal, 20);
+        loaded.add_file(overlay, "only-child.txt", model::Tier::Normal);
+
+        assert_eq!(
+            loaded.direct_children(overlay),
+            vec![("only-child.txt".to_owned(), false)]
+        );
+        assert_eq!(loaded.remove_child_count(overlay, "only-child.txt"), 1);
+        assert!(loaded.direct_children(overlay).is_empty());
+        assert!(loaded.has_child(0, "base"));
+        assert!(loaded.has_child(0, "root.txt"));
+        assert!(loaded.has_child(0, "overlay"));
+    }
+
+    #[test]
+    fn mapped_incremental_parent_then_child_events_do_not_remove_other_entries() {
+        let dir = TempDir::new();
+        let file = dir.path().join("mapped-event-order.idx");
+        let shared = new_index(dir.path());
+        {
+            let mut index = shared.write().unwrap();
+            let base = index.add_dir(0, "base", model::Tier::Normal, 10);
+            index.add_file(base, "anchor.txt", model::Tier::Normal);
+        }
+        persist::save(&shared, &file).unwrap();
+
+        let fresh = dir.path().join("fresh");
+        touch(&fresh.join("dir-000/file-00.txt"));
+        let junk = JunkPatterns::default();
+        let mut loaded = persist::load(&file, dir.path()).unwrap();
+        let before = loaded.len();
+
+        let parent_stats = crawl::apply_fs_event(&mut loaded, &fresh, &junk);
+        assert_eq!(parent_stats.added, 3);
+        assert_eq!(parent_stats.removed, 0);
+        assert!(parent_stats.indexed_subtree);
+        let after_parent = loaded.len();
+        assert_eq!(after_parent, before + 3);
+
+        let child_stats = crawl::apply_fs_event(&mut loaded, &fresh.join("dir-000"), &junk);
+        assert_eq!(child_stats, crawl::FsApplyStats::default());
+        assert_eq!(loaded.len(), after_parent);
+        assert!(loaded.has_child(0, "base"));
+        assert!(loaded.resolve_dir(&fresh.join("dir-000")).is_some());
+        assert!(loaded
+            .resolve_dir(&fresh.join("dir-000"))
+            .is_some_and(|dir_id| loaded.has_child(dir_id, "file-00.txt")));
     }
 
     #[test]
@@ -1004,7 +1131,8 @@ mod tests {
         persist::save(&shared, &mapped_dir.path().join("watcher-v4.idx"))
             .expect("start watcher from mapped v4 base");
         let (start_tx, start_rx) = mpsc::channel();
-        let ready = watcher::spawn_deferred(shared.clone(), root.clone(), junk, None, start_rx);
+        let ready =
+            watcher::spawn_deferred(shared.clone(), root.clone(), junk, None, None, start_rx);
         ready
             .recv_timeout(Duration::from_secs(5))
             .expect("FSEvents watcher did not become ready");
@@ -1205,6 +1333,40 @@ mod tests {
     // the synthetic 5M benchmark below: its regular tree catches algorithmic regressions,
     // while the live index exposes costs caused by the reference machine's real name, path,
     // depth, and tier distribution (#31).
+    #[test]
+    #[ignore]
+    fn live_mapped_subtree_removal_timing() {
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let target = std::env::var_os("BEELINE_LIVE_REMOVAL")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_REMOVAL to an indexed subtree; disk is not changed");
+
+        let mut index = persist::load(&index_path, &root).expect("load live persisted index");
+        let parent_path = target.parent().expect("removal target needs a parent");
+        let parent = index
+            .resolve_dir(parent_path)
+            .expect("removal parent must be indexed");
+        let name = target
+            .file_name()
+            .expect("removal target needs a name")
+            .to_string_lossy();
+        let started = Instant::now();
+        let removed = index.remove_child_count(parent, &name);
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        assert!(removed > 0, "removal target must be indexed");
+        assert!(!index.has_child(parent, &name));
+        println!(
+            "live mapped subtree removal: {removed} slots in {duration_ms:.2} ms from {} total slots",
+            index.slot_len()
+        );
+    }
+
     #[test]
     #[ignore]
     fn live_rebuild_v4_from_filesystem() {

@@ -72,13 +72,27 @@ struct ChildInfo {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FsApplyStats {
+    pub added: usize,
+    pub removed: usize,
+    /// The event inserted this path as a fresh directory and crawled its whole subtree.
+    /// Later descendant paths from the same FSEvents burst are therefore redundant.
+    pub indexed_subtree: bool,
+}
+
+impl FsApplyStats {
+    fn combine(&mut self, other: Self) {
+        self.added += other.added;
+        self.removed += other.removed;
+    }
+}
+
 /// Read one directory's direct children off disk (no lock held). Symlinks are
 /// recorded as non-directory entries and never descended, which avoids cycles.
-fn read_children(path: &Path, root: &Path, junk: &JunkPatterns) -> Vec<ChildInfo> {
+fn read_children(path: &Path, root: &Path, junk: &JunkPatterns) -> std::io::Result<Vec<ChildInfo>> {
     let mut children = Vec::new();
-    let Ok(read_dir) = fs::read_dir(path) else {
-        return children;
-    };
+    let read_dir = fs::read_dir(path)?;
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let child_path = entry.path();
@@ -103,7 +117,7 @@ fn read_children(path: &Path, root: &Path, junk: &JunkPatterns) -> Vec<ChildInfo
             path: child_path,
         });
     }
-    children
+    Ok(children)
 }
 
 /// Breadth-first crawl starting at directory `start` (which must already exist in the
@@ -130,7 +144,9 @@ fn crawl_walk(
     // drains what was deferred (only when `two_phase`).
     loop {
         while let Some((dir_id, dir_path)) = normal.pop_front() {
-            let children = read_children(&dir_path, root, junk);
+            let Ok(children) = read_children(&dir_path, root, junk) else {
+                continue;
+            };
             if children.is_empty() {
                 continue;
             }
@@ -196,53 +212,63 @@ pub fn initial_crawl(
 /// added with an unchecked `add_file`, so running this over an already-populated
 /// directory duplicates its whole subtree. An FSEvent on an existing dir reconciles
 /// direct children instead (see [`reconcile_dir_children`]).
-fn index_subtree_into(data: &mut IndexData, dir_id: DirId, path: &Path, junk: &JunkPatterns) {
+fn index_subtree_into(
+    data: &mut IndexData,
+    dir_id: DirId,
+    path: &Path,
+    junk: &JunkPatterns,
+) -> usize {
     let root = data.root.clone();
-    for child in read_children(path, &root, junk) {
+    let mut added = 0usize;
+    let Ok(children) = read_children(path, &root, junk) else {
+        return 0;
+    };
+    for child in children {
         if child.is_dir {
             let id = data.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
-            index_subtree_into(data, id, &child.path, junk);
+            added += 1 + index_subtree_into(data, id, &child.path, junk);
         } else {
             data.add_file(dir_id, &child.name, child.tier);
+            added += 1;
         }
     }
+    added
 }
 
 /// Apply a single filesystem change at `path` to the index. Junk paths are not
 /// rescanned; the containing directory is marked dirty for a later lazy refresh
 /// (SPEC §6). Non-Junk changes are applied immediately.
-pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
+pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) -> FsApplyStats {
     if path == data.root {
         let root = data.root.clone();
         let mtime = fs::metadata(path)
             .map(|metadata| mtime_ms(&metadata))
             .unwrap_or(0);
-        reconcile_dir_children(data, 0, &root, mtime, junk);
-        return;
+        return reconcile_dir_children(data, 0, &root, mtime, junk);
     }
     let Ok(relative) = path.strip_prefix(&data.root) else {
-        return;
+        return FsApplyStats::default();
     };
     let tier = junk.classify(relative);
     let Some(parent_path) = path.parent() else {
-        return;
+        return FsApplyStats::default();
     };
 
     if tier == Tier::Junk {
         if let Some(parent) = data.resolve_dir(parent_path) {
             data.junk_dirty.insert(parent);
         }
-        return;
+        return FsApplyStats::default();
     }
 
     let Some(parent) = data.resolve_dir(parent_path) else {
-        return;
+        return FsApplyStats::default();
     };
     let Some(name) = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
     else {
-        return;
+        return FsApplyStats::default();
     };
 
     match fs::symlink_metadata(path) {
@@ -251,20 +277,56 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) {
                 // FSEvents on a dir means its direct children changed. Reconcile an
                 // already-indexed dir in place; re-running index_subtree_into (unchecked
                 // add_file) would duplicate the whole subtree on every event.
-                let existing = data.child_dir(parent, &name);
-                if let Some(dir_id) = existing {
-                    reconcile_dir_children(data, dir_id, path, mtime_ms(&metadata), junk);
-                } else {
-                    let id = data.add_dir(parent, &name, tier, mtime_ms(&metadata));
-                    index_subtree_into(data, id, path, junk);
+                let existing = data.child_slot(parent, &name).and_then(|slot| {
+                    data.entry(slot as usize)
+                        .map(|entry| (entry.is_directory, entry.dir_id))
+                });
+                match existing {
+                    Some((true, dir_id)) => {
+                        reconcile_dir_children(data, dir_id, path, mtime_ms(&metadata), junk)
+                    }
+                    existing => {
+                        let removed = if existing.is_some() {
+                            data.remove_child_count(parent, &name)
+                        } else {
+                            0
+                        };
+                        let id =
+                            data.add_dir_known_absent(parent, &name, tier, mtime_ms(&metadata));
+                        FsApplyStats {
+                            added: 1 + index_subtree_into(data, id, path, junk),
+                            removed,
+                            indexed_subtree: true,
+                        }
+                    }
                 }
-            } else if !data.has_child(parent, &name) {
-                data.add_file(parent, &name, tier);
+            } else {
+                let existing = data
+                    .child_slot(parent, &name)
+                    .and_then(|slot| data.entry(slot as usize).map(|entry| entry.is_directory));
+                match existing {
+                    Some(false) => FsApplyStats::default(),
+                    existing => {
+                        let removed = if existing.is_some() {
+                            data.remove_child_count(parent, &name)
+                        } else {
+                            0
+                        };
+                        data.add_file(parent, &name, tier);
+                        FsApplyStats {
+                            added: 1,
+                            removed,
+                            indexed_subtree: false,
+                        }
+                    }
+                }
             }
         }
-        Err(_) => {
-            data.remove_child(parent, &name);
-        }
+        Err(_) => FsApplyStats {
+            added: 0,
+            removed: data.remove_child_count(parent, &name),
+            indexed_subtree: false,
+        },
     }
 }
 
@@ -280,10 +342,15 @@ fn reconcile_dir_children(
     path: &Path,
     mtime: i64,
     junk: &JunkPatterns,
-) {
+) -> FsApplyStats {
     let root = data.root.clone();
-    let disk = read_children(path, &root, junk);
+    // A transient permission or IO failure is not evidence that the directory became
+    // empty. Keep the indexed children and let a later event or startup diff retry.
+    let Ok(disk) = read_children(path, &root, junk) else {
+        return FsApplyStats::default();
+    };
     let on_disk: HashSet<&str> = disk.iter().map(|child| child.name.as_str()).collect();
+    let mut stats = FsApplyStats::default();
 
     // Drop index children no longer present on disk.
     let indexed: Vec<String> = data
@@ -293,7 +360,7 @@ fn reconcile_dir_children(
         .collect();
     for name in &indexed {
         if !on_disk.contains(name.as_str()) {
-            data.remove_child(dir_id, name);
+            stats.removed += data.remove_child_count(dir_id, name);
         }
     }
 
@@ -310,13 +377,19 @@ fn reconcile_dir_children(
         }
         if child.is_dir {
             let id = data.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
-            index_subtree_into(data, id, &child.path, junk);
+            stats.combine(FsApplyStats {
+                added: 1 + index_subtree_into(data, id, &child.path, junk),
+                removed: 0,
+                indexed_subtree: false,
+            });
         } else {
             data.add_file(dir_id, &child.name, child.tier);
+            stats.added += 1;
         }
     }
 
     data.set_node_mtime(dir_id, mtime);
+    stats
 }
 
 /// Reconcile one directory's direct children with disk: add appeared items, remove
@@ -332,7 +405,10 @@ fn reconcile_dir(
         return;
     };
     let disk_mtime = mtime_ms(&dir_metadata);
-    let disk: HashMap<String, ChildInfo> = read_children(path, root, junk)
+    let Ok(children) = read_children(path, root, junk) else {
+        return;
+    };
+    let disk: HashMap<String, ChildInfo> = children
         .into_iter()
         .map(|child| (child.name.clone(), child))
         .collect();
