@@ -137,7 +137,10 @@ fn crawl_walk(
             let mut index = shared.write().expect("name index lock poisoned");
             for child in children {
                 if child.is_dir {
-                    let id = index.add_dir(dir_id, &child.name, child.tier, child.mtime);
+                    // Every directory reached by crawl_walk is freshly inserted and empty.
+                    // Rechecking all siblings here made wide new subtrees quadratic.
+                    let id =
+                        index.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
                     added += 1;
                     if two_phase && child.tier == Tier::Junk {
                         deferred_junk.push((id, child.path));
@@ -197,7 +200,7 @@ fn index_subtree_into(data: &mut IndexData, dir_id: DirId, path: &Path, junk: &J
     let root = data.root.clone();
     for child in read_children(path, &root, junk) {
         if child.is_dir {
-            let id = data.add_dir(dir_id, &child.name, child.tier, child.mtime);
+            let id = data.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
             index_subtree_into(data, id, &child.path, junk);
         } else {
             data.add_file(dir_id, &child.name, child.tier);
@@ -306,7 +309,7 @@ fn reconcile_dir_children(
             continue;
         }
         if child.is_dir {
-            let id = data.add_dir(dir_id, &child.name, child.tier, child.mtime);
+            let id = data.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
             index_subtree_into(data, id, &child.path, junk);
         } else {
             data.add_file(dir_id, &child.name, child.tier);
@@ -357,7 +360,7 @@ fn reconcile_dir(
                 continue;
             }
             if child.is_dir {
-                let id = index.add_dir(dir_id, &child.name, child.tier, child.mtime);
+                let id = index.add_dir_known_absent(dir_id, &child.name, child.tier, child.mtime);
                 new_subdirs.push((id, child.path.clone()));
             } else {
                 index.add_file(dir_id, &child.name, child.tier);
@@ -385,7 +388,7 @@ pub fn diff_rescan(
     app: Option<&AppHandle>,
 ) {
     let started = Instant::now();
-    diff_rescan_dir(shared, 0, root.clone(), &root, junk);
+    diff_rescan_tree(shared, root, junk);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let entries = shared.read().expect("name index lock poisoned").len();
     record(
@@ -395,37 +398,53 @@ pub fn diff_rescan(
     );
 }
 
-fn diff_rescan_dir(
-    shared: &Arc<RwLock<IndexData>>,
-    dir_id: DirId,
-    path: PathBuf,
-    root: &Path,
-    junk: &JunkPatterns,
-) {
-    let (stored_mtime, tier) = {
-        let index = shared.read().expect("name index lock poisoned");
-        let node = index.node(dir_id).expect("indexed directory node");
-        (node.mtime_ms, node.tier)
-    };
-    if tier == Tier::Junk {
-        return; // Lazy: Junk is refreshed on a targeting query, not on startup.
-    }
-
-    let disk_mtime = fs::metadata(&path).map(|meta| mtime_ms(&meta)).ok();
-    match disk_mtime {
-        Some(disk_mtime) if disk_mtime != stored_mtime => {
-            reconcile_dir(shared, dir_id, &path, root, junk);
+fn diff_rescan_tree(shared: &Arc<RwLock<IndexData>>, root: PathBuf, junk: &JunkPatterns) {
+    fn enqueue_once(dir_id: DirId, seen: &mut Vec<bool>, pending: &mut Vec<DirId>) {
+        let position = dir_id as usize;
+        if position >= seen.len() {
+            seen.resize(position + 1, false);
         }
-        Some(_) => {}
-        None => return, // Directory is gone; its parent's reconcile removes it.
+        if !seen[position] {
+            seen[position] = true;
+            pending.push(dir_id);
+        }
     }
 
-    let children: Vec<(String, DirId)> = {
-        let index = shared.read().expect("name index lock poisoned");
-        index.child_dirs(dir_id)
-    };
-    for (name, id) in children {
-        diff_rescan_dir(shared, id, path.join(name), root, junk);
+    let initial_nodes = shared.read().expect("name index lock poisoned").node_len();
+    let mut seen = vec![false; initial_nodes];
+    let mut pending = Vec::new();
+    enqueue_once(0, &mut seen, &mut pending);
+
+    while let Some(dir_id) = pending.pop() {
+        let current = {
+            let index = shared.read().expect("name index lock poisoned");
+            index
+                .node(dir_id)
+                .map(|node| (node.mtime_ms, node.tier, index.full_path(dir_id)))
+        };
+        let Some((stored_mtime, tier, path)) = current else {
+            continue;
+        };
+        if tier == Tier::Junk {
+            continue; // Lazy: Junk is refreshed on a targeting query, not on startup.
+        }
+
+        let disk_mtime = fs::metadata(&path).map(|meta| mtime_ms(&meta)).ok();
+        match disk_mtime {
+            Some(disk_mtime) if disk_mtime != stored_mtime => {
+                reconcile_dir(shared, dir_id, &path, &root, junk);
+            }
+            Some(_) => {}
+            None => continue, // Directory is gone; its parent's reconcile removes it.
+        }
+
+        let children = shared
+            .read()
+            .expect("name index lock poisoned")
+            .child_dirs(dir_id);
+        for (_, child_id) in children {
+            enqueue_once(child_id, &mut seen, &mut pending);
+        }
     }
 }
 

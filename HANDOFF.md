@@ -17,6 +17,145 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 комментарий-вердикт. Открытый с assignee = был в работе; смотри его
 комментарии и `git log` — что уже закоммичено.
 
+## Пауза на WebContent memory #38 — 25.08, перед обновлением T3 Code
+
+### Зачем
+
+Ограничить память процесса WebContent на Location с десятками тысяч файлов.
+Старый путь держал полный `Item[]` каждой вкладки и на каталоге из 50 000
+файлов доходил до footprint 183.5 MiB и peak 279.7 MiB. Цель тикета #38:
+footprint не выше 120 MiB, рост относительно Recents не выше 64 MiB, первый
+кадр не дольше 150 мс, без поломки скролла, Reveal, Quick Look и восстановления
+вкладки.
+
+### Состояние кода
+
+- Работа стоит на паузе в незакоммиченном дереве `main` на HEAD
+  `71763ebfcc60954e269109e74c6acc49367d965e`. Ничего не пушилось.
+- Изменены `package.json`, `src-tauri/src/lib.rs`,
+  `src-tauri/src/listing.rs`, `src/App.tsx`, `src/browse/state.ts`,
+  `src/components/FileTable.tsx`, `src/location/ipc.ts`,
+  `src/location/schema.ts`, `src/preview/model.ts`,
+  `src/settings/SettingsView.tsx`, `src/tabs/useTabs.ts` и этот хэндоф.
+  Добавлен `scripts/browse-window.test.ts`. Пользовательская `.claude/`
+  была untracked до начала работы и не тронута.
+- Backend теперь создаёт ограниченные по жизни listing sessions с владельцем
+  Tab и поколением запроса. Начальный ответ содержит 64 строки метаданных,
+  общее число строк, `sessionId`, смещение и разрешённые позиции focus/selection.
+- Frontend держит окно до 2048 строк вместо полного списка. Таблица сохраняет
+  полную виртуальную высоту и просит следующее окно с запасом 512 строк.
+- Reveal передаёт путь backend, чтобы получить глобальную позицию. Выделение
+  диапазона разрешает пути через backend. Quick Look использует локальное окно
+  и просит соседа только на его границе; нативной панели передаётся один путь.
+- Повторный листинг той же вкладки инвалидирует старую сессию. Просроченная
+  сессия автоматически приводит к новому листингу.
+
+### Что уже проверено
+
+- Зелёные: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`,
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` и `git diff --check`. В Rust: 83 passed, 6 ignored, 0 failed.
+- Подписанный release-бандл собран в
+  `/Users/kiri110k/lab/beeline/src-tauri/target/release/bundle/macos/Beeline.app`.
+  `/Applications/Beeline.app` не заменялся.
+- GUI-прогон использовал каталог
+  `/private/tmp/beeline-50k-window.xnlpTt` с ровно 50 000 пустых файлов.
+  Все артефакты лежат в
+  `/private/tmp/codex-computer-use.beeline38.Up75tR`.
+- На Recents WebContent имел footprint 57 MB и peak 80 MB. На большом каталоге
+  четыре последовательных замера дали 70, 73, 57 и 102 MB. Максимальный
+  текущий footprint укладывается в 120 MB, а максимальный рост относительно
+  Recents равен 45 MB и укладывается в 64 MB. Peak процесса был 169 MB, но peak
+  не входит в сформулированный порог #38. Сырые данные:
+  `/private/tmp/codex-computer-use.beeline38.Up75tR/memory-recents-baseline-raw.txt`
+  и
+  `/private/tmp/codex-computer-use.beeline38.Up75tR/memory-large-location-samples-raw.txt`.
+- Большой каталог отрисовался в отсортированном порядке. Начальный backend
+  listing вернул 64 из 50 000 строк за 332 мс. Это выше бюджета первого кадра
+  150 мс, но событие `location_first_frame` в телеметрию не попало, поэтому
+  сквозное время пока не измерено. Артефакт:
+  `/private/tmp/codex-computer-use.beeline38.Up75tR/large-tab-first-frame-telemetry.txt`.
+- Автоматизация отправила 460 ArrowDown и затем ещё 70 ArrowDown. Интерфейс
+  оставался отзывчивым, но после прокрутки появилась возможная потеря фокуса
+  или несогласованность строки. Wheel-драйвер также несколько раз не сдвинул
+  список. Это может быть ограничением Computer Use, а может быть ошибкой окна;
+  вердикта нет. Снимки и заметки находятся в каталоге артефактов.
+
+### Cleanup перед паузой
+
+- Исходный файл настроек восстановлен из
+  `/private/tmp/codex-computer-use.beeline38.Up75tR/settings.json.original`.
+  SHA-256 восстановленного файла:
+  `8535f09a97f1a134808a6eeb17fbae9def71fc7ebf87f95da9e13e25b8cfe3d8`.
+- Тестовая сборка с PID 73391 и её WebContent с PID 73412 остановлены.
+- Временный каталог 50 000 файлов оставлен для продолжения. Если `/private/tmp`
+  очистится после перезагрузки, создать его заново с теми же именами
+  `file_00000.txt`…`file_49999.txt`.
+
+### Осталось
+
+- Разобраться, почему сортировка 50 000 имён и первые 64 metadata занимают
+  332 мс, и вернуть сквозное измерение `location_first_frame`.
+- Повторить холодный GUI-прогон и получить устойчивый первый кадр не дольше
+  150 мс.
+- Проверить непрерывный скролл через несколько границ окна без Computer Use
+  bulk-key ambiguity. Отдельно проверить Shift+Click, Reveal, Quick Look через
+  границу окна и восстановление вкладки.
+- Провести ревью незакоммиченного diff. После зелёного GUI-вердикта сделать
+  коммит, push, комментарий с замерами и закрыть #38.
+
+**Первый следующий шаг:** открыть снимки
+`/private/tmp/codex-computer-use.beeline38.Up75tR/after-460-inputs-state.jpg` и
+`/private/tmp/codex-computer-use.beeline38.Up75tR/large-list-after-row-450.jpg`,
+сверить ожидаемую строку с текущим окном и локализовать возможную ошибку
+прокрутки до нового GUI-прогона.
+
+## Возобновление после reboot: Name Index memory runaway — 27.08
+
+- Инцидент после перезагрузки был не артефактом незаконченного WebContent WIP.
+  Установленная сборка отличалась от тестового bundle. Два системных
+  `cpu_resource` report показали main-process Beeline: 7.7–14.8 ГБ footprint,
+  85–89% CPU, горячий стек `diff_rescan → diff_rescan_dir → child_dirs/crawl`.
+- Реальный v4-файл: 5 150 533 Items, 418 194 directory nodes, 309 860 406 байт.
+  Структура и directory links валидны; нового содержимого на диске было лишь
+  около 20 тысяч записей. Причина была алгоритмической, не объёмом изменений.
+- Устранены три runaway-пути: свежие широкие поддеревья больше не делают
+  квадратичный sibling lookup; удаление поддерева теперь итеративное с компактным
+  bitset (реальный recursive path падал после 10 102 `remove_slot/clear_children`
+  frames); startup traversal идёт по компактным directory-node links, а не
+  перечитывает миллионы file Items. Сам diff-rescan стал итеративным с `visited`.
+- Mapped v4 теперь валидирует однозначную связь directory Item ↔ node и хранит
+  tombstones узлов. Добавлены регрессии на 2 000 широких siblings, удаление
+  20 000 уровней без call stack и удаление mapped directory tree с повторным save.
+- Полная startup-compaction существующей v4-базы сознательно отложена: старый
+  mmap и растущий temp-файл дают большой bounded transient даже после потоковой
+  оптимизации. После diff актуальный overlay остаётся authoritative для сессии;
+  следующий запуск повторяет тот же быстрый diff. Первый crawl по-прежнему пишет
+  v4. Телеметрия: `index_persist_deferred`; нужен отдельный bounded incremental
+  compaction follow-up, после чего startup persistence можно вернуть.
+- Два финальных запуска свежего release-бинарника на реальном индексе прошли под
+  fail-closed watchdog, который каждую секунду читает суммарный
+  `ri_phys_footprint` main + новых WebContent и останавливает на 512 МиБ:
+  diff-rescan 940/476 мс, 23 655/23 654 mutations, максимум process tree около
+  100 МБ; после 25 секунд idle стабильно около 81 МБ. Накопления на повторном
+  запуске нет. Артефакты:
+  `/private/tmp/beeline-reboot-fixed23.ymC43C` и
+  `/private/tmp/beeline-reboot-repeat.6Bg5GQ`.
+- Реальные `home.idx` и `settings.json` не заменялись. Их SHA-256 остались
+  `e75427c112786f23fae4d6140dc86619bfc7f315c8d73b3a1b6fecaec4317ab9` и
+  `8535f09a97f1a134808a6eeb17fbae9def71fc7ebf87f95da9e13e25b8cfe3d8`.
+  Все тестовые PID остановлены; `/Applications/Beeline.app` не заменялся.
+- Зелёные: `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`,
+  `cargo test` (86 passed, 6 ignored), `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, `git diff --check`. Release code/bundle собраны, но после
+  reboot в Keychain нет identity `Beeline Dev Signing`, поэтому финальный
+  `tauri build` закономерно падает только на codesign. Для runtime-проверок
+  использовался свежий ad-hoc release binary; установленная копия не тронута.
+
+**Следующее:** оформить GitHub follow-up на bounded incremental compaction,
+закоммитить текущий общий WIP без `.claude/`, затем вернуться к оставшейся
+WebContent/UI-приёмке #38.
+
 ## Состояние после Name Index v4 25.08
 
 - Локально реализован прямой переход Name Index v3→v4 без миграции и обратной

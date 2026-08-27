@@ -166,11 +166,39 @@ impl NameIndex {
                     let entries = data.read().expect("name index lock poisoned").len();
                     record(&app, "index_loaded", json!({ "entries": entries }));
                     crawl::diff_rescan(&data, root, &crawl_junk, Some(&app));
+                    let index = data.read().expect("name index lock poisoned");
+                    // Keep the startup delta in the mutable overlay for this session. A
+                    // full 5M-entry rewrite makes the old mmap and the growing temp file
+                    // resident together; repeating the now-subsecond diff next launch is
+                    // safer until v4 gains bounded incremental compaction.
+                    record(
+                        &app,
+                        "index_persist_deferred",
+                        json!({ "entries": index.len(), "mutations": index.revision }),
+                    );
                 } else {
                     crawl::initial_crawl(&data, root, &crawl_junk, Some(&app));
-                }
-                if let Err(error) = persist::save(&data, &index_file) {
-                    eprintln!("name index persist after crawl failed: {error}");
+                    let persist_started = Instant::now();
+                    match persist::save(&data, &index_file) {
+                        Ok(()) => record(
+                            &app,
+                            "index_persist_finished",
+                            json!({
+                                "duration_ms": u64::try_from(
+                                    persist_started.elapsed().as_millis()
+                                )
+                                .unwrap_or(u64::MAX),
+                            }),
+                        ),
+                        Err(error) => {
+                            record(
+                                &app,
+                                "index_persist_failed",
+                                json!({ "error": error.to_string() }),
+                            );
+                            eprintln!("name index persist after crawl failed: {error}");
+                        }
+                    }
                 }
                 // Applying FSEvents concurrently with the first crawl can discover the same
                 // large subtree twice, hold the write lock for minutes, and starve the first
@@ -638,6 +666,31 @@ mod tests {
     }
 
     #[test]
+    fn wide_new_subtree_is_indexed_once() {
+        let dir = TempDir::new();
+        touch(&dir.path().join("existing.txt"));
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+
+        let index_dir = TempDir::new();
+        let file = index_dir.path().join("wide.idx");
+        persist::save(&shared, &file).unwrap();
+        let mapped = persist::load(&file, dir.path()).unwrap();
+        let shared = Arc::new(RwLock::new(mapped));
+
+        for number in 0..2_000 {
+            fs::create_dir_all(dir.path().join(format!("incoming/dir-{number:04}"))).unwrap();
+        }
+        crawl::diff_rescan(&shared, dir.path().to_path_buf(), &junk, None);
+
+        let index = shared.read().unwrap();
+        let incoming = index.resolve_dir(&dir.path().join("incoming")).unwrap();
+        assert_eq!(index.child_dirs(incoming).len(), 2_000);
+        assert_eq!(index.len(), 2_002);
+    }
+
+    #[test]
     fn dir_event_removes_the_deleted_file() {
         // A file deleted on disk loses its entry on the next event over its parent dir.
         let dir = TempDir::new();
@@ -656,6 +709,27 @@ mod tests {
         }
         assert_eq!(shared.read().unwrap().len(), baseline - 1);
         assert_eq!(tier_of(&shared, "a.txt"), None);
+    }
+
+    #[test]
+    fn removing_a_deep_directory_tree_does_not_use_the_call_stack() {
+        let dir = TempDir::new();
+        let mut index = IndexData::new(dir.path().to_path_buf());
+        let first = index.add_dir_known_absent(0, "level-0", model::Tier::Normal, 0);
+        let mut parent = first;
+        for level in 1..20_000 {
+            parent = index.add_dir_known_absent(
+                parent,
+                &format!("level-{level}"),
+                model::Tier::Normal,
+                0,
+            );
+        }
+
+        assert_eq!(index.len(), 20_000);
+        assert!(index.remove_child(0, "level-0"));
+        assert_eq!(index.len(), 0);
+        assert!(index.child_dirs(0).is_empty());
     }
 
     #[test]
@@ -729,6 +803,33 @@ mod tests {
         assert!(!loaded.has_child(docs, "old.txt"));
         assert!(loaded.has_child(docs, "new.txt"));
         assert_eq!(loaded.node(docs).unwrap().mtime_ms, 99);
+    }
+
+    #[test]
+    fn removing_a_mapped_directory_unlinks_its_node_tree() {
+        let dir = TempDir::new();
+        let file = dir.path().join("mapped-removal.idx");
+        let shared = new_index(dir.path());
+        let docs = {
+            let mut index = shared.write().unwrap();
+            let docs = index.add_dir(0, "docs", model::Tier::Normal, 10);
+            let nested = index.add_dir(docs, "nested", model::Tier::Normal, 20);
+            index.add_file(nested, "old.txt", model::Tier::Normal);
+            docs
+        };
+        persist::save(&shared, &file).unwrap();
+
+        let mut loaded = persist::load(&file, dir.path()).unwrap();
+        assert!(loaded.remove_child(0, "docs"));
+        assert_eq!(loaded.len(), 0);
+        assert!(loaded.node(docs).is_none());
+        assert!(loaded.child_dirs(0).is_empty());
+
+        let shared = Arc::new(RwLock::new(loaded));
+        persist::save(&shared, &file).unwrap();
+        let reloaded = persist::load(&file, dir.path()).unwrap();
+        assert_eq!(reloaded.len(), 0);
+        assert!(reloaded.child_dirs(0).is_empty());
     }
 
     #[test]

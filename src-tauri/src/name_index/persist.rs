@@ -6,7 +6,8 @@
 
 use std::{
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -25,25 +26,49 @@ struct Layout {
     node_name_bytes: usize,
 }
 
+struct PersistedShape {
+    root_len: usize,
+    node_count: usize,
+    entry_count: usize,
+    arena_len: usize,
+}
+
+const F_NOCACHE: i32 = 48;
+
+unsafe extern "C" {
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+}
+
+fn disable_file_cache(file: &File) -> std::io::Result<()> {
+    let result = unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 1) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn build_layout(index: &IndexData) -> std::io::Result<Layout> {
     let mut nodes = vec![0u32];
     let mut node_ranges = Vec::new();
     let mut entries = Vec::with_capacity(index.len());
     let mut dir_mapping = vec![NO_DIR; index.node_len()];
+    let mut entry_name_bytes = 0usize;
     dir_mapping[0] = 0;
     let mut cursor = 0usize;
     while cursor < nodes.len() {
         let dir = nodes[cursor];
-        let mut direct = index.direct_entry_slots(dir);
-        direct.sort_unstable_by(|left, right| {
-            let left = index.entry(*left as usize).expect("live direct entry");
-            let right = index.entry(*right as usize).expect("live direct entry");
-            left.name.as_bytes().cmp(right.name.as_bytes())
-        });
+        // Query ranking has its own total-order tie break, so the on-disk Item order is not
+        // observable. Preserve the existing/overlay order instead of sorting millions of
+        // names every time startup changes a few filesystem entries.
+        let direct = index.direct_entry_slots(dir);
         let first = u32::try_from(entries.len())
             .map_err(|_| std::io::Error::other("Name Index exceeds u32 entries"))?;
         for &slot in &direct {
             let entry = index.entry(slot as usize).expect("live direct entry");
+            entry_name_bytes = entry_name_bytes
+                .checked_add(entry.name.len())
+                .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))?;
             if entry.is_directory && dir_mapping[entry.dir_id as usize] == NO_DIR {
                 let next = u32::try_from(nodes.len())
                     .map_err(|_| std::io::Error::other("Name Index exceeds u32 nodes"))?;
@@ -68,16 +93,9 @@ fn build_layout(index: &IndexData) -> std::io::Result<Layout> {
             .checked_add(len)
             .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))
     })?;
-    let arena_len = entries.iter().try_fold(node_name_bytes, |total, slot| {
-        let len = index
-            .entry(*slot as usize)
-            .ok_or_else(|| std::io::Error::other("reachable Item is missing"))?
-            .name
-            .len();
-        total
-            .checked_add(len)
-            .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))
-    })?;
+    let arena_len = node_name_bytes
+        .checked_add(entry_name_bytes)
+        .ok_or_else(|| std::io::Error::other("Name Index arena overflow"))?;
     if arena_len > u32::MAX as usize {
         return Err(std::io::Error::other(
             "Name Index name arena exceeds u32 offsets",
@@ -192,8 +210,7 @@ fn visit_payload(
     Ok(())
 }
 
-fn write_index(index: &IndexData, path: &Path) -> std::io::Result<()> {
-    let layout = build_layout(index)?;
+fn write_index(index: &IndexData, path: &Path, layout: &Layout) -> std::io::Result<PersistedShape> {
     let root = index.root.to_string_lossy();
     let root_len = u32::try_from(root.len())
         .map_err(|_| std::io::Error::other("Name Index root exceeds u32 bytes"))?;
@@ -202,11 +219,21 @@ fn write_index(index: &IndexData, path: &Path) -> std::io::Result<()> {
     let entry_count = u32::try_from(layout.entries.len())
         .map_err(|_| std::io::Error::other("Name Index exceeds u32 entries"))?;
 
+    let file = File::create(path)?;
+    // The temp index is written once, fsynced, then memory-mapped. Keeping its dirty pages
+    // in this process's unified file cache can add the full 300+ MiB output size to the
+    // resident old mapping, so bypass that cache for this sequential atomic write.
+    disable_file_cache(&file)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    // The checksum covers only the payload. Reserve the header, hash while writing the
+    // payload once, then seek back to fill it; the old path walked all 5M entries twice.
+    writer.write_all(&[0u8; HEADER_LEN])?;
     let mut hash = FNV_OFFSET;
-    visit_payload(index, &layout, |bytes| {
+    visit_payload(index, layout, |bytes| {
         hash_bytes(&mut hash, bytes);
-        Ok(())
+        writer.write_all(bytes)
     })?;
+    writer.flush()?;
 
     let mut header = [0u8; HEADER_LEN];
     header[0..4].copy_from_slice(MAGIC);
@@ -217,13 +244,16 @@ fn write_index(index: &IndexData, path: &Path) -> std::io::Result<()> {
     header[20..24].copy_from_slice(&entry_count.to_le_bytes());
     header[24..32].copy_from_slice(&(layout.arena_len as u64).to_le_bytes());
     header[32..40].copy_from_slice(&hash.to_le_bytes());
-
-    let file = File::create(path)?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    writer.seek(SeekFrom::Start(0))?;
     writer.write_all(&header)?;
-    visit_payload(index, &layout, |bytes| writer.write_all(bytes))?;
     writer.flush()?;
-    writer.get_ref().sync_all()
+    writer.get_ref().sync_all()?;
+    Ok(PersistedShape {
+        root_len: root.len(),
+        node_count: layout.nodes.len(),
+        entry_count: layout.entries.len(),
+        arena_len: layout.arena_len,
+    })
 }
 
 pub fn index_path(app_data_dir: &Path, volume_key: &str) -> PathBuf {
@@ -247,19 +277,31 @@ pub fn save(shared: &Arc<RwLock<IndexData>>, path: &Path) -> std::io::Result<()>
         fs::create_dir_all(parent)?;
     }
     let temp_path = path.with_extension("idx.tmp");
-    let revision = {
+    let (revision, layout) = {
         let index = shared.read().expect("name index lock poisoned");
         let revision = index.revision;
-        write_index(&index, &temp_path)?;
-        revision
-    };
-    fs::rename(&temp_path, path)?;
-    let Some(base) = MappedBase::open(path, &shared.read().unwrap().root)? else {
-        return Err(std::io::Error::other("new Name Index v4 failed validation"));
+        let layout = build_layout(&index)?;
+        (revision, layout)
     };
     let mut index = shared.write().expect("name index lock poisoned");
-    if index.revision == revision {
-        index.replace_base(base);
+    if index.revision != revision {
+        return Err(std::io::Error::other(
+            "Name Index changed while preparing persistence",
+        ));
     }
+    // `build_layout` walked the entire old mapping. Replace it with an untouched mapping
+    // before the payload pass so their resident page sets cannot accumulate. Keep the write
+    // lock through the pass: a concurrent full-index query would otherwise warm it again.
+    index.remap_base_cold(path)?;
+    let shape = write_index(&index, &temp_path, &layout)?;
+    let base = MappedBase::open_trusted(
+        &temp_path,
+        shape.root_len,
+        shape.node_count,
+        shape.entry_count,
+        shape.arena_len,
+    )?;
+    fs::rename(&temp_path, path)?;
+    index.replace_base(base);
     Ok(())
 }

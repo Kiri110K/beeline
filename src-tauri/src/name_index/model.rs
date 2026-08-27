@@ -265,8 +265,81 @@ impl MappedBase {
         Ok(base)
     }
 
+    /// Map a file just written and synced by the v4 persister without reading its entire
+    /// payload again. Normal startup still performs checksum and structural validation;
+    /// this trusted path prevents atomic replacement from making both old and new 300+ MiB
+    /// mappings resident in the same process.
+    pub(crate) fn open_trusted(
+        path: &Path,
+        root_len: usize,
+        node_count: usize,
+        entry_count: usize,
+        arena_len: usize,
+    ) -> std::io::Result<Self> {
+        let mapping = MappedFile::open(path)?;
+        let root_start = HEADER_LEN;
+        let node_start = root_start
+            .checked_add(root_len)
+            .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?;
+        let entry_start = node_start
+            .checked_add(
+                node_count
+                    .checked_mul(NODE_RECORD_LEN)
+                    .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?;
+        let arena_start = entry_start
+            .checked_add(
+                entry_count
+                    .checked_mul(ENTRY_RECORD_LEN)
+                    .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?,
+            )
+            .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?;
+        let expected_len = arena_start
+            .checked_add(arena_len)
+            .ok_or_else(|| std::io::Error::other("Name Index layout overflow"))?;
+        if node_count == 0 || mapping.len != expected_len {
+            return Err(std::io::Error::other(
+                "new Name Index v4 has an unexpected size",
+            ));
+        }
+        Ok(Self {
+            mapping,
+            root_start,
+            root_len,
+            node_start,
+            node_count,
+            entry_start,
+            entry_count,
+            arena_start,
+            arena_len,
+        })
+    }
+
+    fn cold_remap(&self, path: &Path) -> std::io::Result<Self> {
+        let mapping = MappedFile::open(path)?;
+        if mapping.len != self.mapping.len {
+            return Err(std::io::Error::other(
+                "Name Index changed while preparing persistence",
+            ));
+        }
+        Ok(Self {
+            mapping,
+            root_start: self.root_start,
+            root_len: self.root_len,
+            node_start: self.node_start,
+            node_count: self.node_count,
+            entry_start: self.entry_start,
+            entry_count: self.entry_count,
+            arena_start: self.arena_start,
+            arena_len: self.arena_len,
+        })
+    }
+
     fn validate(&self) -> Result<(), ()> {
         let mut expected_first = 0usize;
+        let mut referenced_dirs = vec![false; self.node_count];
+        referenced_dirs[0] = true;
         for id in 0..self.node_count {
             let record = self.node_record(id).ok_or(())?;
             let parent = read_u32(record, 8)? as usize;
@@ -281,13 +354,25 @@ impl MappedBase {
                 return Err(());
             }
             for slot in first..first + count {
-                if self.entry(slot).ok_or(())?.parent as usize != id {
+                let entry = self.entry(slot).ok_or(())?;
+                if entry.parent as usize != id {
                     return Err(());
+                }
+                if entry.is_directory {
+                    let child = self.node(entry.dir_id).ok_or(())?;
+                    let child_id = entry.dir_id as usize;
+                    if child.parent as usize != id
+                        || child.name != entry.name
+                        || referenced_dirs[child_id]
+                    {
+                        return Err(());
+                    }
+                    referenced_dirs[child_id] = true;
                 }
             }
             expected_first += count;
         }
-        if expected_first != self.entry_count {
+        if expected_first != self.entry_count || referenced_dirs.iter().any(|seen| !seen) {
             return Err(());
         }
         for slot in 0..self.entry_count {
@@ -379,6 +464,9 @@ pub struct IndexData {
     pub root: PathBuf,
     base: Option<MappedBase>,
     base_tombstones: Vec<u64>,
+    base_node_tombstones: Vec<u64>,
+    base_first_child: Vec<DirId>,
+    base_next_sibling: Vec<DirId>,
     overlay_nodes: Vec<OwnedNode>,
     overlay_entries: Vec<Option<OwnedEntry>>,
     added_by_parent: HashMap<DirId, Vec<u32>>,
@@ -395,6 +483,9 @@ impl IndexData {
             root,
             base: None,
             base_tombstones: Vec::new(),
+            base_node_tombstones: Vec::new(),
+            base_first_child: Vec::new(),
+            base_next_sibling: Vec::new(),
             overlay_nodes: vec![OwnedNode {
                 name: Box::from(""),
                 parent: 0,
@@ -415,10 +506,24 @@ impl IndexData {
     pub(crate) fn from_base(root: PathBuf, base: MappedBase) -> Self {
         debug_assert_eq!(Path::new(base.root()), root);
         let entry_count = base.entry_count;
+        let node_count = base.node_count;
+        let mut base_first_child = vec![NO_DIR; node_count];
+        let mut base_next_sibling = vec![NO_DIR; node_count];
+        // Persisted v4 nodes contain their parent directly. Link them once at load so the
+        // startup traversal visits only directory nodes instead of rescanning all 5M Item
+        // records to rediscover the 418k directory Items.
+        for child in (1..node_count).rev() {
+            let parent = base.node(child as DirId).expect("validated v4 node").parent as usize;
+            base_next_sibling[child] = base_first_child[parent];
+            base_first_child[parent] = child as DirId;
+        }
         Self {
             root,
             base: Some(base),
             base_tombstones: vec![0; entry_count.div_ceil(64)],
+            base_node_tombstones: vec![0; node_count.div_ceil(64)],
+            base_first_child,
+            base_next_sibling,
             overlay_nodes: Vec::new(),
             overlay_entries: Vec::new(),
             added_by_parent: HashMap::new(),
@@ -461,6 +566,15 @@ impl IndexData {
         self.base_node_count() + self.overlay_nodes.len()
     }
 
+    pub(crate) fn remap_base_cold(&mut self, path: &Path) -> std::io::Result<()> {
+        let Some(base) = &self.base else {
+            return Ok(());
+        };
+        let cold = base.cold_remap(path)?;
+        self.base = Some(cold);
+        Ok(())
+    }
+
     fn base_removed(&self, slot: usize) -> bool {
         self.base_tombstones
             .get(slot / 64)
@@ -475,6 +589,20 @@ impl IndexData {
         }
         *word |= bit;
         true
+    }
+
+    fn base_node_removed(&self, id: DirId) -> bool {
+        let id = id as usize;
+        self.base_node_tombstones
+            .get(id / 64)
+            .is_some_and(|word| word & (1u64 << (id % 64)) != 0)
+    }
+
+    fn remove_base_node(&mut self, id: DirId) {
+        let id = id as usize;
+        if let Some(word) = self.base_node_tombstones.get_mut(id / 64) {
+            *word |= 1u64 << (id % 64);
+        }
     }
 
     pub fn entry(&self, slot: usize) -> Option<EntryRef<'_>> {
@@ -499,6 +627,9 @@ impl IndexData {
     pub fn node(&self, id: DirId) -> Option<NodeRef<'_>> {
         let base_count = self.base_node_count();
         if (id as usize) < base_count {
+            if self.base_node_removed(id) {
+                return None;
+            }
             let mut node = self.base.as_ref()?.node(id)?;
             if let Some(mtime) = self.mtime_overrides.get(&id) {
                 node.mtime_ms = *mtime;
@@ -534,7 +665,9 @@ impl IndexData {
             if let Some(range) = base.direct_slots(parent) {
                 slots.extend(
                     range
-                        .filter(|slot| !self.base_removed(*slot))
+                        // Keep persistence total even if this base range was partially
+                        // tombstoned while its directory subtree was removed.
+                        .filter(|slot| self.entry(*slot).is_some())
                         .map(|slot| slot as u32),
                 );
             }
@@ -551,10 +684,28 @@ impl IndexData {
     }
 
     pub fn child_slot(&self, parent: DirId, name: &str) -> Option<u32> {
-        self.direct_entry_slots(parent).into_iter().find(|slot| {
-            self.entry(*slot as usize)
-                .is_some_and(|entry| entry.name == name)
-        })
+        if let Some(range) = self
+            .base
+            .as_ref()
+            .and_then(|base| base.direct_slots(parent))
+        {
+            for slot in range {
+                if self.entry(slot).is_some_and(|entry| entry.name == name) {
+                    return Some(slot as u32);
+                }
+            }
+        }
+        if let Some(added) = self.added_by_parent.get(&parent) {
+            for &slot in added {
+                if self
+                    .entry(slot as usize)
+                    .is_some_and(|entry| entry.name == name)
+                {
+                    return Some(slot);
+                }
+            }
+        }
+        None
     }
 
     pub fn child_dir(&self, parent: DirId, name: &str) -> Option<DirId> {
@@ -574,15 +725,36 @@ impl IndexData {
     }
 
     pub fn child_dirs(&self, parent: DirId) -> Vec<(String, DirId)> {
-        self.direct_entry_slots(parent)
-            .into_iter()
-            .filter_map(|slot| {
-                let entry = self.entry(slot as usize)?;
-                entry
-                    .is_directory
-                    .then(|| (entry.name.to_owned(), entry.dir_id))
-            })
-            .collect()
+        let mut dirs = Vec::new();
+        if let Some(base) = &self.base {
+            let mut child = self
+                .base_first_child
+                .get(parent as usize)
+                .copied()
+                .unwrap_or(NO_DIR);
+            while child != NO_DIR {
+                if !self.base_node_removed(child) {
+                    let node = base.node(child).expect("validated v4 child node");
+                    dirs.push((node.name.to_owned(), child));
+                }
+                child = self
+                    .base_next_sibling
+                    .get(child as usize)
+                    .copied()
+                    .unwrap_or(NO_DIR);
+            }
+        }
+        if let Some(added) = self.added_by_parent.get(&parent) {
+            for &slot in added {
+                let Some(entry) = self.entry(slot as usize) else {
+                    continue;
+                };
+                if entry.is_directory {
+                    dirs.push((entry.name.to_owned(), entry.dir_id));
+                }
+            }
+        }
+        dirs
     }
 
     pub fn has_child(&self, parent: DirId, name: &str) -> bool {
@@ -654,6 +826,19 @@ impl IndexData {
             self.set_node_mtime(existing, mtime_ms);
             return existing;
         }
+        self.add_dir_known_absent(parent, name, tier, mtime_ms)
+    }
+
+    /// Insert a directory after the caller has proved that `parent` has no child named
+    /// `name`. Fresh filesystem crawls use this path: probing the siblings for every new
+    /// directory turns a wide subtree into quadratic work and used 14.8 GB on startup.
+    pub(crate) fn add_dir_known_absent(
+        &mut self,
+        parent: DirId,
+        name: &str,
+        tier: Tier,
+        mtime_ms: i64,
+    ) -> DirId {
         let id = self.base_node_count() + self.overlay_nodes.len();
         let id = u32::try_from(id).expect("Name Index exceeds u32 directory nodes");
         self.overlay_nodes.push(OwnedNode {
@@ -685,35 +870,125 @@ impl IndexData {
         let Some(entry) = self.entry(slot) else {
             return false;
         };
+        if !entry.is_directory {
+            return self.remove_slot_shallow(slot);
+        }
+        let dir_id = entry.dir_id;
+        let has_base_children = self
+            .base
+            .as_ref()
+            .and_then(|base| base.direct_slots(dir_id))
+            .is_some_and(|mut range| range.any(|child| !self.base_removed(child)));
+        let has_overlay_children = self.added_by_parent.get(&dir_id).is_some_and(|added| {
+            added
+                .iter()
+                .any(|child| self.entry(*child as usize).is_some())
+        });
+        if !has_base_children && !has_overlay_children {
+            return self.remove_slot_shallow(slot);
+        }
+        self.remove_slots(vec![slot as u32]) > 0
+    }
+
+    pub fn clear_children(&mut self, dir_id: DirId) {
+        let slots = self.direct_entry_slots(dir_id);
+        self.remove_slots(slots);
+    }
+
+    /// Remove whole directory subtrees without using the call stack. A deleted tree in a
+    /// real v4 index previously recursed through `remove_slot`/`clear_children` 10,102 times,
+    /// retained every sibling buffer on that stack, and then aborted on the stack guard.
+    fn remove_slots(&mut self, roots: Vec<u32>) -> usize {
+        fn enqueue_once(slot: u32, seen: &mut [u64], pending: &mut Vec<u32>) {
+            let slot = slot as usize;
+            let Some(word) = seen.get_mut(slot / 64) else {
+                return;
+            };
+            let bit = 1u64 << (slot % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                pending.push(slot as u32);
+            }
+        }
+
+        if roots.is_empty() {
+            return 0;
+        }
+        let mut pending = Vec::new();
+        let mut seen = vec![0u64; self.slot_len().div_ceil(64)];
+        for slot in roots {
+            enqueue_once(slot, &mut seen, &mut pending);
+        }
+        let mut removed = 0usize;
+
+        while let Some(slot) = pending.pop() {
+            let Some(entry) = self.entry(slot as usize) else {
+                continue;
+            };
+            let dir_id = entry.is_directory.then_some(entry.dir_id);
+            if let Some(dir_id) = dir_id {
+                if let Some(range) = self
+                    .base
+                    .as_ref()
+                    .and_then(|base| base.direct_slots(dir_id))
+                {
+                    for child in range.filter(|child| !self.base_removed(*child)) {
+                        enqueue_once(child as u32, &mut seen, &mut pending);
+                    }
+                }
+                if let Some(added) = self.added_by_parent.remove(&dir_id) {
+                    for child in added
+                        .into_iter()
+                        .filter(|child| self.entry(*child as usize).is_some())
+                    {
+                        enqueue_once(child, &mut seen, &mut pending);
+                    }
+                }
+            }
+            removed += usize::from(self.remove_slot_shallow(slot as usize));
+        }
+        removed
+    }
+
+    /// Tombstone one live Item without walking its descendants. The caller either proved
+    /// that a directory is empty or already queued every child.
+    fn remove_slot_shallow(&mut self, slot: usize) -> bool {
+        let Some(entry) = self.entry(slot) else {
+            return false;
+        };
         let dir_id = entry.is_directory.then_some(entry.dir_id);
         if let Some(dir_id) = dir_id {
-            self.clear_children(dir_id);
-            let base_count = self.base_node_count();
-            if dir_id as usize >= base_count {
-                if let Some(node) = self.overlay_nodes.get_mut(dir_id as usize - base_count) {
-                    node.removed = true;
-                }
+            self.added_by_parent.remove(&dir_id);
+            let base_node_count = self.base_node_count();
+            if (dir_id as usize) < base_node_count {
+                self.remove_base_node(dir_id);
+            } else if let Some(node) = self
+                .overlay_nodes
+                .get_mut(dir_id as usize - base_node_count)
+            {
+                node.removed = true;
             }
             self.junk_dirty.remove(&dir_id);
         }
+
         let base_entry_count = self.base_entry_count();
         if slot < base_entry_count {
-            self.remove_base_slot(slot);
+            if !self.remove_base_slot(slot) {
+                return false;
+            }
         } else {
-            self.overlay_entries[slot - base_entry_count] = None;
+            let overlay_slot = slot - base_entry_count;
+            let Some(entry) = self.overlay_entries.get_mut(overlay_slot) else {
+                return false;
+            };
+            if entry.take().is_none() {
+                return false;
+            }
         }
         self.live -= 1;
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
         true
-    }
-
-    pub fn clear_children(&mut self, dir_id: DirId) {
-        let slots = self.direct_entry_slots(dir_id);
-        for slot in slots {
-            self.remove_slot(slot as usize);
-        }
-        self.revision = self.revision.wrapping_add(1);
     }
 }
 
