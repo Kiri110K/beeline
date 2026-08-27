@@ -68,6 +68,14 @@ _Avoid_: Path Input, search box, address bar
 Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path.
 _Avoid_: Path, filter
 
+**Working Set**:
+The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items from Search Memory. Unvisited descendants of Pinned Anchors are not included merely because their ancestor is pinned.
+_Avoid_: Local index, Recents, cache
+
+**Search Memory**:
+The local, persistent association between Items and the same or similar Search Queries, created by deliberate attention or action and used for personal ranking. Mere visibility in Search Results is not a signal.
+_Avoid_: Visit Journal, Recents, history, cache
+
 **Search Results**:
 A transient ranked list of Items and Locations matching a Search Query. Search Results do not change the current Location until the user Reveals one.
 _Avoid_: Folder contents, Recents

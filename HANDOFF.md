@@ -16,6 +16,26 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 Закрытый тикет = сделан и проверен, у закрытого есть комментарий-вердикт.
 Открытый с assignee = был в работе; смотри его комментарии и `git log`.
 
+## Search v2 wayfinder начат — 27.08
+
+- Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
+  Цель — полная implementation-ready спека, не реализация.
+- Исходное обсуждение записано и закрыто в
+  [Set the Search v2 direction](https://github.com/Kiri110K/beeline/issues/43).
+  Search v2 сначала ищет в личном Working Set, затем расширяется на Name Index по
+  горячо настраиваемому порогу. Search Memory учится на hover/focus и действиях,
+  переносит приоритет между похожими запросами; fuzzy работает с первого символа.
+  Совместимость с v1 не требуется.
+- В `CONTEXT.md` добавлены канонические термины Working Set и Search Memory.
+  Простая видимость строки в Search Results не считается сигналом.
+- Первый frontier: [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45)
+  и AFK-исследование [Research typo candidate retrieval for Name Index v4](https://github.com/Kiri110K/beeline/issues/50).
+  Остальные child tickets связаны нативными GitHub dependencies и откроются по
+  мере закрытия этих решений.
+- В рамках карты production-код не менять. Каждая HITL-сессия использует
+  `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
+  comments соответствующих decision tickets.
+
 ## Performance pass #31 завершён — 27.08
 
 - В предыдущем проходе закрыты startup/search/Recents/large-list/energy бюджеты:
