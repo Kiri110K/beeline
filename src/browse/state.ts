@@ -183,11 +183,8 @@ function pathsForSelection(
   return paths;
 }
 
-export function hasSelectionBeyondFocus(state: BrowseState): boolean {
-  if (state.load.status !== "ready" || state.selected.size === 0) {
-    return false;
-  }
-  return !(state.selected.size === 1 && state.selected.has(state.focusedIndex));
+export function hasSelectedItems(state: BrowseState): boolean {
+  return state.load.status === "ready" && state.selected.size > 0;
 }
 
 interface Position {
@@ -350,10 +347,11 @@ export function browseReducer(
       return {
         ...state,
         anchorIndex: state.focusedIndex,
-        selected: new Set<number>([state.focusedIndex]),
-        selectedPaths: new Map<number, string>([
-          [state.focusedIndex, state.focusedPath],
-        ]),
+        // Focus and Selected Items are independent (§5). Escape clears the selection
+        // layer while leaving the Focused Item available for keyboard navigation; this
+        // is also how Cmd+K reaches the application-action menu.
+        selected: new Set<number>(),
+        selectedPaths: new Map<number, string>(),
       };
     }
     case "listed": {

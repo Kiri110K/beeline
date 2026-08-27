@@ -199,6 +199,12 @@ function TabContextMenu({
     <div
       role="menu"
       style={{ left: menu.x, top: menu.y }}
+      onPointerDown={(event) => {
+        // The window-level dismiss listener runs in the bubble phase. Keep an
+        // interaction inside the menu alive through `click`, otherwise React
+        // unmounts the menu on pointerdown before the item action can run.
+        event.stopPropagation();
+      }}
       className="fixed z-50 min-w-[160px] rounded border border-neutral-700 bg-neutral-800 py-1 text-neutral-200 shadow-lg"
     >
       {items.map((item) => (

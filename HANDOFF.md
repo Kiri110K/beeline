@@ -16,48 +16,46 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 Закрытый тикет = сделан и проверен, у закрытого есть комментарий-вердикт.
 Открытый с assignee = был в работе; смотри его комментарии и `git log`.
 
-## Performance pass #31 — исправления и замеры 27.08
+## Performance pass #31 завершён — 27.08
 
-- После реального reboot Login Item PID 891 загружал persisted Name Index только
-  на 8 278 мс: каждый старт заново хешировал 310 МБ и обходил 5,15 млн Item.
-  Теперь после одной полной проверки рядом с `home.idx` лежит 64-байтный
-  validation stamp, привязанный к device/inode/size/mtime/ctime. Неизменившийся
-  файл проверяет заголовок, layout, размер и root без полного payload walk.
-  Любое изменение identity возвращает прежние checksum + structural validation;
-  существующий corrupt-v4 regression остаётся зелёным.
-- Fast path на реальном индексе: release loader 8,03 мс после stamp против
-  898,64 мс полного validation при тёплом page cache. В свежем signed app index
-  готов на 379 мс от старта процесса. Startup prewarm одного representative
-  поиска занял 73 мс, первый usable frame — 619 мс при лимите 800 мс. Login
-  prewarm снова с большим запасом внутри 2 с.
-- Fast loader сначала перенёс холодные страницы в первый пользовательский поиск:
-  `g` занял 104 мс. Поэтому startup теперь заранее выполняет один ограниченный
-  `g` scan. После него первый реальный запрос по другому символу (`a`) занял
-  меньше 25 мс; keystroke frame — 3 мс. Charged physical footprint main process
-  после prewarm и поиска — 56 MiB (RSS около 210 MiB включает reclaimable mmap).
-- Recents больше не начинает с unbounded Spotlight query. Один год дал 255
-  кандидатов за 90 мс на reference Mac и заполнил cache target 200; если
-  post-filter оставит меньше target, код один раз повторяет запрос без окна.
-  Свежий app записал `recents_refresh` 127 мс при лимите 150 мс. Unit test
-  покрывает fallback; cache-first поведение не менялось.
-- NDJSON теперь измеряет `temporary_tab_first_frame` с фактом DOM focus и
-  `keystroke_first_frame`. Реальный UI pass PID 54466: New Temporary Tab 43 мс
-  и `focused=true`, keystroke 2 мс, обычный каталог 38 мс, Quick Look dispatch
-  2 мс, shortcut show→paint 49 мс и show→settled focus 41 мс. Exact-path Reveal
-  и native Quick Look проверены на отдельном TXT fixture.
-- Снимки UI pass: `/private/tmp/codex-computer-use.beeline31.TBorAg/01-start.png`
-  … `05-warm-entry.png`. Computer control остановил дальнейшие команды после
-  внешнего изменения окна, поэтому test bundle завершён и чистый Recents
-  восстановлен; установленная `/Applications/Beeline.app` не заменялась.
-- Зелёные на текущем дереве: 93 Rust tests (8 ignored), recents
-  fallback test, fmt, clippy `-D warnings`, typecheck, lint, четыре JS contract
-  tests и signed `pnpm tauri build` (executable SHA-256 `9e5481a…0f82`).
-  Пользовательская `.claude/` не тронута.
+- В предыдущем проходе закрыты startup/search/Recents/large-list/energy бюджеты:
+  persisted v4 fast validation + prewarm дали `index_loaded` 379 мс и usable
+  frame 619 мс после reboot; первый keystroke frame — 3 мс; New Temporary Tab —
+  43 мс; обычный каталог — 38 мс; Quick Look dispatch — 2 мс; Recents refresh —
+  127 мс. Charged physical footprint main process после prewarm/search — 56 MiB.
+- Финальный cross-Space smoke нашёл ошибку `CanJoinAllSpaces`: скрытое окно
+  оставалось привязано к прежнему Desktop, хотя macOS активировал Beeline.
+  Collection behavior заменён на `MoveToActiveSpace | FullScreenAuxiliary`;
+  focus retry сокращён с 40 до 20 мс. На втором Desktop show→paint/focus составил
+  31/30 мс. Поверх full-screen: 59/21 мс сразу после перехода и 31/23 мс на
+  повторном вызове. Окно осталось на вызывающем Space, без переброса к T3.
+- Smoke обнаружил, что Focused Item и Selected Items были фактически склеены:
+  Escape оставлял hero выбранным, поэтому application Action Menu с New Tab /
+  Paste Path был недостижим. Теперь Escape очищает Selected Items, сохраняя
+  Focused Item; второй Escape скрывает окно. Application и item menus проверены.
+- Контекстное меню вкладки закрывалось глобальным `pointerdown` до выполнения
+  `click`, поэтому Pin/Unpin/Remove/Copy Location не работали мышью. Внутренний
+  pointerdown теперь не всплывает. Реальный Pin создал `pinned_tabs.json`, Unpin
+  вернул Temporary Tab и снова записал пустой список.
+- Полный SPEC §16 smoke прошёл на signed test bundle: Paste Path (с системным
+  clipboard consent), Reveal, native Quick Look, Copy Path, Open in Terminal в
+  точном каталоге, Move to Trash с восстановлением fixture, wrong-layout поиск
+  скрытого `.секреттестовый.txt`, Pin → Excursion. После 383 078 мс скрытого
+  состояния телеметрия записала `excursions_reset count=1`, а первый листинг был
+  Anchor, не `sub`.
+- Артефакты и снимки финального прохода лежат в
+  `/private/tmp/beeline31-final.OQXBjS`; ключевые события сохранены в
+  `state-after/telemetry.ndjson`. Установленная `/Applications/Beeline.app` не
+  заменялась. Settings, Recents cache, Visit Journal и clipboard восстановлены
+  побайтно; тестовый pin снова отсутствует; Trash-fixture возвращён; Ghostty
+  скрыт; пользовательская `.claude/` не тронута.
+- Финальная проверка: 93 Rust tests passed, 8 ignored; четыре JS contract tests,
+  typecheck, lint, fmt, clippy `-D warnings`, production frontend и подписанный
+  Tauri bundle зелёные. #31 и родительский v1 tracker #23 закрыты с verdict;
+  оставшиеся #33/#39/#40 относятся к post-v1.
 
-**Осталось в #31:** отдельный свободный GUI-слот для Spaces/full-screen,
-пятиминутного Pinned Excursion reset и оставшихся строк полного smoke §16. После
-этого — финальный verdict и закрытие #31; parent #23 закрывать следом, если smoke
-не найдёт нового дефекта.
+**Следующее:** v1 принят. Не расширять его post-v1 задачами без нового решения;
+карта #1 остаётся верхнеуровневым трекером.
 
 ## Name Index watcher #41 завершён — 27.08
 

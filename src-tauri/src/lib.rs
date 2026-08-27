@@ -287,11 +287,11 @@ fn show_and_focus(app: &AppHandle, state: &ShellState, origin: ShowOrigin) -> Re
         .map_err(|error| format!("failed to emit window shown event: {error}"))
 }
 
-// The single window must appear on whatever Space the user is on, including over
-// another app's full-screen Space (observed live: activation succeeded — menu bar
-// switched — while the window stayed on the desktop Space). The launcher pattern:
-// join all Spaces and allow display over full screen (§10 lists activation across
-// Spaces and full-screen as required behavior).
+// The single window must move to whichever Space owns the shortcut, including over
+// another app's full-screen Space. A hidden `CanJoinAllSpaces` window remained attached
+// to its previous desktop on the reference Mac: activation switched desktops while the
+// window stayed absent. `MoveToActiveSpace` gives the launcher behavior we need, while
+// `FullScreenAuxiliary` permits that move onto a full-screen Space (§10).
 fn install_space_behavior(window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     {
@@ -301,7 +301,7 @@ fn install_space_behavior(window: &WebviewWindow) {
             // only set its collection behavior on the main thread (setup runs there).
             let ns_window = unsafe { &*ns_window_ptr.cast::<objc2_app_kit::NSWindow>() };
             ns_window.setCollectionBehavior(
-                NSWindowCollectionBehavior::CanJoinAllSpaces
+                NSWindowCollectionBehavior::MoveToActiveSpace
                     | NSWindowCollectionBehavior::FullScreenAuxiliary,
             );
         }
@@ -312,9 +312,9 @@ fn install_space_behavior(window: &WebviewWindow) {
 
 // Number of settle retries and the gap between them: since macOS 14 activation is
 // cooperative, so a single request from a non-frontmost Accessory app may be dropped.
-// ~320 ms total is below the perceptible-lag threshold for a show.
+// The 20 ms retry stays inside the 50 ms warm-entry budget when one retry is needed.
 const FOCUS_SETTLE_ATTEMPTS: u32 = 8;
-const FOCUS_SETTLE_INTERVAL_MS: u64 = 40;
+const FOCUS_SETTLE_INTERVAL_MS: u64 = 20;
 
 // An Accessory app that has never been active does not come frontmost from `set_focus`
 // alone. Drive the full AppKit sequence on the main thread: make the window key, then
@@ -366,7 +366,7 @@ fn has_foreground_focus(window: &WebviewWindow) -> (bool, bool, bool) {
 }
 
 // Activation may still be deferred after the initial request, so verify and retry
-// off the show path. Every 40 ms, up to 8 times: if the window is key, stop; else
+// off the show path. Every 20 ms, up to 8 times: if the window is key, stop; else
 // re-run the activation sequence. Exactly one `focus_settled` event is recorded
 // (attempts made, final focus). A generation token guards against overlapping loops
 // from rapid re-shows — a newer show bumps the token, and this stale loop exits

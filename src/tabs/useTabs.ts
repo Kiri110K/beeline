@@ -42,7 +42,7 @@ import {
 } from "../operations/state";
 import {
   focusedItemOf,
-  hasSelectionBeyondFocus,
+  hasSelectedItems,
   initialBrowseState,
   itemAt,
   selectedPathsOf,
@@ -2963,7 +2963,7 @@ export function useTabs(
           break;
         case "Escape": {
           const active = tabById(stateRef.current, stateRef.current.activeId);
-          if (active !== undefined && hasSelectionBeyondFocus(active.browse)) {
+          if (active !== undefined && hasSelectedItems(active.browse)) {
             event.preventDefault();
             dispatch({
               type: "browse",
