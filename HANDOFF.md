@@ -16,7 +16,7 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 Закрытый тикет = сделан и проверен, у закрытого есть комментарий-вердикт.
 Открытый с assignee = был в работе; смотри его комментарии и `git log`.
 
-## Name Index watcher #41 — готов к коммиту 27.08
+## Name Index watcher #41 завершён — 27.08
 
 - Причина многоминутного `remove_slots` найдена в mapped v4: `MappedBase`
   не отсекал `node_id` новых overlay-каталогов. Такой id попадал в секцию
@@ -53,9 +53,10 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 - Все тестовые PID и фикстуры удалены, clipboard восстановлен. `settings.json` и
   persisted `home.idx` сохранили SHA-256 `8535f09…3d8` и `e75427c…17ab9`.
   `/Applications/Beeline.app` не заменялась. Пользовательская `.claude/` не тронута.
+- Реализация и отчёт закоммичены как `b6bba98`, запушены в `main`. В задаче #41
+  оставлен verdict с проверками и живыми замерами; задача закрыта.
 
-**Следующее:** закоммитить без `.claude/`, push, оставить verdict в #41 и закрыть
-задачу. После этого вернуться к общему performance pass #31; bounded persistence
+**Следующее:** вернуться к общему performance pass #31. Bounded persistence
 остаётся post-v1 задачей #40.
 
 ## WebContent memory #38 завершён — 27.08
