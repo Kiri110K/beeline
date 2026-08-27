@@ -45,10 +45,10 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   2130 выборок в Name Index watcher:
   `apply_fs_event → reconcile_dir_children → remove_child → remove_slots`.
   Это отдельная проблема обслуживания Name Index, не WebContent; она вынесена
-  в отдельный GitHub follow-up.
+  в задачу #41.
 
 **Следующее:** ограничить стоимость удаления больших поддеревьев из overlay по
-FSEvents. После этого вернуться к общему performance pass #31. Bounded
+FSEvents в #41. После этого вернуться к общему performance pass #31. Bounded
 incremental persistence Name Index остаётся в post-v1 задаче #40.
 
 ## Пауза на WebContent memory #38 — 25.08, перед обновлением T3 Code
