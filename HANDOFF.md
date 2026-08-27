@@ -28,10 +28,18 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Совместимость с v1 не требуется.
 - В `CONTEXT.md` добавлены канонические термины Working Set и Search Memory.
   Простая видимость строки в Search Results не считается сигналом.
-- Первый frontier: [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45)
-  и AFK-исследование [Research typo candidate retrieval for Name Index v4](https://github.com/Kiri110K/beeline/issues/50).
-  Остальные child tickets связаны нативными GitHub dependencies и откроются по
-  мере закрытия этих решений.
+- AFK-исследование [Research typo candidate retrieval for Name Index v4](https://github.com/Kiri110K/beeline/issues/50)
+  завершено на реальном индексе из 5 150 533 Items. Для ограниченного Working Set
+  рекомендован полный Damerau-OSA проход. Для глобального поиска архитектура пока
+  не выбрана: нужно сравнить relaxed mmap full-scan baseline, FST + automaton для
+  whole-name/token и mixed bigram/trigram postings для fuzzy substring. Старый
+  лимит первых 4096 совпадений по mmap order не годится: до ранкера должен доходить
+  rank-aware top-k с обязательным union Working Set.
+- Единственный HITL-frontier сейчас —
+  [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45).
+  В нём обязательно установить верхнюю границу Working Set: без неё нельзя
+  гарантировать дешёвый fuzzy с первого символа. Остальные child tickets связаны
+  нативными GitHub dependencies и откроются по мере закрытия решений.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
