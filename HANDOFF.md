@@ -28,18 +28,26 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Совместимость с v1 не требуется.
 - В `CONTEXT.md` добавлены канонические термины Working Set и Search Memory.
   Простая видимость строки в Search Results не считается сигналом.
+- Отложенное Gen2-направление записано в
+  [Gen2: explore an always-results interaction model](https://github.com/Kiri110K/beeline/issues/52):
+  вместо отдельного Search Results overlay рассматривается одна Raycast-like
+  панель, которая всегда показывает ранжированные результаты и даёт действия над
+  Item без обязательного Reveal. Роль текущей Location пока не решена. Search v2
+  поэтому специфицирует получение, объединение и ранжирование результатов без
+  зависимости от Browse Mode / Search Mode и финальной оболочки Gen2.
 - AFK-исследование [Research typo candidate retrieval for Name Index v4](https://github.com/Kiri110K/beeline/issues/50)
-  завершено на реальном индексе из 5 150 533 Items. Для ограниченного Working Set
-  рекомендован полный Damerau-OSA проход. Для глобального поиска архитектура пока
-  не выбрана: нужно сравнить relaxed mmap full-scan baseline, FST + automaton для
-  whole-name/token и mixed bigram/trigram postings для fuzzy substring. Старый
-  лимит первых 4096 совпадений по mmap order не годится: до ранкера должен доходить
-  rank-aware top-k с обязательным union Working Set.
+  завершено на реальном индексе из 5 150 533 Items. Для ограниченной исторической
+  части Working Set рекомендован полный Damerau-OSA проход. Общего лимита у
+  Working Set нет: текущая Location входит полностью. Для неё и глобального поиска
+  архитектура пока не выбрана: нужно сравнить relaxed mmap full-scan baseline,
+  FST + automaton для whole-name/token и mixed bigram/trigram postings для fuzzy
+  substring. Старый лимит первых 4096 совпадений по mmap order не годится: до
+  ранкера должен доходить rank-aware top-k с обязательным union Working Set.
 - Единственный HITL-frontier сейчас —
   [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45).
-  В нём обязательно установить верхнюю границу Working Set: без неё нельзя
-  гарантировать дешёвый fuzzy с первого символа. Остальные child tickets связаны
-  нативными GitHub dependencies и откроются по мере закрытия решений.
+  Для исторических источников принят отдельный общий предел; конкретные значения
+  определит прототип. Остальные child tickets связаны нативными GitHub
+  dependencies и откроются по мере закрытия решений.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.

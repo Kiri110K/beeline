@@ -69,11 +69,11 @@ Text in the Navigation Input used to find Items and Locations when it does not r
 _Avoid_: Path, filter
 
 **Working Set**:
-The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items from Search Memory. Unvisited descendants of Pinned Anchors are not included merely because their ancestor is pinned.
+The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items from Search Memory. It has no total Item limit: the current Location is included in full, historical sources are bounded independently, and unvisited descendants of a Pinned Anchor are not included merely because their ancestor is pinned.
 _Avoid_: Local index, Recents, cache
 
 **Search Memory**:
-The local, persistent association between Items and the same or similar Search Queries, created by deliberate attention or action and used for personal ranking. Mere visibility in Search Results is not a signal.
+The local, persistent association between an Item and the same or similar Search Queries, created by qualified hover or focus, Quick Look, Reveal, or an Item action. It follows the Item across rename and move; mere visibility and transient navigation are not signals.
 _Avoid_: Visit Journal, Recents, history, cache
 
 **Search Results**:
