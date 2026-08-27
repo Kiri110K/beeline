@@ -63,7 +63,7 @@ Implement the full ticket-#8 contract. Load-bearing rules:
 
 ## 7. Recents (#10, research #3)
 
-- The Recents collection is system-derived: Spotlight (`mdfind` last-used ≥ 90-day window, widening as needed, per research #3) with batched metadata; files only, no directories; newest last-used first. The Finder-parity gap is accepted; hidden and support files are rejected by the documented post-filter.
+- The Recents collection is system-derived: Spotlight (`mdfind` last-used date through a measured one-year window, with one unbounded fallback when the cache target is not filled) returns paths and dates in one process; files only, no directories; newest last-used first. The Finder-parity gap is accepted; hidden and support files are rejected by the documented post-filter.
 - No sorting or filtering controls on the Recents view in v1 (a different order may become a Settings option later). Typing starts global Search, not a filter.
 - Progressive loading: first visible rows instantly from the last-success cache, batches of 100 in the background on scroll; no hard cap. Refresh cost evidence: 59–84 ms (#7).
 - Inaccessible Items stay visible and fail on action with an explanatory error; the app expects near-complete disk access. Degraded states: honestly empty vs Spotlight unavailable (disabled / privacy-excluded / still indexing) with an explanation — no silent filesystem-crawl fallback.

@@ -538,6 +538,9 @@ export function useTabs(
   const searchSeqRef = useRef(new Map<TabId, number>());
   const slowTimerRef = useRef(new Map<TabId, ReturnType<typeof setTimeout>>());
   const searchCountRef = useRef(0);
+  // Explicit New Tab actions are timed through the first committed entry-point frame.
+  // Keeping this outside React state avoids adding a render to the measured path.
+  const newTabTimingRef = useRef(new Map<TabId, number>());
 
   const clearSlowTimer = useCallback((id: TabId): void => {
     const timer = slowTimerRef.current.get(id);
@@ -599,6 +602,23 @@ export function useTabs(
                 : null,
           },
         });
+        const newTabStartedAt = newTabTimingRef.current.get(tabId);
+        if (newTabStartedAt !== undefined) {
+          newTabTimingRef.current.delete(tabId);
+          // The first frame commits React state; the second observes the painted cached
+          // collection and the focus request queued by `newTemporaryTab`.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              if (tabId === stateRef.current.activeId) {
+                fireTelemetry("temporary_tab_first_frame", {
+                  entry_point: location.kind,
+                  focused: document.activeElement === inputRef.current,
+                  duration_ms: Math.round(performance.now() - newTabStartedAt),
+                });
+              }
+            });
+          });
+        }
         if (location.kind === "directory" && (forceRecord || nav !== "replace")) {
           void recordVisit(location.path, "entered_location").match(
             () => undefined,
@@ -1644,6 +1664,7 @@ export function useTabs(
     const current = stateRef.current;
     const nowMs = Date.now();
     const id = freshTabId();
+    newTabTimingRef.current.set(id, performance.now());
     const tab = makeTemporaryTab({ id, nowMs, originatorId: current.activeId });
     // Insert beside the originator, always after the Pinned group (§4).
     const activeIndex = current.tabs.findIndex((t) => t.id === current.activeId);

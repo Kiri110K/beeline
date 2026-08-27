@@ -213,7 +213,39 @@ impl MappedBase {
         }
     }
 
+    /// Open an index whose exact file identity was validated on an earlier launch.
+    /// Header, layout, size, and root are still checked on every open; the expensive
+    /// payload checksum and full Item walk are skipped only when persistence has proved
+    /// that this is the same unchanged file.
+    pub(crate) fn open_prevalidated(
+        path: &Path,
+        expected_root: &Path,
+    ) -> std::io::Result<Option<Self>> {
+        let mapping = match MappedFile::open(path) {
+            Ok(mapping) => mapping,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match Self::parse_layout(mapping, expected_root) {
+            Ok(base) => Ok(Some(base)),
+            Err(()) => Ok(None),
+        }
+    }
+
     fn parse(mapping: MappedFile, expected_root: &Path) -> Result<Self, ()> {
+        let base = Self::parse_layout(mapping, expected_root)?;
+        let expected_hash = read_u64(base.mapping.bytes(), 32)?;
+        let mut hash = FNV_OFFSET;
+        hash_bytes(&mut hash, &base.mapping.bytes()[HEADER_LEN..]);
+        if hash != expected_hash {
+            return Err(());
+        }
+
+        base.validate()?;
+        Ok(base)
+    }
+
+    fn parse_layout(mapping: MappedFile, expected_root: &Path) -> Result<Self, ()> {
         let bytes = mapping.bytes();
         if bytes.len() < HEADER_LEN
             || bytes.get(0..4) != Some(MAGIC)
@@ -226,7 +258,6 @@ impl MappedBase {
         let node_count = read_u32(bytes, 16)? as usize;
         let entry_count = read_u32(bytes, 20)? as usize;
         let arena_len = usize::try_from(read_u64(bytes, 24)?).map_err(|_| ())?;
-        let expected_hash = read_u64(bytes, 32)?;
         let root_start = HEADER_LEN;
         let node_start = root_start.checked_add(root_len).ok_or(())?;
         let entry_start = node_start
@@ -244,13 +275,7 @@ impl MappedBase {
         if Path::new(root) != expected_root {
             return Err(());
         }
-        let mut hash = FNV_OFFSET;
-        hash_bytes(&mut hash, &bytes[HEADER_LEN..]);
-        if hash != expected_hash {
-            return Err(());
-        }
-
-        let base = Self {
+        Ok(Self {
             mapping,
             root_start,
             root_len,
@@ -260,9 +285,7 @@ impl MappedBase {
             entry_count,
             arena_start,
             arena_len,
-        };
-        base.validate()?;
-        Ok(base)
+        })
     }
 
     /// Map a file just written and synced by the v4 persister without reading its entire

@@ -140,6 +140,26 @@ impl NameIndex {
         let data = Arc::new(RwLock::new(
             loaded.unwrap_or_else(|| IndexData::new(root.clone())),
         ));
+        if had_persisted {
+            // The validation stamp keeps cold launch bounded by avoiding a 310+ MiB
+            // checksum walk. Warm the ranker's worker paths and a representative slice of
+            // Item/name pages now, while startup still has ample budget, so that the first
+            // real keystroke does not inherit that cold-page cost. `g` also exercises the
+            // RU-layout variant and consistently reaches the candidate cap on the reference
+            // index without making the entire mapping resident.
+            let started = Instant::now();
+            let index = data.read().expect("name index lock poisoned");
+            let outcome = query::run(&index, &RankContext::empty(), "g", 50, None, None);
+            record(
+                app,
+                "search_prewarmed",
+                json!({
+                    "duration_ms": u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "scanned": outcome.scanned,
+                }),
+            );
+        }
         let junk_refresh =
             JunkRefresh::new(data.clone(), root.clone(), junk.clone(), Some(app.clone()));
         let (watcher_start_tx, watcher_start_rx) = mpsc::channel();
@@ -1394,6 +1414,27 @@ mod tests {
             crawl_seconds,
             persist_ms,
             bytes as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_persisted_index_load_timing() {
+        use std::time::Instant;
+
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let started = Instant::now();
+        let index = persist::load(&index_path, &root).expect("load live persisted index");
+        println!(
+            "loaded {} entries / {} dirs in {:.2} ms",
+            index.len(),
+            index.node_len(),
+            started.elapsed().as_secs_f64() * 1000.0
         );
     }
 

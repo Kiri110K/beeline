@@ -20,8 +20,7 @@ pub struct AliasDictionary {
 }
 
 impl AliasDictionary {
-    /// An empty dictionary (no aliases). Used by the ranker tests.
-    #[cfg(test)]
+    /// An empty dictionary (no aliases). Used by ranker tests and startup prewarm.
     pub fn empty() -> Self {
         Self {
             map: HashMap::new(),

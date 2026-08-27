@@ -1,7 +1,11 @@
 import { type KeyboardEvent, type ReactElement } from "react";
 
 import { strings } from "../strings";
+import { recordTelemetry, reportShellError } from "../shell";
 import type { Tabs } from "../tabs/useTabs";
+
+const KEYSTROKE_TELEMETRY_SAMPLE = 20;
+let keystrokeCount = 0;
 
 // The full-width Navigation Input (SPEC §3, §5): a real editable field whose text
 // is always a Search Query through the one ranker. It is the DOM focus holder in
@@ -75,7 +79,23 @@ export function NavigationInput({
           }
         }}
         onChange={(event) => {
+          const startedAt = performance.now();
           changeQuery(event.currentTarget.value);
+          keystrokeCount += 1;
+          // The first sample makes a short validation flow sufficient; subsequent samples
+          // stay sparse so telemetry IPC never becomes part of the ordinary typing path.
+          if (
+            keystrokeCount === 1 ||
+            keystrokeCount % KEYSTROKE_TELEMETRY_SAMPLE === 0
+          ) {
+            const queryLength = event.currentTarget.value.length;
+            requestAnimationFrame(() => {
+              void recordTelemetry("keystroke_first_frame", {
+                query_len: queryLength,
+                duration_ms: Math.round(performance.now() - startedAt),
+              }).match(() => undefined, reportShellError);
+            });
+          }
         }}
         onKeyDown={onKeyDown}
         className="w-full rounded bg-neutral-800 px-2 py-1 text-neutral-100 outline-none placeholder:text-neutral-500"

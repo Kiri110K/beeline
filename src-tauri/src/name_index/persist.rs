@@ -8,6 +8,7 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -34,6 +35,96 @@ struct PersistedShape {
 }
 
 const F_NOCACHE: i32 = 48;
+const TRUST_MAGIC: &[u8; 4] = b"BLNT";
+const TRUST_VERSION: u32 = 1;
+const TRUST_LEN: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl FileIdentity {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn encode(self) -> [u8; TRUST_LEN] {
+        let mut bytes = [0u8; TRUST_LEN];
+        bytes[0..4].copy_from_slice(TRUST_MAGIC);
+        bytes[4..8].copy_from_slice(&TRUST_VERSION.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.device.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.inode.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.size.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.modified_seconds.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.modified_nanoseconds.to_le_bytes());
+        bytes[48..56].copy_from_slice(&self.changed_seconds.to_le_bytes());
+        bytes[56..64].copy_from_slice(&self.changed_nanoseconds.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != TRUST_LEN
+            || bytes.get(0..4) != Some(TRUST_MAGIC)
+            || u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) != TRUST_VERSION
+        {
+            return None;
+        }
+        let u64_at = |start| {
+            bytes
+                .get(start..start + 8)?
+                .try_into()
+                .ok()
+                .map(u64::from_le_bytes)
+        };
+        let i64_at = |start| {
+            bytes
+                .get(start..start + 8)?
+                .try_into()
+                .ok()
+                .map(i64::from_le_bytes)
+        };
+        Some(Self {
+            device: u64_at(8)?,
+            inode: u64_at(16)?,
+            size: u64_at(24)?,
+            modified_seconds: i64_at(32)?,
+            modified_nanoseconds: i64_at(40)?,
+            changed_seconds: i64_at(48)?,
+            changed_nanoseconds: i64_at(56)?,
+        })
+    }
+}
+
+fn trust_path(path: &Path) -> PathBuf {
+    path.with_extension("idx.trust")
+}
+
+fn read_trust(path: &Path) -> Option<FileIdentity> {
+    FileIdentity::decode(&fs::read(trust_path(path)).ok()?)
+}
+
+fn write_trust(path: &Path, identity: FileIdentity) -> std::io::Result<()> {
+    let trust = trust_path(path);
+    let temporary = path.with_extension("idx.trust.tmp");
+    fs::write(&temporary, identity.encode())?;
+    fs::rename(temporary, trust)
+}
 
 unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
@@ -263,10 +354,21 @@ pub fn index_path(app_data_dir: &Path, volume_key: &str) -> PathBuf {
 }
 
 pub fn load(path: &Path, expected_root: &Path) -> Option<IndexData> {
-    MappedBase::open(path, expected_root)
-        .ok()
-        .flatten()
-        .map(|base| IndexData::from_base(expected_root.to_path_buf(), base))
+    let identity = FileIdentity::read(path).ok()?;
+    let prevalidated = read_trust(path).is_some_and(|trusted| trusted == identity);
+    let base = if prevalidated {
+        MappedBase::open_prevalidated(path, expected_root)
+    } else {
+        MappedBase::open(path, expected_root)
+    }
+    .ok()
+    .flatten()?;
+    if !prevalidated {
+        // A missing stamp is only a performance miss. The fully validated index remains
+        // usable even if this best-effort cache write fails.
+        let _ = write_trust(path, identity);
+    }
+    Some(IndexData::from_base(expected_root.to_path_buf(), base))
 }
 
 pub fn save(shared: &Arc<RwLock<IndexData>>, path: &Path) -> std::io::Result<()> {
@@ -302,6 +404,11 @@ pub fn save(shared: &Arc<RwLock<IndexData>>, path: &Path) -> std::io::Result<()>
         shape.arena_len,
     )?;
     fs::rename(&temp_path, path)?;
+    // The file was checksummed while writing, synced, and structurally produced from a
+    // live IndexData. Bind that validation to the final inode for the next launch.
+    if let Ok(identity) = FileIdentity::read(path) {
+        let _ = write_trust(path, identity);
+    }
     index.replace_base(base);
     Ok(())
 }

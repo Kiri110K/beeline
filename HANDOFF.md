@@ -16,6 +16,49 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 Закрытый тикет = сделан и проверен, у закрытого есть комментарий-вердикт.
 Открытый с assignee = был в работе; смотри его комментарии и `git log`.
 
+## Performance pass #31 — исправления и замеры 27.08
+
+- После реального reboot Login Item PID 891 загружал persisted Name Index только
+  на 8 278 мс: каждый старт заново хешировал 310 МБ и обходил 5,15 млн Item.
+  Теперь после одной полной проверки рядом с `home.idx` лежит 64-байтный
+  validation stamp, привязанный к device/inode/size/mtime/ctime. Неизменившийся
+  файл проверяет заголовок, layout, размер и root без полного payload walk.
+  Любое изменение identity возвращает прежние checksum + structural validation;
+  существующий corrupt-v4 regression остаётся зелёным.
+- Fast path на реальном индексе: release loader 8,03 мс после stamp против
+  898,64 мс полного validation при тёплом page cache. В свежем signed app index
+  готов на 379 мс от старта процесса. Startup prewarm одного representative
+  поиска занял 73 мс, первый usable frame — 619 мс при лимите 800 мс. Login
+  prewarm снова с большим запасом внутри 2 с.
+- Fast loader сначала перенёс холодные страницы в первый пользовательский поиск:
+  `g` занял 104 мс. Поэтому startup теперь заранее выполняет один ограниченный
+  `g` scan. После него первый реальный запрос по другому символу (`a`) занял
+  меньше 25 мс; keystroke frame — 3 мс. Charged physical footprint main process
+  после prewarm и поиска — 56 MiB (RSS около 210 MiB включает reclaimable mmap).
+- Recents больше не начинает с unbounded Spotlight query. Один год дал 255
+  кандидатов за 90 мс на reference Mac и заполнил cache target 200; если
+  post-filter оставит меньше target, код один раз повторяет запрос без окна.
+  Свежий app записал `recents_refresh` 127 мс при лимите 150 мс. Unit test
+  покрывает fallback; cache-first поведение не менялось.
+- NDJSON теперь измеряет `temporary_tab_first_frame` с фактом DOM focus и
+  `keystroke_first_frame`. Реальный UI pass PID 54466: New Temporary Tab 43 мс
+  и `focused=true`, keystroke 2 мс, обычный каталог 38 мс, Quick Look dispatch
+  2 мс, shortcut show→paint 49 мс и show→settled focus 41 мс. Exact-path Reveal
+  и native Quick Look проверены на отдельном TXT fixture.
+- Снимки UI pass: `/private/tmp/codex-computer-use.beeline31.TBorAg/01-start.png`
+  … `05-warm-entry.png`. Computer control остановил дальнейшие команды после
+  внешнего изменения окна, поэтому test bundle завершён и чистый Recents
+  восстановлен; установленная `/Applications/Beeline.app` не заменялась.
+- Зелёные на текущем дереве: 93 Rust tests (8 ignored), recents
+  fallback test, fmt, clippy `-D warnings`, typecheck, lint, четыре JS contract
+  tests и signed `pnpm tauri build` (executable SHA-256 `9e5481a…0f82`).
+  Пользовательская `.claude/` не тронута.
+
+**Осталось в #31:** отдельный свободный GUI-слот для Spaces/full-screen,
+пятиминутного Pinned Excursion reset и оставшихся строк полного smoke §16. После
+этого — финальный verdict и закрытие #31; parent #23 закрывать следом, если smoke
+не найдёт нового дефекта.
+
 ## Name Index watcher #41 завершён — 27.08
 
 - Причина многоминутного `remove_slots` найдена в mapped v4: `MappedBase`

@@ -2,13 +2,13 @@
 //! used files, sourced from Spotlight — never a filesystem crawl.
 //!
 //! Mechanism (research #3, amended by measurement): Finder's public metadata predicate
-//! over `kMDItemLastUsedDate` plus a content-type tree, run through a single unbounded
-//! `mdfind -attr kMDItemLastUsedDate` call — paths and dates in one process. Research
-//! #3's progressive widening and batched `mdls` dating were measured on the reference
-//! machine to cost 2-4 process launches per refresh and blow the 150 ms budget (SPEC
-//! §10), while the bare unbounded query is no slower than a windowed one. Results are
-//! sorted newest-first, passed through the documented post-filter (hidden and support
-//! files), and only the kept top slice pays a per-file metadata read.
+//! over `kMDItemLastUsedDate` plus a content-type tree, run through one
+//! `mdfind -attr kMDItemLastUsedDate` call — paths and dates in one process. The first
+//! query uses a one-year window, which supplies the 200-row cache on the reference machine
+//! while keeping Spotlight inside the 150 ms budget. If filtering leaves fewer rows than
+//! requested, one unbounded fallback preserves the complete Recents behavior. Results are
+//! sorted newest-first, passed through the documented post-filter, and only the kept top
+//! slice pays a per-file metadata read.
 //!
 //! Serving is cache-first: [`get_recents`] returns a slice of the last-success cache
 //! instantly and kicks off one background refresh (never more than one in flight). The
@@ -54,6 +54,7 @@ const REFRESH_TARGET: usize = 200;
 // user-facing content type (content tree, a Microsoft type, or an archive). Directories
 // are excluded because none of these content types match a folder.
 const PREDICATE: &str = "(kMDItemLastUsedDate = \"*\") && ((kMDItemContentTypeTree = public.content) || (kMDItemContentTypeTree = \"com.microsoft.*\"cdw) || (kMDItemContentTypeTree = public.archive))";
+const WINDOWED_PREDICATE: &str = "(kMDItemLastUsedDate >= $time.today(-365)) && ((kMDItemContentTypeTree = public.content) || (kMDItemContentTypeTree = \"com.microsoft.*\"cdw) || (kMDItemContentTypeTree = public.archive))";
 
 // Support-file basenames rejected by the post-filter in addition to hidden entries.
 // Most macOS support files are already dot-hidden; `Icon\r` is the notable exception.
@@ -160,6 +161,13 @@ fn passes_post_filter(path: &Path) -> bool {
 
 /// The process seam. The real implementation shells out to Spotlight tools; tests inject
 /// a fake so the pure gather/filter/sort logic runs without a live Spotlight.
+type DatedPaths = Vec<(PathBuf, Option<i64>)>;
+
+struct RecentGather {
+    paths: DatedPaths,
+    bounded: bool,
+}
+
 trait Spotlight {
     /// `mdutil -s /` classified into index health, or `Err` if the tool cannot run.
     fn index_status(&self) -> Result<IndexHealth, ()>;
@@ -173,7 +181,7 @@ trait Spotlight {
     /// it with a single `mdfind -attr` invocation — the per-batch `mdls` round-trips
     /// alone cost more than the whole 150 ms refresh budget (SPEC §10) on the reference
     /// machine.
-    fn find_dated(&self, query: &str) -> Result<Vec<(PathBuf, Option<i64>)>, ()> {
+    fn find_dated(&self, query: &str) -> Result<DatedPaths, ()> {
         let paths = self.find(query)?;
         let mut dated = Vec::with_capacity(paths.len());
         for batch in paths.chunks(DATE_BATCH) {
@@ -185,11 +193,50 @@ trait Spotlight {
         }
         Ok(dated)
     }
+
+    /// The first production gather may use a bounded date window. The boolean tells the
+    /// caller that it must retry unbounded if post-filtering cannot fill the target.
+    /// Test fakes and alternate adapters stay unbounded by default.
+    fn find_recent_dated(&self, query: &str) -> Result<RecentGather, ()> {
+        self.find_dated(query).map(|paths| RecentGather {
+            paths,
+            bounded: false,
+        })
+    }
 }
 
 /// The real Spotlight adapter: `std::process::Command`, no shell, no argument string
 /// interpolation beyond the query the caller built.
 struct SystemSpotlight;
+
+impl SystemSpotlight {
+    fn find_dated_query(query: &str) -> Result<DatedPaths, ()> {
+        let output = Command::new("mdfind")
+            .arg("-attr")
+            .arg("kMDItemLastUsedDate")
+            .arg(query)
+            .output()
+            .map_err(|_| ())?;
+        if !output.status.success() {
+            return Err(());
+        }
+        // One line per hit: `<path>\t kMDItemLastUsedDate = <date>` (missing attribute
+        // prints `(null)`, which the date parser rejects into `None`). Split on the label
+        // from the right so any path content survives.
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| match line.rsplit_once("kMDItemLastUsedDate = ") {
+                Some((path, value)) => (
+                    PathBuf::from(path.trim_end()),
+                    parse_mdls_date(value.trim()),
+                ),
+                None => (PathBuf::from(line), None),
+            })
+            .collect())
+    }
+}
 
 impl Spotlight for SystemSpotlight {
     fn index_status(&self) -> Result<IndexHealth, ()> {
@@ -237,31 +284,15 @@ impl Spotlight for SystemSpotlight {
         Ok(text.split('\0').map(parse_mdls_date).collect())
     }
 
-    fn find_dated(&self, query: &str) -> Result<Vec<(PathBuf, Option<i64>)>, ()> {
-        let output = Command::new("mdfind")
-            .arg("-attr")
-            .arg("kMDItemLastUsedDate")
-            .arg(query)
-            .output()
-            .map_err(|_| ())?;
-        if !output.status.success() {
-            return Err(());
-        }
-        // One line per hit: `<path>\t kMDItemLastUsedDate = <date>` (missing attribute
-        // prints `(null)`, which the date parser rejects into `None`). Split on the label
-        // from the right so any path content survives.
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| match line.rsplit_once("kMDItemLastUsedDate = ") {
-                Some((path, value)) => (
-                    PathBuf::from(path.trim_end()),
-                    parse_mdls_date(value.trim()),
-                ),
-                None => (PathBuf::from(line), None),
-            })
-            .collect())
+    fn find_dated(&self, query: &str) -> Result<DatedPaths, ()> {
+        Self::find_dated_query(query)
+    }
+
+    fn find_recent_dated(&self, _query: &str) -> Result<RecentGather, ()> {
+        Self::find_dated_query(WINDOWED_PREDICATE).map(|paths| RecentGather {
+            paths,
+            bounded: true,
+        })
     }
 }
 
@@ -338,19 +369,28 @@ fn compute_recents_with(spotlight: &dyn Spotlight, target: usize) -> RefreshResu
         }
     }
 
-    let found = match spotlight.find_dated(PREDICATE) {
+    let gather = match spotlight.find_recent_dated(PREDICATE) {
         Ok(found) => found,
         Err(()) => return classify_failure(spotlight),
     };
 
-    // Everything up to the truncate is string-level work — no filesystem IO.
-    let mut seen = std::collections::HashSet::new();
-    let mut candidates: Vec<(i64, PathBuf)> = found
-        .into_iter()
-        .filter(|(path, _)| seen.insert(path.clone()))
-        .filter_map(|(path, date)| date.map(|modified_ms| (modified_ms, path)))
-        .filter(|(_, path)| passes_post_filter(path))
-        .collect();
+    // Everything up to the truncate is string-level work — no filesystem IO. If the
+    // bounded production query cannot fill the cache after filtering, widen exactly once.
+    let candidates_from = |found: Vec<(PathBuf, Option<i64>)>| {
+        let mut seen = std::collections::HashSet::new();
+        found
+            .into_iter()
+            .filter(|(path, _)| seen.insert(path.clone()))
+            .filter_map(|(path, date)| date.map(|modified_ms| (modified_ms, path)))
+            .filter(|(_, path)| passes_post_filter(path))
+            .collect::<Vec<_>>()
+    };
+    let mut candidates = candidates_from(gather.paths);
+    if gather.bounded && candidates.len() < target {
+        if let Ok(unbounded) = spotlight.find_dated(PREDICATE) {
+            candidates = candidates_from(unbounded);
+        }
+    }
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     candidates.truncate(target);
 
@@ -643,6 +683,30 @@ mod tests {
         }
     }
 
+    struct WindowedFakeSpotlight(FakeSpotlight);
+
+    impl Spotlight for WindowedFakeSpotlight {
+        fn index_status(&self) -> Result<IndexHealth, ()> {
+            self.0.index_status()
+        }
+
+        fn find(&self, query: &str) -> Result<Vec<PathBuf>, ()> {
+            self.0.find(query)
+        }
+
+        fn last_used(&self, paths: &[PathBuf]) -> Result<Vec<Option<i64>>, ()> {
+            self.0.last_used(paths)
+        }
+
+        fn find_recent_dated(&self, _query: &str) -> Result<RecentGather, ()> {
+            self.find_dated(WINDOWED_PREDICATE)
+                .map(|paths| RecentGather {
+                    paths,
+                    bounded: true,
+                })
+        }
+    }
+
     #[test]
     fn predicate_shape() {
         // Finder's public Recents predicate: last-used date plus user-facing types.
@@ -650,6 +714,8 @@ mod tests {
         assert!(PREDICATE.contains("public.content"));
         assert!(PREDICATE.contains("public.archive"));
         assert!(!PREDICATE.contains("$time.today"));
+        assert!(WINDOWED_PREDICATE.contains("$time.today(-365)"));
+        assert!(WINDOWED_PREDICATE.contains("public.content"));
     }
 
     #[test]
@@ -782,6 +848,39 @@ mod tests {
         // One gather, with the bare unbounded predicate.
         let queries = fake.queries.lock().unwrap();
         assert_eq!(queries.as_slice(), &[PREDICATE.to_owned()]);
+    }
+
+    #[test]
+    fn bounded_gather_widens_once_when_filtering_cannot_fill_target() {
+        let dir = TempDir::new();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        let third = dir.path().join("c.txt");
+        for path in [&first, &second, &third] {
+            fs::write(path, b"x").unwrap();
+        }
+        let dates = HashMap::from([
+            (first.clone(), Some(10)),
+            (second.clone(), Some(20)),
+            (third.clone(), Some(30)),
+        ]);
+        let fake = WindowedFakeSpotlight(FakeSpotlight::healthy(
+            vec![Ok(vec![first.clone()]), Ok(vec![first, second, third])],
+            dates,
+        ));
+
+        match compute_recents_with(&fake, 2) {
+            RefreshResult::Ok(items) => {
+                let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+                assert_eq!(names, vec!["c.txt", "b.txt"]);
+            }
+            other => panic!("expected Ok, got {:?}", other_kind(&other)),
+        }
+        let queries = fake.0.queries.lock().unwrap();
+        assert_eq!(
+            queries.as_slice(),
+            &[WINDOWED_PREDICATE.to_owned(), PREDICATE.to_owned()]
+        );
     }
 
     #[test]

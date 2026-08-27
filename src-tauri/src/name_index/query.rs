@@ -143,10 +143,9 @@ pub struct RankContext<'a> {
     pub aliases: &'a AliasDictionary,
 }
 
-#[cfg(test)]
 impl RankContext<'static> {
-    /// A context with no journal and no aliases, for tier/ordering tests and any caller
-    /// that only needs the text ranker.
+    /// A context with no journal and no aliases, for ranker tests and startup's one
+    /// content-independent cache warm-up.
     pub fn empty() -> RankContext<'static> {
         use std::sync::OnceLock;
         static AGG: OnceLock<Aggregate> = OnceLock::new();
