@@ -29,6 +29,8 @@ const readyStateSchema = z.object({
   focusedPath: z.string().nullable(),
   selected: z.set(z.number()),
   selectedPaths: z.map(z.number(), z.string()),
+  scrollTop: z.number(),
+  pendingScrollTop: z.number(),
 });
 
 function item(index: number): Record<string, unknown> {
@@ -79,12 +81,15 @@ try {
     nav: "replace",
     originScrollTop: 0,
     focusPath: targetPath,
+    focusScrollTop: targetIndex * 28,
   });
   const initial = readyStateSchema.parse(listed);
   assert.equal(initial.load.items.length, 64);
   assert.equal(initial.load.total, 50_000);
   assert.equal(initial.focusedIndex, targetIndex);
   assert.equal(initial.focusedPath, targetPath);
+  assert.equal(initial.scrollTop, targetIndex * 28);
+  assert.equal(initial.pendingScrollTop, targetIndex * 28);
 
   const windowItems = Array.from({ length: 2_048 }, (_, index) => item(index));
   const shifted = module.browseReducer(listed, {

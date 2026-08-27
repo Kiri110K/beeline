@@ -410,6 +410,8 @@ pub async fn list_location_initial(
 ) -> Result<InitialListLocation, ListError> {
     let started = Instant::now();
     let telemetry_path = request.path.clone();
+    let focus_requested = request.focus_path.is_some();
+    let selection_requested = request.selected_paths.len();
     let task_path = request.path.clone();
     let session = tauri::async_runtime::spawn_blocking(move || build_session(&task_path))
         .await
@@ -442,6 +444,11 @@ pub async fn list_location_initial(
             "returned": listing.items.len(),
             "complete": listing.complete,
             "phase": "initial",
+            "offset": listing.offset,
+            "focus_requested": focus_requested,
+            "focus_resolved": listing.focus_index.is_some(),
+            "selection_requested": selection_requested,
+            "selection_resolved": listing.selected.len(),
             "duration_ms": duration_ms,
         }),
     ) {

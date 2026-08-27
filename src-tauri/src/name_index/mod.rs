@@ -35,7 +35,7 @@ use crate::telemetry::Telemetry;
 use alias::AliasDictionary;
 use junk::JunkPatterns;
 use junk_refresh::JunkRefresh;
-use model::IndexData;
+use model::{IndexData, Tier};
 use query::{RankContext, SearchHit};
 use visit_journal::{VisitJournal, VisitKind};
 
@@ -387,6 +387,46 @@ fn execute_search(
     }
 }
 
+/// Resolve direct navigation before it can queue behind background preview work in the
+/// shared blocking pool. Exact existing paths are already the ranker's strongest possible
+/// answer, so they need neither the Name Index read lock nor a full scan.
+fn direct_existing_path_response(
+    data: &Arc<RwLock<IndexData>>,
+    junk: &JunkPatterns,
+    root: &Path,
+    query: &str,
+    limit: usize,
+    started: Instant,
+) -> Option<SearchResponse> {
+    if limit == 0 {
+        return None;
+    }
+    let (target, is_directory) = query::existing_typed_path(query.trim(), root)?;
+    let tier = target
+        .strip_prefix(root)
+        .ok()
+        .map(|relative| junk.classify(relative))
+        .unwrap_or(Tier::Normal);
+    let path = target.to_string_lossy().into_owned();
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    let revision = data.try_read().map(|index| index.revision).unwrap_or(0);
+    Some(SearchResponse {
+        revision,
+        reused: false,
+        scanned: 0,
+        backend_duration_ms: started.elapsed().as_millis() as u64,
+        hits: vec![SearchHit {
+            name,
+            path,
+            is_directory,
+            tier: tier.as_str(),
+        }],
+    })
+}
+
 /// Run a search with no cancellation or reuse (the direct path the tests exercise).
 /// Production searches go through `search_name_index`, which adds stale-cancellation and
 /// typing-extension reuse on top of the same `execute_search` core.
@@ -425,9 +465,16 @@ pub async fn search_name_index(
 ) -> Result<SearchResponse, String> {
     // Bump on entry so any older scan still in flight sees itself superseded and aborts.
     let my_gen = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let started = Instant::now();
     let data = state.data.clone();
     let junk = state.junk_snapshot();
     let root = state.root.clone();
+    if let Some(response) =
+        direct_existing_path_response(&data, &junk, &root, &query, limit as usize, started)
+    {
+        *state.reuse.lock().expect("reuse cache lock poisoned") = None;
+        return Ok(response);
+    }
     let journal = state.journal.clone();
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
@@ -1009,6 +1056,50 @@ mod tests {
             50,
         );
         assert_eq!(response.hits[0].path, typed.to_string_lossy());
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.scanned, 0);
+        assert!(!response.reused);
+    }
+
+    #[test]
+    fn existing_typed_path_outside_index_root_skips_scan() {
+        // Direct navigation also covers mounted volumes and /private/tmp fixtures that are
+        // outside the home-root Name Index. Filesystem existence is sufficient; no indexed
+        // slot is required.
+        let root_dir = TempDir::new();
+        let outside_dir = TempDir::new();
+        let typed = outside_dir.path().join("target.txt");
+        touch(&typed);
+
+        let root = fs::canonicalize(root_dir.path()).unwrap();
+        let shared = new_index(&root);
+        let (_journal_dir, journal) = empty_journal();
+        let response = run_search(
+            &shared,
+            &Arc::new(JunkPatterns::default()),
+            &root,
+            &journal,
+            &AliasDictionary::empty(),
+            &typed.to_string_lossy(),
+            50,
+        );
+
+        assert_eq!(response.hits[0].path, typed.to_string_lossy());
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.scanned, 0);
+
+        let direct = direct_existing_path_response(
+            &shared,
+            &JunkPatterns::default(),
+            &root,
+            &typed.to_string_lossy(),
+            50,
+            Instant::now(),
+        )
+        .expect("existing external path should bypass the blocking pool");
+        assert_eq!(direct.hits[0].path, typed.to_string_lossy());
+        assert_eq!(direct.hits.len(), 1);
+        assert_eq!(direct.scanned, 0);
     }
 
     #[test]

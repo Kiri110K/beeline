@@ -81,6 +81,7 @@ export type BrowseAction =
       nav: NavKind;
       originScrollTop: number;
       focusPath: string | null;
+      focusScrollTop: number | null;
     }
   | {
       type: "revalidated";
@@ -413,6 +414,7 @@ export function browseReducer(
               scrollTop: 0,
             };
       const position = positionFor(requestedRestore, action.result.load);
+      const scrollTop = action.focusScrollTop ?? position.scrollTop;
       return {
         location: action.location,
         load: {
@@ -429,8 +431,8 @@ export function browseReducer(
         selectedPaths: position.selectedPaths,
         history,
         future,
-        scrollTop: position.scrollTop,
-        pendingScrollTop: position.scrollTop,
+        scrollTop,
+        pendingScrollTop: scrollTop,
         scrollGeneration: state.scrollGeneration + 1,
       };
     }

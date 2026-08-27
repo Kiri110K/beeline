@@ -537,6 +537,34 @@ pub(crate) fn run_impl(
         };
     }
 
+    // An exact existing path is already the strongest possible answer (guarantee a).
+    // Resolve it before touching the Name Index: scanning millions of entries only to
+    // inject this same path afterwards turns direct navigation into a multi-second search.
+    // Mark the shortcut non-exhaustive so its singleton result is never reused as a match
+    // set for a later, extended query.
+    if is_path_shaped(trimmed) {
+        if let Some((target, is_dir)) = existing_typed_path(trimmed, &index.root) {
+            let mut candidates = Vec::with_capacity(1);
+            inject(&mut candidates, index, &target, EXISTING_PATH, is_dir);
+            let hits = candidates
+                .into_iter()
+                .map(|candidate| SearchHit {
+                    name: candidate.name,
+                    path: candidate.path,
+                    is_directory: candidate.is_directory,
+                    tier: candidate.tier.as_str(),
+                })
+                .collect();
+            return SearchOutcome {
+                hits,
+                exhaustive: false,
+                aborted: false,
+                scanned: 0,
+                candidate_entries: Vec::new(),
+            };
+        }
+    }
+
     let prep = Prepared::new(index, trimmed, &query_lower);
     let (mut candidates, scanned, aborted, capped) = match reuse {
         Some(slots) => scan_reuse(index, &prep, ctx, slots, cancel),
@@ -565,13 +593,6 @@ pub(crate) fn run_impl(
         Vec::new()
     };
 
-    // Guarantee (a): an existing typed absolute path ranks its target first. The fs
-    // existence check is only ever done here, for path-shaped queries.
-    if prep.path_shaped {
-        if let Some((target, is_dir)) = existing_typed_path(trimmed, &index.root) {
-            inject(&mut candidates, index, &target, EXISTING_PATH, is_dir);
-        }
-    }
     // Guarantee (g): an alias word recommends its target — added, never used to filter.
     if let Some(target) = ctx.aliases.resolve(&query_lower) {
         let target = target.to_path_buf();
@@ -1296,7 +1317,7 @@ fn known_places(root: &Path) -> HashSet<PathBuf> {
 /// Resolve a path-shaped query to an existing absolute path on disk, expanding a leading
 /// `~` to the root. Returns the path and whether it is a directory, or `None` when the
 /// query is not an absolute/`~` path or nothing exists there.
-fn existing_typed_path(query: &str, root: &Path) -> Option<(PathBuf, bool)> {
+pub(crate) fn existing_typed_path(query: &str, root: &Path) -> Option<(PathBuf, bool)> {
     let expanded = if query == "~" {
         root.to_path_buf()
     } else if let Some(rest) = query.strip_prefix("~/") {

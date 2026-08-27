@@ -48,6 +48,11 @@ interface PreviewAsyncState {
 // Sampled `preview_shown {kind}` telemetry: one line every Nth preview so the focus-movement
 // path stays cheap (SPEC §9 telemetry). Module-scoped so the count spans remounts.
 const PREVIEW_TELEMETRY_SAMPLE = 20;
+// Do not enqueue filesystem work for every row crossed while a key is held or a wheel is
+// moving. The target and pending state still paint immediately; only the async preview waits
+// for a short focus dwell. Without this coalescing, thousands of stale IPC promises can fill
+// WebContent memory and the shared blocking pool before their generation guards drop replies.
+const PREVIEW_REQUEST_DELAY_MS = 150;
 let previewShownCount = 0;
 
 function recordPreviewShown(kind: string): void {
@@ -111,56 +116,62 @@ export function usePreview(target: PreviewTarget | null): PreviewView | null {
       );
     };
 
-    void previewMetadata(path).match(
-      (metadata) => {
-        commit((base) => ({ ...base, meta: { status: "ready", metadata } }));
-      },
-      () => {
-        commit((base) => ({ ...base, meta: { status: "missing" } }));
-      },
-    );
+    const timer = window.setTimeout(() => {
+      void previewMetadata(path).match(
+        (metadata) => {
+          commit((base) => ({ ...base, meta: { status: "ready", metadata } }));
+        },
+        () => {
+          commit((base) => ({ ...base, meta: { status: "missing" } }));
+        },
+      );
 
-    switch (kind) {
-      case "text":
-        void previewTextExcerpt(path, PREVIEW_TEXT_MAX_BYTES).match(
-          (excerpt) => {
-            commit((base) => ({
-              ...base,
-              body: {
-                status: "text",
-                text: excerpt.text,
-                truncated: excerpt.truncated,
-              },
-            }));
-          },
-          // A binary/vanished/unreadable excerpt falls back to a generic icon.
-          () => {
-            commit((base) => ({ ...base, body: { status: "none" } }));
-          },
-        );
-        break;
-      case "thumbnail":
-        void previewThumbnail(path, PREVIEW_THUMBNAIL_MAX_PX).match(
-          (thumbnail) => {
-            // `null` means a newer request superseded this one — leave the pending body for
-            // the newer request to resolve (SPEC §10: stale results are dropped).
-            if (thumbnail === null) {
-              return;
-            }
-            commit((base) => ({
-              ...base,
-              body: { status: "image", src: convertFileSrc(thumbnail.pngPath) },
-            }));
-          },
-          // No thumbnail (unsupported/failed): fall back to a generic icon.
-          () => {
-            commit((base) => ({ ...base, body: { status: "none" } }));
-          },
-        );
-        break;
-      case "generic":
-        break;
-    }
+      switch (kind) {
+        case "text":
+          void previewTextExcerpt(path, PREVIEW_TEXT_MAX_BYTES).match(
+            (excerpt) => {
+              commit((base) => ({
+                ...base,
+                body: {
+                  status: "text",
+                  text: excerpt.text,
+                  truncated: excerpt.truncated,
+                },
+              }));
+            },
+            // A binary/vanished/unreadable excerpt falls back to a generic icon.
+            () => {
+              commit((base) => ({ ...base, body: { status: "none" } }));
+            },
+          );
+          break;
+        case "thumbnail":
+          void previewThumbnail(path, PREVIEW_THUMBNAIL_MAX_PX).match(
+            (thumbnail) => {
+              // `null` means a newer request superseded this one — leave the pending body for
+              // the newer request to resolve (SPEC §10: stale results are dropped).
+              if (thumbnail === null) {
+                return;
+              }
+              commit((base) => ({
+                ...base,
+                body: { status: "image", src: convertFileSrc(thumbnail.pngPath) },
+              }));
+            },
+            // No thumbnail (unsupported/failed): fall back to a generic icon.
+            () => {
+              commit((base) => ({ ...base, body: { status: "none" } }));
+            },
+          );
+          break;
+        case "generic":
+          break;
+      }
+    }, PREVIEW_REQUEST_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
   }, [path, name, isDirectory]);
 
   if (target === null) {

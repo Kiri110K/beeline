@@ -13,9 +13,43 @@ Claude Code на этом Маке, без доступа к прошлой.
 ## Источник правды по прогрессу
 
 GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родитель).
-Тикеты #24–#32; закрытый = сделан и проверен, у закрытого есть
-комментарий-вердикт. Открытый с assignee = был в работе; смотри его
-комментарии и `git log` — что уже закоммичено.
+Закрытый тикет = сделан и проверен, у закрытого есть комментарий-вердикт.
+Открытый с assignee = был в работе; смотри его комментарии и `git log`.
+
+## WebContent memory #38 завершён — 27.08
+
+- Frontend Location хранит только ограниченное окно строк. Preview ждёт 150 мс
+  устойчивого фокуса перед metadata/excerpt/thumbnail IPC, поэтому быстрая
+  клавиатурная и wheel-навигация больше не ставит тысячи устаревших запросов в
+  очередь WebContent и общего blocking pool.
+- Точный существующий путь возвращается до blocking pool и без сканирования
+  Name Index. Reveal передаёт явную глобальную позицию прокрутки, поэтому
+  восстановление старого scrollTop больше не сбрасывает окно обратно к строке 0.
+- Финальный GUI stress-pass на каталоге из 50 000 файлов прошёл. WebContent:
+  Recents 39.649 MiB, после полного сценария 67.813 MiB, после idle 66.255 MiB;
+  рост 28.164/26.606 MiB при лимите 64 MiB, абсолютный максимум ниже 120 MiB.
+  Первый кадр большого каталога занял 47 мс.
+- Непрерывность проверена на строках 250, 750, 1250, 1750, 2250 и 2500.
+  Пустых строк, перестановки и потери фокуса нет. Точный путь
+  `file_30000.txt` открылся без состояния Searching; Reveal вернул окно с
+  offset 29968 и нужной строкой; Quick Look перешёл на `file_30002.txt`.
+- Автопроверки зелёные: 87 Rust-тестов прошли, 6 ignored; `cargo fmt`, clippy
+  с `-D warnings`, `pnpm typecheck`, lint и весь набор JS contract tests.
+  Финальный подписанный `pnpm tauri build` установлен в
+  `/Applications/Beeline.app`.
+- Отчёты: memory/scroll
+  `/private/tmp/codex-computer-use.beeline38-coalesced.fLjJQA/report.md`,
+  Reveal/Quick Look
+  `/private/tmp/codex-computer-use.beeline38-final-reveal.aD11ne/report.md`.
+- Во время stress-pass main process держал 47–63% CPU. `sample` показал все
+  2130 выборок в Name Index watcher:
+  `apply_fs_event → reconcile_dir_children → remove_child → remove_slots`.
+  Это отдельная проблема обслуживания Name Index, не WebContent; она вынесена
+  в отдельный GitHub follow-up.
+
+**Следующее:** ограничить стоимость удаления больших поддеревьев из overlay по
+FSEvents. После этого вернуться к общему performance pass #31. Bounded
+incremental persistence Name Index остаётся в post-v1 задаче #40.
 
 ## Пауза на WebContent memory #38 — 25.08, перед обновлением T3 Code
 

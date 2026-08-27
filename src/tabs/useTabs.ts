@@ -591,6 +591,12 @@ export function useTabs(
             nav,
             originScrollTop,
             focusPath: focusPath ?? null,
+            focusScrollTop:
+              focusPath !== undefined &&
+              result.kind === "items" &&
+              result.load.focusIndex !== null
+                ? result.load.focusIndex * ROW_HEIGHT
+                : null,
           },
         });
         if (location.kind === "directory" && (forceRecord || nav !== "replace")) {
