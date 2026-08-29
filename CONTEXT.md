@@ -68,6 +68,10 @@ _Avoid_: Path Input, search box, address bar
 Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path. Its identity ignores case, surrounding and repeated whitespace, and canonically equivalent Unicode encoding, but preserves punctuation.
 _Avoid_: Path, filter
 
+**Query Family**:
+Normalized non-path Search Queries with the same distinct tokens regardless of token order or repetition. Members share Search Memory at full strength.
+_Avoid_: Query history, permutation
+
 **Working Set**:
 The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items with retained query-independent usage or Search Memory. It has no total Item limit: the current Location is included in full, historical sources are bounded independently, and unvisited descendants of a Pinned Anchor are not included merely because their ancestor is pinned.
 _Avoid_: Local index, Recents, cache
