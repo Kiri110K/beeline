@@ -46,8 +46,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 - Единственный HITL-frontier сейчас —
   [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45).
   Для исторических источников принят отдельный общий предел; конкретные значения
-  определит прототип. Остальные child tickets связаны нативными GitHub
-  dependencies и откроются по мере закрытия решений.
+  определит прототип. Пассивные visibility, scroll, hover, focus и selection не
+  обучают ранжирование. Action Menu даёт слабый сигнал, Quick Look — средний,
+  выполненное недеструктивное Item action — сильный. Накопление повторов не
+  решается умозрительно: его сравнит
+  [Prototype repeated Search Memory signals](https://github.com/Kiri110K/beeline/issues/53),
+  который теперь блокирует финализацию контракта. Остальные child tickets связаны
+  нативными GitHub dependencies и откроются по мере закрытия решений.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
