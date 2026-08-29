@@ -23,9 +23,8 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 - Исходное обсуждение записано и закрыто в
   [Set the Search v2 direction](https://github.com/Kiri110K/beeline/issues/43).
   Search v2 сначала ищет в личном Working Set, затем расширяется на Name Index по
-  горячо настраиваемому порогу. Search Memory учится на hover/focus и действиях,
-  переносит приоритет между похожими запросами; fuzzy работает с первого символа.
-  Совместимость с v1 не требуется.
+  горячо настраиваемому порогу. Search Memory переносит приоритет между похожими
+  запросами; fuzzy работает с первого символа. Совместимость с v1 не требуется.
 - В `CONTEXT.md` добавлены канонические термины Working Set и Search Memory.
   Простая видимость строки в Search Results не считается сигналом.
 - Отложенное Gen2-направление записано в
@@ -43,21 +42,28 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   FST + automaton для whole-name/token и mixed bigram/trigram postings для fuzzy
   substring. Старый лимит первых 4096 совпадений по mmap order не годится: до
   ранкера должен доходить rank-aware top-k с обязательным union Working Set.
-- Единственный HITL-frontier сейчас —
-  [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45).
+- [Define the Working Set and Search Memory contract](https://github.com/Kiri110K/beeline/issues/45)
+  закрыт.
   Для исторических источников принят отдельный общий предел; конкретные значения
   определит прототип. Пассивные visibility, scroll, hover, focus и selection не
   обучают ранжирование. Action Menu даёт слабый сигнал, Quick Look — средний,
-  выполненное недеструктивное Item action — сильный. Накопление повторов не
-  решается умозрительно: его сравнит
+  выполненное недеструктивное Item action — сильный. Отдельный
   [Prototype repeated Search Memory signals](https://github.com/Kiri110K/beeline/issues/53),
-  который теперь блокирует финализацию контракта. Остальной HITL-frontier этого
-  решения исчерпан. Память не имеет TTL, плавно стареет и вымывается лимитом;
-  Settings даёт только `Reset Learned Ranking`. Удалённый Item и Item на
-  отключённом диске не показываются, но их память остаётся неактивной. Серый
-  `No Access` разрешён только для Item, который существует, но сейчас недоступен
-  из-за прав. Остальные child tickets связаны нативными GitHub dependencies и
-  откроются по мере закрытия решений.
+  закрыт как `not planned`: первая встроенная версия напрямую накапливает события
+  без специального объединения повторов. Решение об усложнении принимается после
+  реального использования Кириллом по локальным диагностическим логам. Память не
+  имеет TTL, плавно стареет и вымывается лимитом; Settings даёт только
+  `Reset Learned Ranking`. Удалённый Item и Item на отключённом диске не
+  показываются, но их память остаётся неактивной. Серый `No Access` разрешён
+  только для Item, который существует, но сейчас недоступен из-за прав.
+- Продукт делается для одного пользователя и быстрых итераций. Не сохранять
+  compatibility с v1 или экспериментальным learned state. Настройки ранжирования
+  держать централизованными и дешёвыми для изменения. При замене search/ranking/
+  persistence path удалять старую ветку в том же изменении; не оставлять dual
+  pipeline, fallback и мёртвый код «на всякий случай».
+- Следующий открытый frontier теперь состоит из
+  [Define query similarity and memory transfer](https://github.com/Kiri110K/beeline/issues/44)
+  и [Prototype the staged retrieval threshold](https://github.com/Kiri110K/beeline/issues/51).
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
