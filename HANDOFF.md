@@ -51,8 +51,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   выполненное недеструктивное Item action — сильный. Накопление повторов не
   решается умозрительно: его сравнит
   [Prototype repeated Search Memory signals](https://github.com/Kiri110K/beeline/issues/53),
-  который теперь блокирует финализацию контракта. Остальные child tickets связаны
-  нативными GitHub dependencies и откроются по мере закрытия решений.
+  который теперь блокирует финализацию контракта. Остальной HITL-frontier этого
+  решения исчерпан. Память не имеет TTL, плавно стареет и вымывается лимитом;
+  Settings даёт только `Reset Learned Ranking`. Удалённый Item и Item на
+  отключённом диске не показываются, но их память остаётся неактивной. Серый
+  `No Access` разрешён только для Item, который существует, но сейчас недоступен
+  из-за прав. Остальные child tickets связаны нативными GitHub dependencies и
+  откроются по мере закрытия решений.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
