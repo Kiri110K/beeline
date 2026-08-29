@@ -65,7 +65,7 @@ The text entry point that interprets typed or pasted text as a path or Search Qu
 _Avoid_: Path Input, search box, address bar
 
 **Search Query**:
-Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path.
+Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path. Its identity ignores case, surrounding and repeated whitespace, and canonically equivalent Unicode encoding, but preserves punctuation.
 _Avoid_: Path, filter
 
 **Working Set**:
@@ -73,7 +73,7 @@ The personal set considered for every Search Query regardless of length: Items i
 _Avoid_: Local index, Recents, cache
 
 **Search Memory**:
-The local, persistent association between an Item and the Search Query present when the user opens its Action Menu, invokes Quick Look, or completes an Item action; the association may benefit similar future queries. It follows the Item across rename and move; visibility, scrolling, hover, focus, selection, and choosing another Item are not signals.
+The local, persistent association between an Item and the normalized Search Query present when the user opens its Action Menu, invokes Quick Look, or completes an Item action; it may return or promote the Item for the same or a sufficiently similar future query. It follows the Item across rename and move; visibility, scrolling, hover, focus, selection, and choosing another Item are not signals.
 _Avoid_: Visit Journal, Recents, history, cache
 
 **Search Results**:
