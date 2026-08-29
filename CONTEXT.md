@@ -73,7 +73,7 @@ The personal set considered for every Search Query regardless of length: Items i
 _Avoid_: Local index, Recents, cache
 
 **Search Memory**:
-The local, persistent association between an Item and the same or similar Search Queries, created by qualified hover or focus, Quick Look, Reveal, or an Item action. It follows the Item across rename and move; mere visibility and transient navigation are not signals.
+The local, persistent association between an Item and the Search Query present when qualified hover or focus, Quick Look, or an Item action occurs; the association may benefit similar future queries. It follows the Item across rename and move; mere visibility, transient navigation, and choosing another Item are not signals.
 _Avoid_: Visit Journal, Recents, history, cache
 
 **Search Results**:
