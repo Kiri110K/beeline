@@ -69,7 +69,7 @@ Text in the Navigation Input used to find Items and Locations when it does not r
 _Avoid_: Path, filter
 
 **Working Set**:
-The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items from Search Memory. It has no total Item limit: the current Location is included in full, historical sources are bounded independently, and unvisited descendants of a Pinned Anchor are not included merely because their ancestor is pinned.
+The personal set considered for every Search Query regardless of length: Items in the current Location, Pinned Anchors, system Recents, paths from the Visit Journal, and Items with retained query-independent usage or Search Memory. It has no total Item limit: the current Location is included in full, historical sources are bounded independently, and unvisited descendants of a Pinned Anchor are not included merely because their ancestor is pinned.
 _Avoid_: Local index, Recents, cache
 
 **Search Memory**:
