@@ -69,7 +69,7 @@ Text in the Navigation Input used to find Items and Locations when it does not r
 _Avoid_: Path, filter
 
 **Path Interpretation**:
-An ordered reading of a Search Query in which separate query tokens identify distinct path components, with any number of intermediate components omitted. It competes with ordinary search, needs no path separators, and may end at either a file or a directory.
+An ordered reading of a Search Query in which separate query tokens identify distinct path components, with any number of intermediate components omitted. It competes with ordinary search, may end at either a file or a directory, treats spaces and slashes as equivalent component separators, and preserves the meaning of `~`, `./`, and `../`.
 _Avoid_: Implicit Path, Location Chain, path mode
 
 **Query Family**:

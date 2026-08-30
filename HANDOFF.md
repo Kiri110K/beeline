@@ -56,14 +56,25 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `Reset Learned Ranking`. Удалённый Item и Item на отключённом диске не
   показываются, но их память остаётся неактивной. Серый `No Access` разрешён
   только для Item, который существует, но сейчас недоступен из-за прав.
+- [Define query similarity and memory transfer](https://github.com/Kiri110K/beeline/issues/44)
+  закрыт. Exact normalized query всегда получает прямую связь с Item. Обычная
+  интерпретация переносит память через порядконезависимую Query Family, а Path
+  Interpretation сохраняет порядок частей пути и допускает пропущенные каталоги.
+  `work wip` и `work/wip` делят путевую память; `~`, `./` и `../` сохраняют
+  смысл. Раскладка делится памятью только при фактическом corrected match.
+  Префиксы, одна добавленная или удалённая часть и ограниченный edit distance
+  переносят память со штрафом. Длина для опечатки считается по изменённой части.
+  Переносы не транзитивны, и первая версия не складывает несколько исправлений.
+  Результат, пришедший только из памяти, усиливает только точную связь.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/
   persistence path удалять старую ветку в том же изменении; не оставлять dual
   pipeline, fallback и мёртвый код «на всякий случай».
-- Следующий открытый frontier теперь состоит из
-  [Define query similarity and memory transfer](https://github.com/Kiri110K/beeline/issues/44)
-  и [Prototype the staged retrieval threshold](https://github.com/Kiri110K/beeline/issues/51).
+- Следующий открытый frontier —
+  [Prototype the staged retrieval threshold](https://github.com/Kiri110K/beeline/issues/51).
+  После замеров перейти к
+  [Decide the Search v2 ranking contract](https://github.com/Kiri110K/beeline/issues/49).
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
