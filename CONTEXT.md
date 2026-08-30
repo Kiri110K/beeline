@@ -73,7 +73,7 @@ An ordered reading of a Search Query in which separate query tokens identify dis
 _Avoid_: Implicit Path, Location Chain, path mode
 
 **Query Family**:
-Normalized non-path Search Queries with the same distinct tokens regardless of token order or repetition. Members share Search Memory at full strength.
+Ordinary interpretations of normalized Search Queries with the same distinct tokens regardless of token order or repetition. Members share ordinary-search evidence in Search Memory at full strength; Path Interpretation evidence remains ordered.
 _Avoid_: Query history, permutation
 
 **Working Set**:
@@ -81,7 +81,7 @@ The personal set considered for every Search Query regardless of length: Items i
 _Avoid_: Local index, Recents, cache
 
 **Search Memory**:
-The local, persistent association between an Item and the normalized Search Query present when the user opens its Action Menu, invokes Quick Look, or completes an Item action; it may return or promote the Item for the same or a sufficiently similar future query. It follows the Item across rename and move; visibility, scrolling, hover, focus, selection, and choosing another Item are not signals.
+The local, persistent association between an Item, the normalized Search Query, and any currently supported ordinary or Path Interpretation when the user opens its Action Menu, invokes Quick Look, or completes an Item action. It may return or promote the Item for the same or a sufficiently similar future query, and follows the Item across rename and move; visibility, scrolling, hover, focus, selection, and choosing another Item are not signals.
 _Avoid_: Visit Journal, Recents, history, cache
 
 **Search Results**:
