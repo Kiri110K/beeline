@@ -68,6 +68,10 @@ _Avoid_: Path Input, search box, address bar
 Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path. Its identity ignores case, surrounding and repeated whitespace, and canonically equivalent Unicode encoding, but preserves punctuation.
 _Avoid_: Path, filter
 
+**Path Interpretation**:
+An ordered reading of a Search Query in which separate query tokens identify distinct path components, with any number of intermediate components omitted. It competes with ordinary search, needs no path separators, and may end at either a file or a directory.
+_Avoid_: Implicit Path, Location Chain, path mode
+
 **Query Family**:
 Normalized non-path Search Queries with the same distinct tokens regardless of token order or repetition. Members share Search Memory at full strength.
 _Avoid_: Query history, permutation
