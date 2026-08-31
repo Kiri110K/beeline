@@ -66,14 +66,21 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   переносят память со штрафом. Длина для опечатки считается по изменённой части.
   Переносы не транзитивны, и первая версия не складывает несколько исправлений.
   Результат, пришедший только из памяти, усиливает только точную связь.
+- [Prototype the staged retrieval threshold](https://github.com/Kiri110K/beeline/issues/51)
+  завершён на production v4 из 5 244 905 Items и двух реальных Working Set
+  размером 215 и 321 Item. Дефолт — пять значимых символов включительно.
+  Значимыми считаются Unicode-буквы и цифры после NFC; разделители и пунктуация
+  не считаются, слова суммируются. Exact existing path и точный Alias Dictionary
+  bypass порога. Четырёхзначного исключения для цифр нет: `1825` полезен локально,
+  а `2026` и `2035` дают слишком много глобального шума. Изменение порога должно
+  немедленно пересчитывать неизменённый активный запрос. Воспроизводимый код и
+  отчёт: `/Users/kiri110k/lab/beeline/prototypes/staged-retrieval-threshold/`.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/
   persistence path удалять старую ветку в том же изменении; не оставлять dual
   pipeline, fallback и мёртвый код «на всякий случай».
 - Следующий открытый frontier —
-  [Prototype the staged retrieval threshold](https://github.com/Kiri110K/beeline/issues/51).
-  После замеров перейти к
   [Decide the Search v2 ranking contract](https://github.com/Kiri110K/beeline/issues/49).
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution

@@ -1,0 +1,20 @@
+# id	category	query	target
+recent-network-4	personal-four	netw	/Users/kiri110k/NETWORK-SETUP.md
+recent-network-5	personal-five	netwo	/Users/kiri110k/NETWORK-SETUP.md
+recent-account-4	personal-multi-token	ms ac	/Users/kiri110k/scrap/MS-account.txt
+recent-pmi-4	personal-cyrillic-multi-token	пми в	/Users/kiri110k/work/vault/Inbox/antoxa/ПМИ/06_Производное/Конвертации_исходников/ПМИ_ver_1_41/ПМИ_ver_1_41.html
+recent-plan-5	personal-cyrillic-five	план т	/Users/kiri110k/work/wip/пакет_план_ТО/ТЗ_План_ТО.html
+global-handoff-4	global-four	hand	/Users/kiri110k/lab/beeline/HANDOFF.md
+global-context-5	global-five	conte	/Users/kiri110k/lab/beeline/CONTEXT.md
+global-context-6	global-six	contex	/Users/kiri110k/lab/beeline/CONTEXT.md
+digits-4	digits	0002	/Users/kiri110k/lab/beeline/docs/adr/0002-react-for-the-production-ui.md
+digits-equipment-4	digits	1825	-
+digits-year-4	digits	2026	-
+digits-equipment-2035-4	digits	2035	-
+implicit-path-5	path-interpretation	work w	/Users/kiri110k/work/wip
+implicit-path-7	path-interpretation	work wip	/Users/kiri110k/work/wip
+separator-path-7	path-separator	work/wip	/Users/kiri110k/work/wip
+ordinary-multi-token-7	multi-token	status r	/Users/kiri110k/Downloads/status-report_2026-08-02-19-00-00_2026-08-03-19-00-00.xlsx
+reported-typo-10	typo	метолология	-
+synthetic-alias-3	alias	bee	/Users/kiri110k/lab/beeline
+exact-path	exact-path	/Users/kiri110k/lab/beeline	/Users/kiri110k/lab/beeline
