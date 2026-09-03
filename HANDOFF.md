@@ -86,13 +86,20 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `ranker.json`: строгая атомарная валидация, embedded default при отсутствии или
   ошибке на старте, ручной reload без file watch и немедленный пересчёт активного
   запроса. CLI обязан валидировать, объяснять, replay/diff и применять конфиг;
-  `apply` атомарно заменяет файл и просит запущенную Beeline перечитать его.
+  `apply` атомарно заменяет файл и просит запущенную Beeline перечитать его. Если
+  процесс не подтвердил reload, новый файл остаётся источником правды, а CLI
+  явно сообщает, что процесс продолжает работать со старым снимком.
   Ranking Traces локальные: compact на каждое обновление, detailed top-256 после
   300 мс idle или действия, acted-on Item всегда detailed; исходные пределы —
   30 дней или 256 MiB. `schemaVersion` нужен для валидации, а не совместимости:
   экспериментальные конфиг, traces и learned state можно выбрасывать.
-  Открыты выразительность JSON, semantic validation монотонности, хранение
-  снимков конфига для replay/rollback, tie-break и начальный список features.
+  В alpha конфиг полный: только известные коду features, числовые веса, caps,
+  penalties и простые curves; язык формул не нужен. Delta относительно default
+  отложена до публикации. Каждый effective config хранится один раз по fingerprint,
+  пока на него ссылается Ranking Trace. Exact score ties разрешаются по
+  нормализованному имени, полному пути и stable Item identity. Открыты semantic
+  validation монотонности, шкала score, разрешённые interactions и начальный
+  список features.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
