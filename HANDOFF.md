@@ -80,9 +80,8 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   держать централизованными и дешёвыми для изменения. При замене search/ranking/
   persistence path удалять старую ветку в том же изменении; не оставлять dual
   pipeline, fallback и мёртвый код «на всякий случай».
-- Следующий открытый frontier —
-  [Decide the Search v2 ranking contract](https://github.com/Kiri110K/beeline/issues/49).
-  В нём уже принят единый ranker поверх Candidate Evidence и один активный
+- [Decide the Search v2 ranking contract](https://github.com/Kiri110K/beeline/issues/49)
+  закрыт. Принят единый ranker поверх Candidate Evidence и один активный
   `ranker.json`: строгая атомарная валидация, embedded default при отсутствии или
   ошибке на старте, ручной reload без file watch и немедленный пересчёт активного
   запроса. CLI обязан валидировать, объяснять, replay/diff и применять конфиг;
@@ -114,8 +113,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   события внутри неё накапливаются с saturation. General Usage сохраняет
   отдельные contributions под общим cap без cross-source dedup в первой версии.
   Hidden и Junk применяются по одному разу, складываются и ограничиваются общим
-  cap. Открыты filename/stem/extension semantics, область current Location,
-  точное ограничение transferred memory и выбор initial numeric defaults.
+  cap. Literal filename exact сильнее near-exact stem; extension — отдельный
+  слабый target, который усиливает явно введённая точка. Current Location
+  усиливает только непосредственные Items без лимита количества. Отношения между
+  groups полностью настраиваются: сценарии первой сборки — гипотезы, не вечные
+  гарантии. Числа выбираются при integrated implementation и затем тюнингуются
+  по Ranking Traces и использованию Кирилла; отдельный ranker prototype не нужен.
+- Следующий открытый frontier —
+  [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46).
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
