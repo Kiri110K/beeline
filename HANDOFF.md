@@ -98,7 +98,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   отложена до публикации. Каждый effective config хранится один раз по fingerprint,
   пока на него ссылается Ranking Trace. Exact score ties разрешаются по
   нормализованному имени, полному пути и stable Item identity. Открыты semantic
-  validation монотонности, шкала score, разрешённые interactions и начальный
+  validation не позволяет конфигу развернуть смысл feature: positive weights,
+  penalty magnitudes и caps неотрицательны, curves соблюдают объявленную
+  монотонность. Candidate Evidence хранит raw facts; ranker приводит каждый
+  применимый факт к силе 0–1 и умножает её на weight. Ranking Trace раздельно
+  пишет raw value, normalized strength, weight и contribution. Открыты способ
+  сложения score, разрешённые interactions, накопление внутри групп и начальный
   список features.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
