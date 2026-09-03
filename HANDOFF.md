@@ -121,6 +121,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   по Ranking Traces и использованию Кирилла; отдельный ranker prototype не нужен.
 - Следующий открытый frontier —
   [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46).
+  Progressive merge сохраняет по stable identity только Focused Item после
+  явной result navigation; auto-focused первый Item до навигации не sticky.
+  Остальной список свободно rerank; hover и scroll ничего не закрепляют и не
+  обучают. Query change сбрасывает сохранение. Stream сообщает local-ready,
+  global-running и complete; до 150 мс индикатора нет, после — Status Strip.
+  Действующие бюджеты: UI response на keystroke ≤8 мс, first Search Results
+  end-to-end ≤50 мс. Отдельный global-completion budget ещё решает #47;
+  прототип порога дал Working Set <0.1 мс и whole-index median/p90/max
+  32.89/63.50/68.76 мс на 5 244 905 Items.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
