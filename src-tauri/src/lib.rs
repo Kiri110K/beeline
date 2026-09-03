@@ -12,6 +12,7 @@ mod telemetry;
 
 use std::{
     env,
+    path::Path,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,7 +33,7 @@ use listing::{
     list_location_file_neighbor, list_location_initial, list_location_selection_paths,
     list_location_window, validate_directory, ListingSessions,
 };
-use name_index::{record_visit, search_name_index, NameIndex};
+use name_index::{record_visit, search_name_index_v2, NameIndex};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
     rename_item, resolve_installed_bundle, reveal_in_finder, trash_items, Operations,
@@ -46,6 +47,16 @@ use quick_look::{
 use recents::{get_recents, RecentsCache};
 use settings::get_settings;
 use telemetry::Telemetry;
+
+/// Build Search v2's generated candidate sidecar without starting the desktop app. The
+/// binary calls this only for its private helper-process mode.
+pub fn build_search_qgram_sidecar(
+    source_path: &Path,
+    root: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    name_index::build_qgram_sidecar(source_path, root, target_path)
+}
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_SHOWN_EVENT: &str = "beeline://window-shown";
@@ -628,7 +639,7 @@ pub fn run() {
             resolve_installed_bundle,
             reveal_in_finder,
             save_pinned_tabs,
-            search_name_index,
+            search_name_index_v2,
             set_settings,
             telemetry_event,
             trash_items,

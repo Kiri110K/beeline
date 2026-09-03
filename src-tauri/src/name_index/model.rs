@@ -160,7 +160,7 @@ impl MappedFile {
         })
     }
 
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.pointer, self.len) }
     }
 }
@@ -579,7 +579,7 @@ impl IndexData {
         self.base.as_ref().map_or(0, |base| base.node_count)
     }
 
-    fn base_entry_count(&self) -> usize {
+    pub(crate) fn base_entry_count(&self) -> usize {
         self.base.as_ref().map_or(0, |base| base.entry_count)
     }
 
@@ -597,6 +597,12 @@ impl IndexData {
 
     pub fn node_len(&self) -> usize {
         self.base_node_count() + self.overlay_nodes.len()
+    }
+
+    pub(crate) fn base_content_hash(&self) -> Option<u64> {
+        self.base
+            .as_ref()
+            .and_then(|base| read_u64(base.mapping.bytes(), 32).ok())
     }
 
     pub(crate) fn remap_base_cold(&mut self, path: &Path) -> std::io::Result<()> {
@@ -828,6 +834,23 @@ impl IndexData {
             }
         }
         Some(current)
+    }
+
+    pub fn resolve_item_slot(&self, path: &Path) -> Option<u32> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let components = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (name, parents) = components.split_last()?;
+        let mut parent = 0;
+        for component in parents {
+            parent = self.child_dir(parent, component)?;
+        }
+        self.child_slot(parent, name)
     }
 
     fn push_entry(&mut self, entry: OwnedEntry) -> u32 {

@@ -99,6 +99,10 @@ impl Aggregate {
         let recency = RECENCY_MAX / (1 + age_days);
         (freq + recency).min(VISIT_CAP)
     }
+
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.by_path.keys().map(String::as_str)
+    }
 }
 
 /// The live Visit Journal: an append handle plus the in-memory aggregate.

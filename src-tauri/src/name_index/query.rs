@@ -24,7 +24,10 @@
 use std::{
     collections::HashSet,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -52,6 +55,9 @@ const PAR_THRESHOLD: usize = 50_000;
 /// reference 10-core machine measures 8 workers consistently faster than 10 on its live 5M
 /// index. Smaller machines still use every available core.
 const MAX_SEARCH_SHARDS: usize = 8;
+/// Name-only fuzzy verification has no per-shard directory-mask allocation, so it can use
+/// every core on the reference 10-core Mac to reduce time to the first completed wave.
+const MAX_NAME_FUZZY_SHARDS: usize = 10;
 
 /// How many index slots each shard scans between stale-query checks. A few thousand entries
 /// is frequent enough to abort a superseded scan promptly (well under a millisecond of extra
@@ -72,6 +78,8 @@ const QUAL_EXACT: i64 = 5 * Q;
 const QUAL_PREFIX: i64 = 4 * Q;
 /// The query occurs inside the name.
 const QUAL_SUBSTRING: i64 = 2 * Q;
+/// Bounded Typo Correction. Kept below a literal substring and above a path-only token.
+const QUAL_TYPO: i64 = Q + Q / 2;
 /// A token of a multi-token query found only in the entry's *path* (not its name). One full
 /// band below the weakest name match, so an all-tokens-in-name hit always outranks a hit
 /// where any token only appears in the path (SPEC §6 token contract, part 3).
@@ -168,6 +176,7 @@ pub struct SearchHit {
     pub tier: &'static str,
 }
 
+#[derive(Clone)]
 struct Candidate {
     score: i64,
     path: String,
@@ -186,7 +195,7 @@ struct SearchItem<'a> {
 }
 
 /// A best-effort cancellation token: the search's own generation stamp and the shared
-/// counter that a newer `search_name_index` bumps. A shard consults it every
+/// counter that a newer Search v2 request bumps. A shard consults it every
 /// [`ABORT_STRIDE`] entries and aborts once the counter has moved past `mine` (SPEC §10: a
 /// newer keystroke cancels in-flight work of the previous state).
 #[derive(Clone, Copy)]
@@ -201,7 +210,7 @@ impl<'a> Cancel<'a> {
         Self { current, mine }
     }
 
-    fn superseded(&self) -> bool {
+    pub(crate) fn superseded(&self) -> bool {
         // Relaxed is enough: we only need to eventually observe a newer stamp; correctness
         // never depends on *when* the abort is seen, only that a superseded scan is dropped.
         self.current.load(Ordering::Relaxed) != self.mine
@@ -263,7 +272,17 @@ struct Prepared {
     /// only — the mask path folds the root's bits into `mask(0)`. Populated only for
     /// multi-token queries.
     root_lower: Vec<String>,
+    /// Query-derived bit filters for the prototype candidate rule, prepared once rather
+    /// than rebuilding Unicode character masks for every mutable-overlay Item.
+    fuzzy_name_filters: Vec<FuzzyNameFilter>,
     known: HashSet<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct FuzzyNameFilter {
+    filter: u64,
+    characters: usize,
+    missing_bits_per_edit: u32,
 }
 
 /// A `u64` mask holds one bit per path needle, so beyond this many needles the per-dir mask
@@ -275,13 +294,14 @@ const MAX_PATH_NEEDLES: usize = 63;
 impl Prepared {
     fn new(index: &IndexData, trimmed: &str, query_lower: &str) -> Self {
         let known = known_places(&index.root);
+        let query_name_filter = name_filter(query_lower);
         let path_shaped = is_path_shaped(trimmed);
         let segments = if path_shaped {
             path_segments(query_lower)
         } else {
             Vec::new()
         };
-        let segment_name_filters = segments
+        let segment_name_filters: Vec<u64> = segments
             .iter()
             .map(|segment| name_filter(segment))
             .collect();
@@ -292,7 +312,7 @@ impl Prepared {
         } else {
             layout_variants(query_lower)
         };
-        let corrected_name_filters = corrected
+        let corrected_name_filters: Vec<u64> = corrected
             .iter()
             .map(|variant| name_filter(variant))
             .collect();
@@ -321,7 +341,7 @@ impl Prepared {
             }
         }
         let use_path_mask = multi && path_needles.len() <= MAX_PATH_NEEDLES;
-        let path_needle_name_filters = path_needles
+        let path_needle_name_filters: Vec<u64> = path_needles
             .iter()
             .map(|needle| name_filter(needle))
             .collect();
@@ -330,9 +350,33 @@ impl Prepared {
         } else {
             Vec::new()
         };
+        let fuzzy_name_filters = if path_shaped {
+            segments
+                .last()
+                .zip(segment_name_filters.last())
+                .map(|(token, filter)| prepare_fuzzy_name_filter(token, *filter))
+                .into_iter()
+                .collect()
+        } else if multi {
+            path_needles
+                .iter()
+                .zip(&path_needle_name_filters)
+                .map(|(token, filter)| prepare_fuzzy_name_filter(token, *filter))
+                .collect()
+        } else {
+            std::iter::once((query_lower, query_name_filter))
+                .chain(
+                    corrected
+                        .iter()
+                        .zip(&corrected_name_filters)
+                        .map(|(token, filter)| (token.as_str(), *filter)),
+                )
+                .map(|(token, filter)| prepare_fuzzy_name_filter(token, filter))
+                .collect()
+        };
         Self {
             query_lower: query_lower.to_owned(),
-            query_name_filter: name_filter(query_lower),
+            query_name_filter,
             path_shaped,
             segments,
             segment_name_filters,
@@ -345,6 +389,7 @@ impl Prepared {
             corrected_offsets,
             use_path_mask,
             root_lower,
+            fuzzy_name_filters,
             known,
         }
     }
@@ -373,6 +418,44 @@ impl Prepared {
 #[inline]
 fn filter_contains(item_filter: u64, query_filter: u64) -> bool {
     item_filter & query_filter == query_filter
+}
+
+/// Cheap no-false-negative filter for the prototype's candidate contract: an ordinary
+/// multi-token result must plausibly match at least one query token in the Item name. The
+/// q-gram sidecar enforces that for the immutable base; this keeps a large mutable overlay
+/// from falling through to Unicode distance and ancestor reconstruction wholesale.
+fn fuzzy_candidate_may_match_name(item_filter: u64, prep: &Prepared, short_fuzzy: bool) -> bool {
+    prep.fuzzy_name_filters
+        .iter()
+        .any(|filter| fuzzy_filter_may_match(item_filter, *filter, short_fuzzy))
+}
+
+fn prepare_fuzzy_name_filter(token: &str, filter: u64) -> FuzzyNameFilter {
+    let missing_bits_per_edit = token
+        .chars()
+        .map(|character| {
+            let lowered = character.to_lowercase().collect::<String>();
+            name_filter(&lowered).count_ones()
+        })
+        .max()
+        .unwrap_or(1);
+    FuzzyNameFilter {
+        filter,
+        characters: token.chars().count(),
+        missing_bits_per_edit,
+    }
+}
+
+fn fuzzy_filter_may_match(
+    item_filter: u64,
+    query_filter: FuzzyNameFilter,
+    short_fuzzy: bool,
+) -> bool {
+    let edits = allowed_typo_edits(query_filter.characters, short_fuzzy);
+    let allowed_missing = query_filter
+        .missing_bits_per_edit
+        .saturating_mul(edits as u32);
+    (query_filter.filter & !item_filter).count_ones() <= allowed_missing
 }
 
 /// Scan-local memo answering, per directory, the one bit a multi-token path check needs:
@@ -509,6 +592,398 @@ pub fn run(
         resolve_shards(index.slot_len())
     };
     run_impl(index, ctx, query, limit, reuse, cancel, shards)
+}
+
+/// Verify and rank a q-gram candidate set with bounded Typo Correction. Unlike the legacy
+/// exact scan, this path never caps by index order: every supplied candidate reaches ranking.
+/// The q-gram sidecar bounds the input before this function runs.
+pub fn run_fuzzy(
+    index: &IndexData,
+    ctx: &RankContext,
+    query: &str,
+    limit: usize,
+    slots: &[u32],
+    cancel: Option<&Cancel>,
+    short_fuzzy: bool,
+) -> SearchOutcome {
+    run_fuzzy_inner(index, ctx, query, limit, slots, cancel, short_fuzzy, None)
+}
+
+/// The global Search v2 variant: each completed shard can publish the best cumulative
+/// ranking collected so far, while the return value remains the deterministic final top K.
+#[allow(clippy::too_many_arguments)]
+pub fn run_fuzzy_streaming(
+    index: &IndexData,
+    ctx: &RankContext,
+    query: &str,
+    limit: usize,
+    slots: &[u32],
+    cancel: Option<&Cancel>,
+    short_fuzzy: bool,
+    on_partial: &mut dyn FnMut(Vec<SearchHit>, usize),
+) -> SearchOutcome {
+    run_fuzzy_inner(
+        index,
+        ctx,
+        query,
+        limit,
+        slots,
+        cancel,
+        short_fuzzy,
+        Some(on_partial),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fuzzy_inner(
+    index: &IndexData,
+    ctx: &RankContext,
+    query: &str,
+    limit: usize,
+    slots: &[u32],
+    cancel: Option<&Cancel>,
+    short_fuzzy: bool,
+    mut on_partial: Option<&mut dyn FnMut(Vec<SearchHit>, usize)>,
+) -> SearchOutcome {
+    let trimmed = query.trim();
+    let query_lower = trimmed.to_lowercase();
+    if query_lower.is_empty() || limit == 0 {
+        return SearchOutcome {
+            hits: Vec::new(),
+            exhaustive: true,
+            aborted: false,
+            scanned: 0,
+            candidate_entries: Vec::new(),
+        };
+    }
+    let prep = Prepared::new(index, trimmed, &query_lower);
+    let shards = resolve_fuzzy_shards(slots.len(), prep.use_path_mask);
+    let (mut candidates, scanned, aborted) = if shards <= 1 {
+        scan_fuzzy_slots(index, ctx, &prep, slots, cancel, short_fuzzy)
+    } else {
+        let chunk_size = slots.len().div_ceil(shards);
+        let prepared = &prep;
+        thread::scope(|scope| {
+            let (sender, receiver) = mpsc::channel();
+            for chunk in slots.chunks(chunk_size) {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    crate::qos::set_user_initiated_qos();
+                    let part = scan_fuzzy_slots(index, ctx, prepared, chunk, cancel, short_fuzzy);
+                    let _ = sender.send(part);
+                });
+            }
+            drop(sender);
+
+            let mut candidates = Vec::new();
+            let mut scanned = 0usize;
+            let mut aborted = false;
+            for (mut local, local_scanned, local_aborted) in receiver {
+                rank_fuzzy_candidates(&mut local, limit);
+                candidates.extend(local);
+                rank_fuzzy_candidates(&mut candidates, limit);
+                scanned += local_scanned;
+                aborted |= local_aborted;
+                if !aborted {
+                    if let Some(callback) = on_partial.as_deref_mut() {
+                        callback(fuzzy_hits(&candidates), scanned);
+                    }
+                }
+            }
+            (candidates, scanned, aborted)
+        })
+    };
+    if aborted {
+        return SearchOutcome {
+            hits: Vec::new(),
+            exhaustive: false,
+            aborted: true,
+            scanned,
+            candidate_entries: Vec::new(),
+        };
+    }
+    if let Some(target) = ctx.aliases.resolve(&query_lower) {
+        inject(&mut candidates, index, target, ALIAS_RECOMMEND, true);
+    }
+    rank_fuzzy_candidates(&mut candidates, limit);
+    SearchOutcome {
+        hits: fuzzy_hits(&candidates),
+        exhaustive: true,
+        aborted: false,
+        scanned,
+        candidate_entries: Vec::new(),
+    }
+}
+
+fn resolve_fuzzy_shards(slots: usize, uses_path_masks: bool) -> usize {
+    if slots < PAR_THRESHOLD {
+        return 1;
+    }
+    let maximum = if uses_path_masks {
+        MAX_SEARCH_SHARDS
+    } else {
+        MAX_NAME_FUZZY_SHARDS
+    };
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .clamp(1, maximum)
+}
+
+fn rank_fuzzy_candidates(candidates: &mut Vec<Candidate>, limit: usize) {
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.path.len().cmp(&right.path.len()))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates.dedup_by(|left, right| left.slot == right.slot);
+    candidates.truncate(limit);
+}
+
+fn fuzzy_hits(candidates: &[Candidate]) -> Vec<SearchHit> {
+    candidates
+        .iter()
+        .map(|candidate| SearchHit {
+            name: candidate.name.clone(),
+            path: candidate.path.clone(),
+            is_directory: candidate.is_directory,
+            tier: candidate.tier.as_str(),
+        })
+        .collect()
+}
+
+fn scan_fuzzy_slots(
+    index: &IndexData,
+    ctx: &RankContext,
+    prep: &Prepared,
+    slots: &[u32],
+    cancel: Option<&Cancel>,
+    short_fuzzy: bool,
+) -> (Vec<Candidate>, usize, bool) {
+    let mut candidates = Vec::new();
+    let mut scratch = String::new();
+    let mut dir_masks = new_dir_masks(index, prep);
+    let mut scanned = 0usize;
+    for (position, &slot) in slots.iter().enumerate() {
+        if position % ABORT_STRIDE == 0 && cancel.is_some_and(Cancel::superseded) {
+            return (candidates, scanned, true);
+        }
+        let Some(entry) = index.entry(slot as usize) else {
+            continue;
+        };
+        let item = SearchItem {
+            entry,
+            name_filter: entry.filter,
+        };
+        if !fuzzy_candidate_may_match_name(item.name_filter, prep, short_fuzzy) {
+            continue;
+        }
+        scanned += 1;
+        if let Some((score, path)) =
+            score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
+                .or_else(|| score_fuzzy_entry(index, item, prep, ctx, short_fuzzy))
+        {
+            candidates.push(Candidate {
+                score,
+                path,
+                name: entry.name.to_owned(),
+                is_directory: entry.is_directory,
+                tier: entry.tier,
+                slot,
+            });
+        }
+    }
+    (candidates, scanned, false)
+}
+
+fn score_fuzzy_entry(
+    index: &IndexData,
+    item: SearchItem<'_>,
+    prep: &Prepared,
+    ctx: &RankContext,
+    short_fuzzy: bool,
+) -> Option<(i64, String)> {
+    let (quality, corrected) = if prep.path_shaped {
+        let quality = fuzzy_path_interpretation(index, item, &prep.segments, short_fuzzy)?;
+        (quality + SCOPE_BONUS, false)
+    } else if prep.tokens.len() > 1 {
+        let mut best = fuzzy_token_set(index, item, &prep.tokens, short_fuzzy);
+        best = best.max(fuzzy_path_interpretation(
+            index,
+            item,
+            &prep.tokens,
+            short_fuzzy,
+        ));
+        let mut corrected = false;
+        for tokens in &prep.corrected_tokens {
+            let mut candidate = fuzzy_token_set(index, item, tokens, short_fuzzy);
+            candidate = candidate.max(fuzzy_path_interpretation(index, item, tokens, short_fuzzy));
+            if candidate > best {
+                best = candidate;
+                corrected = true;
+            }
+        }
+        (best?, corrected)
+    } else {
+        let direct = prep
+            .tokens
+            .first()
+            .and_then(|token| fuzzy_name_quality(item.entry.name, token, short_fuzzy));
+        let mut best = direct;
+        let mut corrected = false;
+        for variant in &prep.corrected {
+            let candidate = fuzzy_name_quality(item.entry.name, variant, short_fuzzy);
+            if candidate > best {
+                best = candidate;
+                corrected = true;
+            }
+        }
+        (best?, corrected)
+    };
+
+    let mut score = quality - tier_penalty(item.entry.tier);
+    if corrected {
+        score -= CORRECTION_PENALTY;
+    }
+    let path = index.entry_path(item.entry);
+    let path_str = path.to_string_lossy().into_owned();
+    score += ctx.journal.boost(&path_str);
+    if prep.known.contains(&path) {
+        score += KNOWN_PLACE_BOOST;
+    }
+    Some((score, path_str))
+}
+
+fn fuzzy_token_set(
+    index: &IndexData,
+    item: SearchItem<'_>,
+    tokens: &[String],
+    short_fuzzy: bool,
+) -> Option<i64> {
+    let ancestors = ancestor_names(index, item.entry.parent);
+    let mut weakest = i64::MAX;
+    let mut name_match = false;
+    for token in tokens {
+        if let Some(quality) = fuzzy_name_quality(item.entry.name, token, short_fuzzy) {
+            weakest = weakest.min(quality);
+            name_match = true;
+            continue;
+        }
+        let quality = ancestors
+            .iter()
+            .filter_map(|component| fuzzy_component_quality(component, token, short_fuzzy))
+            .max()?;
+        weakest = weakest.min(quality.min(QUAL_PATH));
+    }
+    name_match.then_some(weakest)
+}
+
+fn fuzzy_path_interpretation(
+    index: &IndexData,
+    item: SearchItem<'_>,
+    tokens: &[String],
+    short_fuzzy: bool,
+) -> Option<i64> {
+    let (last, parents) = tokens.split_last()?;
+    let final_quality = fuzzy_name_quality(item.entry.name, last, short_fuzzy)?;
+    let ancestors = ancestor_names(index, item.entry.parent);
+    let mut cursor = ancestors.len();
+    let mut weakest = final_quality;
+    for token in parents.iter().rev() {
+        let mut found = None;
+        while cursor > 0 {
+            cursor -= 1;
+            if let Some(quality) = fuzzy_component_quality(&ancestors[cursor], token, short_fuzzy) {
+                found = Some(quality.min(QUAL_PATH));
+                break;
+            }
+        }
+        weakest = weakest.min(found?);
+    }
+    Some(weakest)
+}
+
+fn fuzzy_name_quality(name: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+    let lower = name.to_lowercase();
+    let stem = lower
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map_or(lower.as_str(), |(stem, _)| stem);
+    fuzzy_targets(&lower, stem, query, short_fuzzy)
+}
+
+fn fuzzy_component_quality(component: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+    let lower = component.to_lowercase();
+    fuzzy_targets(&lower, &lower, query, short_fuzzy)
+}
+
+fn fuzzy_targets(full: &str, stem: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+    let edits = allowed_typo_edits(query.chars().count(), short_fuzzy);
+    if edits == 0 {
+        return None;
+    }
+    full.split(|character: char| !character.is_alphanumeric())
+        .chain(std::iter::once(stem))
+        .filter(|target| !target.is_empty())
+        .filter_map(|target| bounded_osa_chars(query, target, edits))
+        .map(|distance| QUAL_TYPO - distance as i64 * 100_000)
+        .max()
+}
+
+fn allowed_typo_edits(length: usize, short_fuzzy: bool) -> usize {
+    match length {
+        0 => 0,
+        1..=2 if short_fuzzy => 1,
+        1..=2 => 0,
+        3..=6 => 1,
+        7..=12 => 2,
+        _ => 3,
+    }
+}
+
+fn bounded_osa_chars(left: &str, right: &str, limit: usize) -> Option<usize> {
+    if left.is_ascii() && right.is_ascii() {
+        return bounded_osa(left.as_bytes(), right.as_bytes(), limit);
+    }
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    bounded_osa(&left, &right, limit)
+}
+
+fn bounded_osa<T: Eq>(left: &[T], right: &[T], limit: usize) -> Option<usize> {
+    if left.len().abs_diff(right.len()) > limit {
+        return None;
+    }
+    let mut previous_two = (0..=right.len()).collect::<Vec<_>>();
+    let mut previous = previous_two.clone();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_value) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+        for (right_index, right_value) in right.iter().enumerate() {
+            let substitution = usize::from(left_value != right_value);
+            let mut distance = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + substitution);
+            if left_index > 0
+                && right_index > 0
+                && left[left_index] == right[right_index - 1]
+                && left[left_index - 1] == right[right_index]
+            {
+                distance = distance.min(previous_two[right_index - 1] + 1);
+            }
+            current[right_index + 1] = distance;
+            row_min = row_min.min(distance);
+        }
+        if row_min > limit {
+            return None;
+        }
+        std::mem::swap(&mut previous_two, &mut previous);
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[right.len()] <= limit).then_some(previous[right.len()])
 }
 
 /// The scan core, with an explicit shard count (the benchmark forces `1` for a sequential
@@ -891,7 +1366,7 @@ fn score_multi(
     // The direct token set is the flat needle prefix (offset 0); each corrected set follows at
     // its recorded offset, so a per-set token position maps to a flat bit index.
     let (mut score, corrected_match) = if let Some(band) =
-        match_token_set(index, item, &prep.tokens, 0, prep, dir_masks, scratch)
+        best_multi_interpretation(index, item, &prep.tokens, 0, prep, dir_masks, scratch)
     {
         (band, false)
     } else {
@@ -902,7 +1377,8 @@ fn score_multi(
             // this fallback stays cheap across a whole-index scan (e.g. a Cyrillic corrected
             // token over millions of ASCII names).
             let offset = prep.corrected_offsets[k];
-            if let Some(band) = match_token_set(index, item, set, offset, prep, dir_masks, scratch)
+            if let Some(band) =
+                best_multi_interpretation(index, item, set, offset, prep, dir_masks, scratch)
             {
                 best = Some(best.map_or(band, |current| current.max(band)));
             }
@@ -922,6 +1398,48 @@ fn score_multi(
         score += KNOWN_PLACE_BOOST;
     }
     Some((score, path_str))
+}
+
+/// The strongest direct interpretation of a multi-token query. Ordinary matching allows
+/// any token order; Path Interpretation additionally rewards an ordered ancestor chain
+/// ending at the Item name. This is a score contribution, not a forced first position.
+fn best_multi_interpretation(
+    index: &IndexData,
+    item: SearchItem<'_>,
+    tokens: &[String],
+    offset: usize,
+    prep: &Prepared,
+    dir_masks: &mut Option<DirMaskCache>,
+    scratch: &mut String,
+) -> Option<i64> {
+    let ordinary = match_token_set(index, item, tokens, offset, prep, dir_masks, scratch);
+    let scoped = implicit_path_quality(index, item, tokens, offset, prep, scratch);
+    ordinary.max(scoped)
+}
+
+fn implicit_path_quality(
+    index: &IndexData,
+    item: SearchItem<'_>,
+    tokens: &[String],
+    offset: usize,
+    prep: &Prepared,
+    scratch: &mut String,
+) -> Option<i64> {
+    let (last, prefix) = tokens.split_last()?;
+    if prefix.is_empty() {
+        return None;
+    }
+    let last_filter = *prep
+        .path_needle_name_filters
+        .get(offset + tokens.len() - 1)?;
+    let quality = quality_match(
+        item.entry.name,
+        item.name_filter,
+        last,
+        last_filter,
+        scratch,
+    )?;
+    ancestors_match(index, item.entry.parent, prefix).then_some(quality + SCOPE_BONUS)
 }
 
 /// The quality band of an entry against a whole token set: the minimum per-token quality, or
@@ -1264,7 +1782,7 @@ fn path_segments(query_lower: &str) -> Vec<String> {
 
 /// The layout-corrected variants of a query (both directions), excluding the query
 /// itself. Empty when the query has no keys that differ between layouts.
-fn layout_variants(query_lower: &str) -> Vec<String> {
+pub(crate) fn layout_variants(query_lower: &str) -> Vec<String> {
     let mut variants = Vec::new();
     let to_ru = map_layout(query_lower, true);
     if to_ru != query_lower {
@@ -1682,6 +2200,48 @@ mod tests {
     }
 
     #[test]
+    fn ordered_tokens_strongly_boost_an_implicit_path() {
+        let mut index = index();
+        let work = index.add_dir(0, "work", Tier::Normal, 0);
+        index.add_dir(work, "wip", Tier::Normal, 0);
+        index.add_file(0, "archive-users-work-wip-session.md", Tier::Normal);
+
+        let hits = run(&index, "work wip");
+        assert_eq!(hits[0].path, "/home/tester/work/wip");
+    }
+
+    #[test]
+    fn fuzzy_streaming_partials_converge_to_final_order() {
+        let mut index = index();
+        let mut slots = Vec::new();
+        for number in 0..=PAR_THRESHOLD {
+            let name = if number.is_multiple_of(10_000) {
+                format!("methodology-{number}.md")
+            } else {
+                format!("unrelated-{number}.txt")
+            };
+            let slot = index.slot_len() as u32;
+            index.add_file(0, &name, Tier::Normal);
+            slots.push(slot);
+        }
+        let mut partials = Vec::new();
+        let outcome = run_fuzzy_streaming(
+            &index,
+            &RankContext::empty(),
+            "methodolgy",
+            50,
+            &slots,
+            None,
+            false,
+            &mut |hits, _| partials.push(hits),
+        );
+
+        assert!(!partials.is_empty());
+        assert_eq!(partials.last(), Some(&outcome.hits));
+        assert_eq!(outcome.hits.len(), 6);
+    }
+
+    #[test]
     fn multi_token_order_is_irrelevant() {
         let mut index = index();
         let invoices = index.add_dir(0, "invoices", Tier::Normal, 0);
@@ -1760,5 +2320,26 @@ mod tests {
         let out = super::run_impl(&index, &ctx, "file", 50, None, Some(&cancel), 1);
         assert!(out.aborted);
         assert!(out.hits.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_candidates_cover_typo_layout_and_transposition() {
+        let mut index = index();
+        index.add_file(0, "методология.md", Tier::Normal);
+        index.add_file(0, "methodology.md", Tier::Normal);
+        let slots = [0, 1];
+        let ctx = RankContext::empty();
+
+        for query in ["метолология", "methodolgy", "methdoology", "ьуерщвщдпн"]
+        {
+            let outcome = super::run_fuzzy(&index, &ctx, query, 50, &slots, None, false);
+            assert!(
+                outcome
+                    .hits
+                    .iter()
+                    .any(|hit| hit.name == "методология.md" || hit.name == "methodology.md"),
+                "no corrected result for {query}"
+            );
+        }
     }
 }

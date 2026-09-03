@@ -98,6 +98,9 @@ export function SearchResults({
       .with({ status: "pending" }, ({ slow }) =>
         slow ? strings.search.searching : null,
       )
+      .with({ status: "streaming" }, ({ slow }) =>
+        slow ? strings.search.searching : null,
+      )
       .with({ status: "idle" }, () => null)
       .exhaustive();
     if (line === null) {

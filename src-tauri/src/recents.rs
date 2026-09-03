@@ -516,6 +516,16 @@ impl RecentsCache {
         RecentsResponse::Ok { items, total }
     }
 
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.state
+            .lock()
+            .expect("recents cache lock poisoned")
+            .items
+            .iter()
+            .map(|item| PathBuf::from(&item.path))
+            .collect()
+    }
+
     /// Fold a refresh outcome into the cache, returning the resulting item count and
     /// whether anything actually changed. An unavailable outcome preserves any existing
     /// items (last-success wins). The `changed` flag gates the update event so a stable

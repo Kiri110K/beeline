@@ -109,9 +109,41 @@ The measurements support a real staged stream rather than a loading state:
   150 ms no-indicator boundary.
 
 The UI should paint each completed wave and preserve only the explicitly Focused Item by stable
-identity. It should not show progress for the measured warm path. IPC and rendered merge still
-need an integrated pass because the slowest first wave leaves only about 10 ms inside the
-50 ms end-to-end contract.
+identity. It should not show progress for the measured warm path. At this prototype boundary,
+IPC and rendered merge were the remaining unknown because the slowest first wave left only about
+10 ms inside the 50 ms end-to-end contract; the integration below closes that measurement gap.
+
+## Production integration — 2026-09-03
+
+The prototype architecture now runs in the signed Tauri bundle through one channel-backed
+Search v2 stream. The frontend paints the complete Working Set, cumulative q-gram shard waves,
+and the deterministic final ranking. Only deliberate keyboard focus is preserved by stable Item
+path; a query edit clears that preservation and stale-query waves are rejected.
+
+Live end-to-render measurements over the current 5.5M-Item index:
+
+| Query | First useful paint/callback | Final paint/callback | Outcome |
+| --- | ---: | ---: | --- |
+| `метолология` | 17 ms | 51 ms | `МЕТОДОЛОГИЯ.md` rank 1 |
+| `ьуерщвщдпн` | 36 ms | 288 ms | layout + typo results found |
+| `work wip` | 17 ms | 480 ms | `/Users/kiri110k/work/wip` rank 1 |
+
+The slower final waves were measured while startup diff-rescan was active. The binding first
+useful result remains within 50 ms for the measured typo, layout-plus-typo, and implicit-path
+cases; broad completion can continue beyond the 150 ms no-indicator boundary. The current
+overlay therefore reorders quietly as shards land. That observed tail, rather than the Rust-only
+prototype, is the input for the next UI iteration.
+
+The live mutable overlay was much larger than the prototype corpus assumed. A cheap prepared
+name filter now reduces expensive verification (for example, 280,911 candidate slots to 9,965
+verified Items for `метолология`) while preserving the accepted rule that an ordinary
+multi-token candidate has at least one plausible name-token match. Ordered implicit Path
+Interpretation competes as a strong score contribution rather than a forced first result.
+
+Cold sidecar construction is isolated in a CLI-only helper process: 14.692 s for 128,438,403
+postings and a 522,142,268-byte file. The GUI remained responsive, and its post-build physical
+footprint was about 80 MB. Building inside the GUI had taken 114.572 s at background QoS and
+left about 644 MB in retained allocator pages, so that path was rejected.
 
 ## Known limits
 
@@ -124,5 +156,6 @@ need an integrated pass because the slowest first wave leaves only about 10 ms i
   not the selected on-disk format.
 - The harness uses empty Search Memory and Alias Dictionary state. It resolves live Recents
   and Visit Journal paths only as Working Set and ranking signals.
-- IPC, render cost, energy, incremental sidecar maintenance, stale-result rejection in the UI,
-  and post-reboot page-fault behavior remain for the integrated implementation pass.
+- Search Memory, energy, incremental sidecar maintenance, and post-reboot page-fault behavior
+  remain unmeasured. IPC/render timing and stale-result rejection are now covered by the
+  production integration and its reducer contract test.

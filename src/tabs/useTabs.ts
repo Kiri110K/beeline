@@ -73,6 +73,7 @@ import type {
 import {
   recordVisit,
   searchNameIndex,
+  subscribeSearchQgramReady,
   type SearchHit,
 } from "../search/ipc";
 import {
@@ -130,7 +131,7 @@ import { ROW_HEIGHT } from "../components/layout";
 // "slow" once it is still in flight after this many ms; telemetry is sampled to
 // stay cheap (recorded when a query is slow-ish, else every Nth query).
 const SEARCH_LIMIT = 50;
-const SEARCH_SLOW_MS = 200;
+const SEARCH_SLOW_MS = 150;
 const SEARCH_TELEMETRY_MS_THRESHOLD = 25;
 const SEARCH_TELEMETRY_SAMPLE = 20;
 
@@ -1321,7 +1322,9 @@ export function useTabs(
       results: number,
       durationMs: number,
       backendDurationMs: number,
-      reused: boolean,
+      stage: string,
+      complete: boolean,
+      qgramReady: boolean,
       scanned: number,
     ): void => {
       searchCountRef.current += 1;
@@ -1335,7 +1338,9 @@ export function useTabs(
           results,
           duration_ms: duration,
           backend_duration_ms: backendDurationMs,
-          reused,
+          stage,
+          complete,
+          qgram_ready: qgramReady,
           scanned,
         });
       }
@@ -1370,25 +1375,60 @@ export function useTabs(
           });
         }, SEARCH_SLOW_MS),
       );
-      void searchNameIndex(query, SEARCH_LIMIT).match(
-        (response) => {
+      const current = stateRef.current;
+      const active = tabById(current, tabId);
+      const currentLocation =
+        active?.browse.location.kind === "directory"
+          ? active.browse.location.path
+          : null;
+      const pinnedPaths = current.tabs.filter(isPinned).map((tab) => tab.anchorPath);
+      void searchNameIndex(
+        query,
+        SEARCH_LIMIT,
+        currentLocation,
+        pinnedPaths,
+        (wave) => {
           if (searchSeqRef.current.get(tabId) !== seq) {
             return;
           }
-          clearSlowTimer(tabId);
           fireSearchTelemetry(
             query.length,
-            response.hits.length,
+            wave.hits.length,
             performance.now() - started,
-            response.backendDurationMs,
-            response.reused,
-            response.scanned,
+            wave.backendDurationMs,
+            wave.stage,
+            wave.complete,
+            wave.qgramReady,
+            wave.scanned,
           );
           dispatch({
             type: "search",
             tabId,
-            action: { type: "resultsLanded", query, hits: response.hits },
+            action: { type: "resultsWave", query, wave },
           });
+          requestAnimationFrame(() => {
+            if (searchSeqRef.current.get(tabId) !== seq) {
+              return;
+            }
+            fireTelemetry("search_wave_painted", {
+              query_len: query.length,
+              stage: wave.stage,
+              complete: wave.complete,
+              qgram_ready: wave.qgramReady,
+              results: wave.hits.length,
+              backend_duration_ms: wave.backendDurationMs,
+              duration_ms: Math.round(performance.now() - started),
+            });
+          });
+          if (wave.complete) {
+            clearSlowTimer(tabId);
+          }
+        },
+      ).match(
+        () => {
+          if (searchSeqRef.current.get(tabId) === seq) {
+            clearSlowTimer(tabId);
+          }
         },
         (error) => {
           if (searchSeqRef.current.get(tabId) !== seq) {
@@ -1406,6 +1446,28 @@ export function useTabs(
     },
     [clearSlowTimer, fireSearchTelemetry],
   );
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void subscribeSearchQgramReady(() => {
+      const current = stateRef.current;
+      const active = tabById(current, current.activeId);
+      if (
+        active !== undefined &&
+        active.search.mode === "search" &&
+        active.search.query.trim() !== ""
+      ) {
+        runSearch(active.id, active.search.query);
+      }
+    }).match((fn) => {
+      unlisten = fn;
+    }, reportShellError);
+    return () => {
+      if (unlisten !== null) {
+        unlisten();
+      }
+    };
+  }, [runSearch]);
 
   // Focus and select the Navigation Input on the next frame (after the state
   // change has painted), so activation always shows the retained query selected.

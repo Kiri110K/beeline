@@ -1,17 +1,17 @@
-import type { SearchHit } from "./ipc";
+import type { SearchHit, SearchWave } from "./ipc";
 
-// The results view of one active search. `pending` carries whatever hits were last
-// shown so a newer query never blanks the overlay (progressive results, SPEC §6);
-// `done` may hold an empty list, which the overlay renders as "nothing found".
 export type ResultsView =
   | { status: "idle" }
   | { status: "pending"; hits: SearchHit[]; slow: boolean }
-  | { status: "done"; hits: SearchHit[] }
-  | { status: "failed" };
+  | {
+      status: "streaming";
+      hits: SearchHit[];
+      slow: boolean;
+      stage: SearchWave["stage"];
+    }
+  | { status: "done"; hits: SearchHit[]; stage: SearchWave["stage"] }
+  | { status: "failed"; hits: SearchHit[] };
 
-// Per-Tab search state (§4: each Tab retains its own inactive query). Browse Mode
-// keeps only the retained query text; Search Mode additionally owns the results
-// overlay, the Focused result, and whether reordering has frozen (SPEC §5, §6).
 export type SearchState =
   | { mode: "browse"; query: string }
   | {
@@ -19,52 +19,42 @@ export type SearchState =
       query: string;
       results: ResultsView;
       focusedIndex: number;
-      // Reordering (and auto-focus of the first result) stops once the user starts
-      // keyboard navigation within results (SPEC §6); a query edit clears it.
-      frozen: boolean;
+      // Set only by deliberate result navigation. Later waves keep this exact Item focused
+      // while every other row remains free to move to its latest rank.
+      deliberateFocusPath: string | null;
     };
 
 export const initialSearchState: SearchState = { mode: "browse", query: "" };
 
 export type SearchAction =
-  // Enter Search Mode with the retained query (Cmd+L, click, Slash, new Tab).
   | { type: "activate" }
-  // Leave Search Mode; the query text stays, inactive (Escape, Reveal).
   | { type: "deactivate" }
-  // The user edited the query (implies Search Mode; clears the freeze).
   | { type: "queryChanged"; query: string }
-  // Move the Focused result (Up/Down, Ctrl+J/K); freezes reordering.
   | { type: "focusDelta"; delta: number }
-  // A search response for `query` landed / failed / crossed the slow threshold.
-  | { type: "resultsLanded"; query: string; hits: SearchHit[] }
+  | { type: "resultsWave"; query: string; wave: SearchWave }
   | { type: "resultsFailed"; query: string }
   | { type: "resultsSlow"; query: string };
 
-// The hits currently on screen for a results view (empty for idle/failed).
 export function displayedHits(results: ResultsView): readonly SearchHit[] {
-  if (results.status === "pending" || results.status === "done") {
-    return results.hits;
+  switch (results.status) {
+    case "idle":
+      return [];
+    case "pending":
+    case "streaming":
+    case "done":
+    case "failed":
+      return results.hits;
   }
-  return [];
 }
 
 function clamp(value: number, min: number, max: number): number {
-  if (value < min) {
-    return min;
-  }
-  if (value > max) {
-    return max;
-  }
-  return value;
+  return Math.min(Math.max(value, min), max);
 }
 
-// The results view a query starts in: idle for an empty query, otherwise pending
-// while carrying the prior hits forward so the overlay never flickers to blank.
 function initialResultsFor(query: string, priorHits: SearchHit[]): ResultsView {
-  if (query.trim() === "") {
-    return { status: "idle" };
-  }
-  return { status: "pending", hits: priorHits, slow: false };
+  return query.trim() === ""
+    ? { status: "idle" }
+    : { status: "pending", hits: priorHits, slow: false };
 }
 
 export function searchReducer(
@@ -72,19 +62,16 @@ export function searchReducer(
   action: SearchAction,
 ): SearchState {
   switch (action.type) {
-    case "activate": {
-      if (state.mode === "search") {
-        // Already active: DOM re-selection is handled by the caller, state stands.
-        return state;
-      }
-      return {
-        mode: "search",
-        query: state.query,
-        results: initialResultsFor(state.query, []),
-        focusedIndex: 0,
-        frozen: false,
-      };
-    }
+    case "activate":
+      return state.mode === "search"
+        ? state
+        : {
+            mode: "search",
+            query: state.query,
+            results: initialResultsFor(state.query, []),
+            focusedIndex: 0,
+            deliberateFocusPath: null,
+          };
     case "deactivate":
       return { mode: "browse", query: state.query };
     case "queryChanged": {
@@ -94,7 +81,7 @@ export function searchReducer(
         query: action.query,
         results: initialResultsFor(action.query, prior),
         focusedIndex: 0,
-        frozen: false,
+        deliberateFocusPath: null,
       };
     }
     case "focusDelta": {
@@ -105,41 +92,56 @@ export function searchReducer(
       if (hits.length === 0) {
         return state;
       }
-      const next = clamp(state.focusedIndex + action.delta, 0, hits.length - 1);
-      return { ...state, focusedIndex: next, frozen: true };
+      const focusedIndex = clamp(state.focusedIndex + action.delta, 0, hits.length - 1);
+      return {
+        ...state,
+        focusedIndex,
+        deliberateFocusPath: hits[focusedIndex]?.path ?? null,
+      };
     }
-    case "resultsLanded": {
-      // Stale application is already blocked by the caller's seq guard; the query
-      // check drops a response the user has since typed past.
+    case "resultsWave": {
       if (state.mode !== "search" || state.query !== action.query) {
         return state;
       }
-      // A frozen list keeps the Focused result put; otherwise the first result is
-      // auto-focused (SPEC §6).
-      const focusedIndex = state.frozen
-        ? clamp(state.focusedIndex, 0, Math.max(0, action.hits.length - 1))
-        : 0;
-      return {
-        ...state,
-        results: { status: "done", hits: action.hits },
-        focusedIndex,
-      };
+      let focusedIndex = 0;
+      let deliberateFocusPath = state.deliberateFocusPath;
+      if (deliberateFocusPath !== null) {
+        const preserved = action.wave.hits.findIndex(
+          (hit) => hit.path === deliberateFocusPath,
+        );
+        focusedIndex =
+          preserved >= 0
+            ? preserved
+            : clamp(state.focusedIndex, 0, Math.max(0, action.wave.hits.length - 1));
+        deliberateFocusPath = action.wave.hits[focusedIndex]?.path ?? null;
+      }
+      const results: ResultsView = action.wave.complete
+        ? { status: "done", hits: action.wave.hits, stage: action.wave.stage }
+        : {
+            status: "streaming",
+            hits: action.wave.hits,
+            slow: false,
+            stage: action.wave.stage,
+          };
+      return { ...state, results, focusedIndex, deliberateFocusPath };
     }
     case "resultsFailed": {
       if (state.mode !== "search" || state.query !== action.query) {
         return state;
       }
-      return { ...state, results: { status: "failed" }, focusedIndex: 0 };
+      return {
+        ...state,
+        results: { status: "failed", hits: [...displayedHits(state.results)] },
+      };
     }
     case "resultsSlow": {
-      if (
-        state.mode !== "search" ||
-        state.query !== action.query ||
-        state.results.status !== "pending"
-      ) {
+      if (state.mode !== "search" || state.query !== action.query) {
         return state;
       }
-      return { ...state, results: { ...state.results, slow: true } };
+      if (state.results.status === "pending" || state.results.status === "streaming") {
+        return { ...state, results: { ...state.results, slow: true } };
+      }
+      return state;
     }
   }
 }

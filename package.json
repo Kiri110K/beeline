@@ -9,11 +9,12 @@
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.app.json && tsc -p tsconfig.node.json",
     "lint": "eslint .",
-    "test": "pnpm test:contract && pnpm test:browse-window && pnpm test:save-telemetry && pnpm test:slot-seed",
+    "test": "pnpm test:contract && pnpm test:browse-window && pnpm test:save-telemetry && pnpm test:slot-seed && pnpm test:search-stream",
     "test:contract": "node scripts/settings-contract.test.ts",
     "test:browse-window": "node scripts/browse-window.test.ts",
     "test:save-telemetry": "node scripts/save-telemetry.test.ts",
     "test:slot-seed": "node scripts/slot-seed.test.ts",
+    "test:search-stream": "node scripts/search-stream.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {

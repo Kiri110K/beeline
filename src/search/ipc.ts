@@ -1,11 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
-import { type ResultAsync } from "neverthrow";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { errAsync, okAsync, type ResultAsync } from "neverthrow";
 import { z } from "zod";
 
-import { fromTauri, type ShellError } from "../shell";
+import { fromTauri, reportShellError, type ShellError } from "../shell";
 
-// One ranked Search Result crossing the IPC boundary. Mirrors the Rust `SearchHit`
-// (camelCase serde rename); parsed here, trusted afterwards.
+const QGRAM_READY_EVENT = "beeline://search-qgram-ready";
+
 const tierSchema = z.enum(["normal", "hidden", "junk"]);
 export type Tier = z.infer<typeof tierSchema>;
 
@@ -19,39 +20,85 @@ export const searchHitSchema = z
   .strict();
 export type SearchHit = z.infer<typeof searchHitSchema>;
 
-// The Rust `SearchResponse`: the ranked hits plus the index generation they were
-// computed against (retained for future progressive reconciliation, SPEC §6), and scan
-// metadata (`reused`, `scanned`) passed through to sampled search telemetry (SPEC §10).
-export const searchResponseSchema = z
+export const searchWaveSchema = z
   .object({
+    stage: z.enum(["working_set", "exact", "fuzzy"]),
     revision: z.number().int().nonnegative(),
-    reused: z.boolean(),
+    complete: z.boolean(),
+    qgramReady: z.boolean(),
     scanned: z.number().int().nonnegative(),
     backendDurationMs: z.number().int().nonnegative(),
     hits: z.array(searchHitSchema),
   })
   .strict();
-export type SearchResponse = z.infer<typeof searchResponseSchema>;
+export type SearchWave = z.infer<typeof searchWaveSchema>;
 
-// Query the Name Index for up to `limit` ranked hits (SPEC §6). The backend trims
-// and lowercases the query itself; the raw text is passed straight through.
+const unitSchema = z.null();
+const readyPayloadSchema = z.object({}).strict();
+const unlistenSchema = z.custom<UnlistenFn>(
+  (value) => typeof value === "function",
+);
+
+// Start one Search v2 stream. Every channel message is parsed before the caller sees it;
+// the command resolves only after its final wave or cancellation.
 export function searchNameIndex(
   query: string,
   limit: number,
-): ResultAsync<SearchResponse, ShellError> {
-  return fromTauri("search_name_index", searchResponseSchema, () =>
-    invoke("search_name_index", { query, limit }),
+  currentLocation: string | null,
+  pinnedPaths: string[],
+  onWave: (wave: SearchWave) => void,
+): ResultAsync<null, ShellError> {
+  const boundaryErrors: ShellError[] = [];
+  const channel = new Channel<unknown>((payload) => {
+    const parsed = searchWaveSchema.safeParse(payload);
+    if (parsed.success) {
+      onWave(parsed.data);
+    } else {
+      boundaryErrors.push({
+        code: "invalid-boundary-payload",
+        operation: "search_name_index_v2:channel",
+        cause: parsed.error,
+      });
+    }
+  });
+  return fromTauri("search_name_index_v2", unitSchema, () =>
+    invoke("search_name_index_v2", {
+      query,
+      limit,
+      currentLocation,
+      pinnedPaths,
+      onWave: channel,
+    }),
+  ).andThen((value) => {
+    const error = boundaryErrors[0];
+    return error === undefined ? okAsync(value) : errAsync(error);
+  });
+}
+
+// The sidecar is built once in a helper process. A query entered while that work is still
+// running first gets exact results; this event makes the active query transparently rerun
+// as soon as global Typo Correction becomes available.
+export function subscribeSearchQgramReady(
+  handler: () => void,
+): ResultAsync<UnlistenFn, ShellError> {
+  return fromTauri(`listen:${QGRAM_READY_EVENT}`, unlistenSchema, () =>
+    listen(QGRAM_READY_EVENT, (event) => {
+      const parsed = readyPayloadSchema.safeParse(event.payload);
+      if (parsed.success) {
+        handler();
+      } else {
+        reportShellError({
+          code: "invalid-boundary-payload",
+          operation: QGRAM_READY_EVENT,
+          cause: parsed.error,
+        });
+      }
+    }),
   );
 }
 
-// What a visit was (SPEC §6): a Location entered, or a file opened. Only these two
-// wire strings are accepted by the `record_visit` command.
 export type VisitKind = "entered_location" | "opened_file";
 
-const unitSchema = z.null();
-
-// Record a visit into the Visit Journal — a ranking-only signal, never user-facing
-// (SPEC §6). Recording is liberal in v1; failures are reported, never surfaced.
 export function recordVisit(
   path: string,
   kind: VisitKind,

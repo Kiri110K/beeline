@@ -13,12 +13,15 @@ mod junk;
 mod junk_refresh;
 mod model;
 mod persist;
+mod qgram;
 mod query;
 mod visit_journal;
 mod watcher;
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex, RwLock,
@@ -29,18 +32,20 @@ use std::{
 
 use serde::Serialize;
 use serde_json::json;
-use tauri::{AppHandle, Manager, State};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 
-use crate::telemetry::Telemetry;
+use crate::{recents::RecentsCache, telemetry::Telemetry};
 use alias::AliasDictionary;
 use junk::JunkPatterns;
 use junk_refresh::JunkRefresh;
 use model::{IndexData, Tier};
+use qgram::QGramIndex;
 use query::{RankContext, SearchHit};
 use visit_journal::{VisitJournal, VisitKind};
 
 /// The volume key for the home root. Mounted volumes get their own keys later.
 const HOME_VOLUME_KEY: &str = "home";
+const QGRAM_READY_EVENT: &str = "beeline://search-qgram-ready";
 
 /// The built-in Junk seed list (SPEC §6), re-exported so the settings store can seed a
 /// fresh install's editable list from the same source (SPEC §12).
@@ -62,6 +67,7 @@ pub(crate) fn junk_seed_v2_names() -> Vec<String> {
 /// change reaches every future classification without re-crawling (Junk refreshes lazily,
 /// SPEC §6, §10).
 type SharedJunk = Arc<RwLock<Arc<JunkPatterns>>>;
+type SharedQGrams = Arc<RwLock<Option<Arc<QGramIndex>>>>;
 
 /// One cached exhaustive scan, reused when the next query strictly extends this one under
 /// the same index revision (typing-extension reuse, SPEC §10). Storing entry *slots* (not
@@ -89,13 +95,16 @@ pub struct NameIndex {
     /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
     /// searches rank against the current aliases.
     aliases: RwLock<Arc<AliasDictionary>>,
-    /// Monotonic query counter (SPEC §10 cancel-on-newer). `search_name_index` bumps it on
+    /// Monotonic query counter (SPEC §10 cancel-on-newer). Search v2 bumps it on
     /// entry; each running scan carries its own stamp and aborts once a newer query moves the
     /// counter past it.
     generation: Arc<AtomicU64>,
     /// The single previous exhaustive scan (the app has one search stream, SPEC §5), so a
     /// strictly-extending keystroke rescans just that match set instead of the whole index.
     reuse: Arc<Mutex<Option<ReuseCache>>>,
+    /// Search v2 Typo Correction candidates for the immutable mapped base. Built in the
+    /// background and swapped atomically; overlay Items are verified separately.
+    qgrams: SharedQGrams,
     /// Event-driven battery policy for lazy Junk refreshes (SPEC §10).
     junk_refresh: JunkRefresh,
 }
@@ -119,6 +128,7 @@ impl NameIndex {
             .app_data_dir()
             .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
         let index_file = persist::index_path(&app_data_dir, HOME_VOLUME_KEY);
+        let qgram_file = index_file.with_extension("qgram");
 
         // Seed the Junk classifier and Alias Dictionary from the persisted settings store
         // (SPEC §12): a fresh install's defaults carry the built-in Junk list and any
@@ -140,6 +150,17 @@ impl NameIndex {
         let data = Arc::new(RwLock::new(
             loaded.unwrap_or_else(|| IndexData::new(root.clone())),
         ));
+        let qgrams: SharedQGrams = Arc::new(RwLock::new(None));
+        if had_persisted {
+            load_or_build_qgrams(
+                data.clone(),
+                index_file.clone(),
+                root.clone(),
+                qgram_file.clone(),
+                qgrams.clone(),
+                app.clone(),
+            );
+        }
         if had_persisted {
             // The validation stamp keeps cold launch bounded by avoiding a 310+ MiB
             // checksum walk. Warm the ranker's worker paths and a representative slice of
@@ -178,6 +199,8 @@ impl NameIndex {
             let root = root.clone();
             let app = app.clone();
             let index_file = index_file.clone();
+            let qgram_file = qgram_file.clone();
+            let qgrams = qgrams.clone();
             thread::spawn(move || {
                 crawl::set_crawl_qos();
                 // The watcher is registered before the crawl begins, so changes made during
@@ -186,7 +209,7 @@ impl NameIndex {
                 if had_persisted {
                     let entries = data.read().expect("name index lock poisoned").len();
                     record(&app, "index_loaded", json!({ "entries": entries }));
-                    crawl::diff_rescan(&data, root, &crawl_junk, Some(&app));
+                    crawl::diff_rescan(&data, root.clone(), &crawl_junk, Some(&app));
                     let index = data.read().expect("name index lock poisoned");
                     // Keep the startup delta in the mutable overlay for this session. A
                     // full 5M-entry rewrite makes the old mmap and the growing temp file
@@ -198,7 +221,7 @@ impl NameIndex {
                         json!({ "entries": index.len(), "mutations": index.revision }),
                     );
                 } else {
-                    crawl::initial_crawl(&data, root, &crawl_junk, Some(&app));
+                    crawl::initial_crawl(&data, root.clone(), &crawl_junk, Some(&app));
                     let persist_started = Instant::now();
                     match persist::save(&data, &index_file) {
                         Ok(()) => record(
@@ -220,6 +243,14 @@ impl NameIndex {
                             eprintln!("name index persist after crawl failed: {error}");
                         }
                     }
+                    load_or_build_qgrams(
+                        data.clone(),
+                        index_file,
+                        root,
+                        qgram_file,
+                        qgrams,
+                        app.clone(),
+                    );
                 }
                 // Applying FSEvents concurrently with the first crawl can discover the same
                 // large subtree twice, hold the write lock for minutes, and starve the first
@@ -248,6 +279,7 @@ impl NameIndex {
             aliases,
             generation: Arc::new(AtomicU64::new(0)),
             reuse: Arc::new(Mutex::new(None)),
+            qgrams,
             junk_refresh,
         })
     }
@@ -281,6 +313,115 @@ impl NameIndex {
     }
 }
 
+fn load_or_build_qgrams(
+    data: Arc<RwLock<IndexData>>,
+    source_path: PathBuf,
+    root: PathBuf,
+    path: PathBuf,
+    target: SharedQGrams,
+    app: AppHandle,
+) {
+    let existing = {
+        let index = data.read().expect("name index lock poisoned");
+        index
+            .base_content_hash()
+            .and_then(|hash| QGramIndex::open(&path, hash, index.base_entry_count()).map(Arc::new))
+    };
+    if let Some(existing) = existing {
+        *target.write().expect("q-gram lock poisoned") = Some(existing);
+        record(&app, "search_qgram_loaded", json!({ "rebuilt": false }));
+        return;
+    }
+
+    thread::spawn(move || {
+        // The two build passes allocate roughly the final sidecar size. macOS's allocator
+        // retains those freed pages in a long-lived GUI process, so perform the one-off build
+        // in the same executable's CLI-only helper mode. Its entire heap disappears on exit;
+        // the app only maps the finished read-only sidecar.
+        let started = Instant::now();
+        let built = std::env::current_exe()
+            .map_err(|error| format!("cannot resolve q-gram helper executable: {error}"))
+            .and_then(|executable| {
+                Command::new(executable)
+                    .arg("--build-search-qgram")
+                    .arg(&source_path)
+                    .arg(&root)
+                    .arg(&path)
+                    .status()
+                    .map_err(|error| format!("cannot launch q-gram helper: {error}"))
+            })
+            .and_then(|status| {
+                status
+                    .success()
+                    .then_some(())
+                    .ok_or_else(|| format!("q-gram helper exited with {status}"))
+            })
+            .and_then(|()| {
+                let index = data.read().expect("name index lock poisoned");
+                let hash = index
+                    .base_content_hash()
+                    .ok_or_else(|| "Name Index base disappeared".to_owned())?;
+                let entries = index.base_entry_count();
+                let mapped = QGramIndex::open(&path, hash, entries)
+                    .ok_or_else(|| "built q-gram sidecar is invalid or stale".to_owned())?;
+                Ok((Arc::new(mapped), hash, entries))
+            });
+        match built {
+            Ok((mapped, hash, entries)) => {
+                let still_current = {
+                    let index = data.read().expect("name index lock poisoned");
+                    index.base_content_hash() == Some(hash) && index.base_entry_count() == entries
+                };
+                if !still_current {
+                    record(&app, "search_qgram_stale_build", json!({}));
+                    return;
+                }
+                let bytes = std::fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                let postings = mapped.postings();
+                *target.write().expect("q-gram lock poisoned") = Some(mapped);
+                record(
+                    &app,
+                    "search_qgram_built",
+                    json!({
+                        "duration_ms": u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "bytes": bytes,
+                        "postings": postings,
+                    }),
+                );
+                if let Err(error) = app.emit(QGRAM_READY_EVENT, json!({})) {
+                    record(
+                        &app,
+                        "search_qgram_ready_emit_failed",
+                        json!({ "error": error.to_string() }),
+                    );
+                }
+            }
+            Err(error) => {
+                record(
+                    &app,
+                    "search_qgram_failed",
+                    json!({ "error": error.to_string() }),
+                );
+                eprintln!("q-gram sidecar build failed: {error}");
+            }
+        }
+    });
+}
+
+/// CLI-only q-gram builder used by the app's short-lived helper process. It maps the
+/// persisted Name Index independently and never initializes Tauri or a WebView.
+pub fn build_qgram_sidecar(source_path: &Path, root: &Path, path: &Path) -> Result<(), String> {
+    crate::qos::set_qos(0x11);
+    let source = persist::load(source_path, root)
+        .ok_or_else(|| "cannot map q-gram source Name Index".to_owned())?;
+    QGramIndex::build(&source, path)
+        .map(|_| ())
+        .map_err(|error| format!("cannot build q-gram sidecar: {error}"))
+}
+
 fn record(app: &AppHandle, event: &str, fields: serde_json::Value) {
     if let Err(error) = app.state::<Telemetry>().record(event, fields) {
         eprintln!("telemetry event {event} failed: {error}");
@@ -309,6 +450,18 @@ pub struct SearchResponse {
     pub scanned: usize,
     /// Time spent inside the blocking backend task. Comparing it with frontend telemetry
     /// separates index-scan cost from task-queue, IPC, and WebView wake-up latency.
+    pub backend_duration_ms: u64,
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWave {
+    pub stage: &'static str,
+    pub revision: u64,
+    pub complete: bool,
+    pub qgram_ready: bool,
+    pub scanned: usize,
     pub backend_duration_ms: u64,
     pub hits: Vec<SearchHit>,
 }
@@ -449,7 +602,7 @@ fn direct_existing_path_response(
 }
 
 /// Run a search with no cancellation or reuse (the direct path the tests exercise).
-/// Production searches go through `search_name_index`, which adds stale-cancellation and
+/// Production searches go through Search v2, which adds stale-cancellation and
 /// typing-extension reuse on top of the same `execute_search` core.
 #[cfg(test)]
 fn run_search(
@@ -474,17 +627,53 @@ fn run_search(
     }
 }
 
-/// Query the Name Index. Runs off the async runtime's core threads (like `list_location`)
-/// so the read scan and any Junk drain never block IPC. Every call bumps the query
-/// generation so any still-running older scan aborts (SPEC §10 cancel-on-newer), and a
-/// strictly-extending query reuses the previous exhaustive scan's candidate set.
+fn working_set_slots(
+    index: &IndexData,
+    current_location: Option<&Path>,
+    pinned_paths: &[PathBuf],
+    recent_paths: &[PathBuf],
+    journal: &visit_journal::Aggregate,
+) -> Vec<u32> {
+    let mut slots = BTreeSet::new();
+    if let Some(location) = current_location {
+        if let Some(directory) = index.resolve_dir(location) {
+            slots.extend(index.direct_entry_slots(directory));
+        }
+    }
+    for path in pinned_paths
+        .iter()
+        .chain(recent_paths)
+        .map(PathBuf::as_path)
+        .chain(journal.paths().map(Path::new))
+    {
+        if let Some(slot) = index.resolve_item_slot(path) {
+            slots.insert(slot);
+        }
+    }
+    slots.into_iter().collect()
+}
+
+fn send_wave(channel: &Channel<SearchWave>, wave: SearchWave) -> Result<(), String> {
+    channel
+        .send(wave)
+        .map_err(|error| format!("failed to send Search v2 wave: {error}"))
+}
+
+/// Search v2 sends one ranked stream through a Tauri channel. The frontend may paint the
+/// complete Working Set before global work finishes, then reconcile exact/layout and fuzzy
+/// waves by stable Item path. One generation stamp covers the entire stream.
 #[tauri::command]
-pub async fn search_name_index(
+#[allow(clippy::too_many_arguments)]
+pub async fn search_name_index_v2(
     query: String,
     limit: u32,
+    current_location: Option<String>,
+    pinned_paths: Vec<String>,
+    on_wave: Channel<SearchWave>,
+    app: AppHandle,
     state: State<'_, NameIndex>,
-) -> Result<SearchResponse, String> {
-    // Bump on entry so any older scan still in flight sees itself superseded and aborts.
+    recents: State<'_, RecentsCache>,
+) -> Result<(), String> {
     let my_gen = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let started = Instant::now();
     let data = state.data.clone();
@@ -494,19 +683,178 @@ pub async fn search_name_index(
         direct_existing_path_response(&data, &junk, &root, &query, limit as usize, started)
     {
         *state.reuse.lock().expect("reuse cache lock poisoned") = None;
-        return Ok(response);
+        return send_wave(
+            &on_wave,
+            SearchWave {
+                stage: "exact",
+                revision: response.revision,
+                complete: true,
+                qgram_ready: state.qgrams.read().expect("q-gram lock poisoned").is_some(),
+                scanned: response.scanned,
+                backend_duration_ms: response.backend_duration_ms,
+                hits: response.hits,
+            },
+        );
     }
+
     let journal = state.journal.clone();
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
     let junk_refresh = state.junk_refresh.clone();
+    let qgrams = state.qgrams.clone();
+    let recent_paths = recents.paths();
+    let current_location = current_location.map(PathBuf::from);
+    let pinned_paths = pinned_paths
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     tauri::async_runtime::spawn_blocking(move || {
         crate::qos::set_user_initiated_qos();
-        let started = Instant::now();
-        let cached = reuse.lock().expect("reuse cache lock poisoned").clone();
+        let stream_started = Instant::now();
         let cancel = query::Cancel::new(&generation, my_gen);
-        let executed = execute_search(
+        let aggregate = journal.aggregate();
+        let context = RankContext {
+            journal: &aggregate,
+            aliases: &aliases,
+        };
+
+        let (working, working_slots, revision) = {
+            let index = data.read().expect("name index lock poisoned");
+            let slots = working_set_slots(
+                &index,
+                current_location.as_deref(),
+                &pinned_paths,
+                &recent_paths,
+                &aggregate,
+            );
+            let outcome = query::run_fuzzy(
+                &index,
+                &context,
+                &query,
+                limit as usize,
+                &slots,
+                Some(&cancel),
+                true,
+            );
+            (outcome, slots, index.revision)
+        };
+        if working.aborted {
+            return Err("search superseded".to_owned());
+        }
+        let global = qgram::significant_len(&query) >= 5;
+        let qgram_ready = qgrams.read().expect("q-gram lock poisoned").is_some();
+        send_wave(
+            &on_wave,
+            SearchWave {
+                stage: "working_set",
+                revision,
+                complete: !global,
+                qgram_ready,
+                scanned: working.scanned,
+                backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                hits: working.hits,
+            },
+        )?;
+        if !global {
+            return Ok(());
+        }
+
+        let qgram = qgrams.read().expect("q-gram lock poisoned").clone();
+        if let Some(qgram) = qgram.filter(|_| qgram::supports_query(&query)) {
+            if junk.query_targets_junk(&query.trim().to_lowercase()) {
+                junk_refresh.targeting_query();
+            }
+            let candidate_set = qgram.candidates(&query, &cancel);
+            if candidate_set.aborted {
+                return Err("search superseded".to_owned());
+            }
+            let mut candidate_slots = candidate_set.slots;
+            {
+                let index = data.read().expect("name index lock poisoned");
+                candidate_slots
+                    .extend((qgram.source_entries()..index.slot_len()).map(|slot| slot as u32));
+            }
+            candidate_slots.extend(working_slots);
+            candidate_slots.sort_unstable();
+            candidate_slots.dedup();
+
+            let mut partial_error = None;
+            let mut send_partial = |hits: Vec<SearchHit>, scanned: usize| {
+                if hits.is_empty() || partial_error.is_some() {
+                    return;
+                }
+                if let Err(error) = send_wave(
+                    &on_wave,
+                    SearchWave {
+                        stage: "fuzzy",
+                        revision,
+                        complete: false,
+                        qgram_ready: true,
+                        scanned,
+                        backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        hits,
+                    },
+                ) {
+                    partial_error = Some(error);
+                }
+            };
+            let fuzzy = {
+                let index = data.read().expect("name index lock poisoned");
+                query::run_fuzzy_streaming(
+                    &index,
+                    &context,
+                    &query,
+                    limit as usize,
+                    &candidate_slots,
+                    Some(&cancel),
+                    false,
+                    &mut send_partial,
+                )
+            };
+            if let Some(error) = partial_error {
+                return Err(error);
+            }
+            if fuzzy.aborted {
+                return Err("search superseded".to_owned());
+            }
+            let scanned = fuzzy.scanned;
+            let hits = fuzzy.hits;
+            let result_count = hits.len();
+            send_wave(
+                &on_wave,
+                SearchWave {
+                    stage: "fuzzy",
+                    revision,
+                    complete: true,
+                    qgram_ready: true,
+                    scanned,
+                    backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    hits,
+                },
+            )?;
+            record(
+                &app,
+                "search_v2_completed",
+                json!({
+                    "duration_ms": u64::try_from(stream_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "candidates": candidate_slots.len(),
+                    "posting_visits": candidate_set.posting_visits,
+                    "results": result_count,
+                    "retrieval": "qgram",
+                }),
+            );
+            return Ok(());
+        }
+
+        // Until the sidecar is ready, and for token mixtures too short to have complete
+        // q-gram recall, retain the exact/layout scanner as a correctness fallback.
+        let cached = reuse.lock().expect("reuse cache lock poisoned").clone();
+        let exact = execute_search(
             &data,
             &junk,
             &root,
@@ -518,36 +866,54 @@ pub async fn search_name_index(
             cached.as_ref(),
             Some(&cancel),
         );
-        // Superseded: return an explicit error. The frontend's per-Tab seq-guard already
-        // drops it — a newer query on the single search stream is by definition in flight —
-        // so it never reaches the UI (SPEC §6 progressive/stale handling).
-        if executed.outcome.aborted {
+        if exact.outcome.aborted {
             return Err("search superseded".to_owned());
         }
-        // Cache the match set only when the scan was exhaustive; a capped scan (or one whose
-        // reuse is no longer valid) clears the slot so the next query starts from a full scan.
         {
             let mut slot = reuse.lock().expect("reuse cache lock poisoned");
-            if executed.outcome.exhaustive {
+            if exact.outcome.exhaustive {
                 *slot = Some(ReuseCache {
                     query_lower: query.trim().to_lowercase(),
-                    revision: executed.revision,
-                    entries: executed.outcome.candidate_entries,
+                    revision: exact.revision,
+                    entries: exact.outcome.candidate_entries.clone(),
                 });
             } else {
                 *slot = None;
             }
         }
-        Ok(SearchResponse {
-            revision: executed.revision,
-            reused: executed.reused,
-            scanned: executed.outcome.scanned,
-            backend_duration_ms: started.elapsed().as_millis() as u64,
-            hits: executed.outcome.hits,
-        })
+
+        let exact_hits = exact.outcome.hits;
+        let result_count = exact_hits.len();
+        send_wave(
+            &on_wave,
+            SearchWave {
+                stage: "exact",
+                revision: exact.revision,
+                complete: true,
+                qgram_ready,
+                scanned: exact.outcome.scanned,
+                backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                hits: exact_hits,
+            },
+        )?;
+        record(
+            &app,
+            "search_v2_completed",
+            json!({
+                "duration_ms": u64::try_from(stream_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
+                "candidates": exact.outcome.scanned,
+                "posting_visits": 0,
+                "results": result_count,
+                "exact_reused": exact.reused,
+                "retrieval": "exact_fallback",
+            }),
+        );
+        Ok(())
     })
     .await
-    .map_err(|_| "name index search task failed".to_owned())?
+    .map_err(|_| "Search v2 task failed".to_owned())?
 }
 
 /// Record a visit into the Visit Journal (SPEC §6). The frontend wires this into
