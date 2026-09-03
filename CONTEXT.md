@@ -84,6 +84,18 @@ _Avoid_: Local index, Recents, cache
 The local, persistent association between an Item, the normalized Search Query, and any currently supported ordinary or Path Interpretation when the user opens its Action Menu, invokes Quick Look, or completes an Item action. It may return or promote the Item for the same or a sufficiently similar future query, and follows the Item across rename and move; visibility, scrolling, hover, focus, selection, and choosing another Item are not signals.
 _Avoid_: Visit Journal, Recents, history, cache
 
+**Candidate Evidence**:
+The merged, query-specific facts attached to one Item before ranking, including retrieval sources, match interpretations, correction quality, and personal signals.
+_Avoid_: Result metadata, provenance, source score
+
+**Ranker Configuration**:
+The single user-editable definition of ranking weights, curves, caps, and dormant features used by the ranker for every candidate.
+_Avoid_: Search settings, ranking code, weights file
+
+**Ranking Trace**:
+The local, replayable record of a Search Query, its Candidate Evidence, the active Ranker Configuration, calculated score contributions, final order, and subsequent eligible Item actions.
+_Avoid_: Telemetry, debug log, Search Memory
+
 **Search Results**:
 A transient ranked list of Items and Locations matching a Search Query. Search Results do not change the current Location until the user Reveals one.
 _Avoid_: Folder contents, Recents
