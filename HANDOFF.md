@@ -82,6 +82,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   pipeline, fallback и мёртвый код «на всякий случай».
 - Следующий открытый frontier —
   [Decide the Search v2 ranking contract](https://github.com/Kiri110K/beeline/issues/49).
+  В нём уже принят единый ranker поверх Candidate Evidence и один активный
+  `ranker.json`: строгая атомарная валидация, embedded default при отсутствии или
+  ошибке на старте, ручной reload без file watch и немедленный пересчёт активного
+  запроса. CLI обязан валидировать, объяснять, replay/diff и применять конфиг;
+  `apply` атомарно заменяет файл и просит запущенную Beeline перечитать его.
+  Ranking Traces локальные: compact на каждое обновление, detailed top-256 после
+  300 мс idle или действия, acted-on Item всегда detailed; исходные пределы —
+  30 дней или 256 MiB. `schemaVersion` нужен для валидации, а не совместимости:
+  экспериментальные конфиг, traces и learned state можно выбрасывать.
+  Открыты выразительность JSON, semantic validation монотонности, хранение
+  снимков конфига для replay/rollback, tie-break и начальный список features.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
