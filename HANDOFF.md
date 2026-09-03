@@ -108,9 +108,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   transfer similarity меняют родительский вклад и отдельно видны в trace.
   Первые groups: Text Match, Search Memory, General Usage, Context, Alias,
   Item Kind и Penalties. Retrieval provenance и Working Set membership дают
-  ноль score. Открыты выбор одного из альтернативных Text Match explanations,
-  агрегация Search Memory associations, дедуп общего usage evidence и сочетание
-  Hidden/Junk penalties.
+  ноль score. Text Match берёт одно лучшее полное explanation: одна
+  interpretation, не больше одной correction, лучший hit каждого token и смесь
+  weakest/remaining token quality. Search Memory берёт strongest association;
+  события внутри неё накапливаются с saturation. General Usage сохраняет
+  отдельные contributions под общим cap без cross-source dedup в первой версии.
+  Hidden и Junk применяются по одному разу, складываются и ограничиваются общим
+  cap. Открыты filename/stem/extension semantics, область current Location,
+  точное ограничение transferred memory и выбор initial numeric defaults.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
