@@ -102,9 +102,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   penalty magnitudes и caps неотрицательны, curves соблюдают объявленную
   монотонность. Candidate Evidence хранит raw facts; ranker приводит каждый
   применимый факт к силе 0–1 и умножает её на weight. Ranking Trace раздельно
-  пишет raw value, normalized strength, weight и contribution. Открыты способ
-  сложения score, разрешённые interactions, накопление внутри групп и начальный
-  список features.
+  пишет raw value, normalized strength, weight и contribution. Score — сумма
+  ограниченных named groups минус penalties. Связанные features сначала
+  складываются внутри group cap; code-defined modifiers вроде query length или
+  transfer similarity меняют родительский вклад и отдельно видны в trace.
+  Открыты точные границы groups, насыщение learned events, Text Match aggregate
+  и начальный список features/default values.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
