@@ -75,6 +75,19 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   а `2026` и `2035` дают слишком много глобального шума. Изменение порога должно
   немедленно пересчитывать неизменённый активный запрос. Воспроизводимый код и
   отчёт: `/Users/kiri110k/lab/beeline/prototypes/staged-retrieval-threshold/`.
+- [Prototype end-to-end Search v2 performance](https://github.com/Kiri110K/beeline/issues/54)
+  завершён на production v4 из 5 244 905 Items. Full mmap оставлен baseline:
+  опечатки стабилизировали top-10 за 68–152 мс, составные запросы — за
+  434–603 мс и завершались до 1,13 с. Следующий последовательный q-gram
+  sidecar дал Working Set 0,36–1,48 мс p95, первый полезный global результат
+  не позже 39,62 мс p95 и финальный top-50 не позже 136,05 мс p95. Все десять
+  целей остались в top-50; `метолология` стабилизировалась за 14,98 мс p95.
+  Sidecar пока большой: 522 142 260 байт, build 14,79 с и 584 МБ peak physical
+  footprint. Тёплый query-run — 55 МБ peak physical footprint. FST не делать,
+  пока integrated IPC/render или размер после сжатия не докажут необходимость.
+  Архитектура первой интеграции: полный Working Set, production exact/layout
+  волна, затем q-gram fuzzy supplement. Полный отчёт и воспроизводимый harness:
+  `/Users/kiri110k/lab/beeline/prototypes/search-v2-performance/RESULTS.md`.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/
@@ -127,13 +140,11 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   обучают. Query change сбрасывает сохранение. Stream сообщает local-ready,
   global-running и complete; до 150 мс индикатора нет, после — Status Strip.
   Действующие бюджеты: UI response на keystroke ≤8 мс, first Search Results
-  end-to-end ≤50 мс. Отдельный global-completion budget ещё решает #47. Важно:
-  threshold prototype замерял нынешний exact/prefix/substring matcher и
-  Keyboard Layout Correction, но не Typo Correction; `метолология` после
-  полного скана 5 244 905 Items вернула ноль. Его whole-index
-  median/p90/max 32.89/63.50/68.76 мс нельзя считать замером полного fuzzy
-  Search v2. Отдельно измерить typo, layout+typo, Candidate Evidence, ranking,
-  cancellation, IPC и rendered merge.
+  end-to-end ≤50 мс. Прототип #54 подтвердил три backend-волны и отсутствие
+  индикатора на тёплом пути. Теперь #46 должен проверить progressive merge в
+  настоящем UI: q-gram first-global p95 оставляет около 10 мс на IPC/render в
+  худшем запросе. Отдельный global-completion budget, cold/post-reboot и
+  окончательные memory/disk пределы решает #47 после integrated pass.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
