@@ -121,24 +121,19 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   по Ranking Traces и использованию Кирилла; отдельный ranker prototype не нужен.
 - Следующий открытый frontier —
   [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46).
-  Progressive merge сохраняет только deliberately navigated Focused Item по
-  stable Item identity; auto-focused first Item, hover и scroll ничего не
-  закрепляют. До 150 мс indicator не показывается, затем Status Strip сообщает
-  о продолжающемся global search. Важно: threshold prototype замерял нынешний
-  exact/prefix/substring matcher и Keyboard Layout Correction, но не Typo
-  Correction. `метолология` после полного скана 5 244 905 Items вернула ноль.
-  Цифры median 32.89 / p90 63.50 / max 68.76 мс нельзя считать бюджетом полного
-  fuzzy Search v2; отдельно измерить typo, layout+typo, Candidate Evidence,
-  ranking, cancellation, IPC и rendered merge.
   Progressive merge сохраняет по stable identity только Focused Item после
   явной result navigation; auto-focused первый Item до навигации не sticky.
   Остальной список свободно rerank; hover и scroll ничего не закрепляют и не
   обучают. Query change сбрасывает сохранение. Stream сообщает local-ready,
   global-running и complete; до 150 мс индикатора нет, после — Status Strip.
   Действующие бюджеты: UI response на keystroke ≤8 мс, first Search Results
-  end-to-end ≤50 мс. Отдельный global-completion budget ещё решает #47;
-  прототип порога дал Working Set <0.1 мс и whole-index median/p90/max
-  32.89/63.50/68.76 мс на 5 244 905 Items.
+  end-to-end ≤50 мс. Отдельный global-completion budget ещё решает #47. Важно:
+  threshold prototype замерял нынешний exact/prefix/substring matcher и
+  Keyboard Layout Correction, но не Typo Correction; `метолология` после
+  полного скана 5 244 905 Items вернула ноль. Его whole-index
+  median/p90/max 32.89/63.50/68.76 мс нельзя считать замером полного fuzzy
+  Search v2. Отдельно измерить typo, layout+typo, Candidate Evidence, ranking,
+  cancellation, IPC и rendered merge.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
