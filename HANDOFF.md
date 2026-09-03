@@ -106,8 +106,11 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   ограниченных named groups минус penalties. Связанные features сначала
   складываются внутри group cap; code-defined modifiers вроде query length или
   transfer similarity меняют родительский вклад и отдельно видны в trace.
-  Открыты точные границы groups, насыщение learned events, Text Match aggregate
-  и начальный список features/default values.
+  Первые groups: Text Match, Search Memory, General Usage, Context, Alias,
+  Item Kind и Penalties. Retrieval provenance и Working Set membership дают
+  ноль score. Открыты выбор одного из альтернативных Text Match explanations,
+  агрегация Search Memory associations, дедуп общего usage evidence и сочетание
+  Hidden/Junk penalties.
 - В рамках карты production-код не менять. Каждая HITL-сессия использует
   `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
   comments соответствующих decision tickets.
