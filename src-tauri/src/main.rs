@@ -3,7 +3,8 @@
 
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
-    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("--build-search-qgram")) {
+    let mode = arguments.next();
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--build-search-qgram")) {
         let Some(source_path) = arguments.next() else {
             eprintln!("missing q-gram source path");
             std::process::exit(2);
@@ -25,6 +26,13 @@ fn main() {
             std::path::Path::new(&root),
             std::path::Path::new(&target_path),
         ) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--benchmark-search-v2")) {
+        if let Err(error) = beeline_lib::run_search_v2_benchmark(arguments) {
             eprintln!("{error}");
             std::process::exit(1);
         }

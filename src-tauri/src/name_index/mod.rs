@@ -8,6 +8,7 @@
 //! `crawl.rs`). Background work runs on plain `std::thread`s lowered to background QoS.
 
 mod alias;
+mod benchmark;
 mod crawl;
 mod junk;
 mod junk_refresh;
@@ -61,6 +62,8 @@ pub(crate) fn junk_seed_v2_names() -> Vec<String> {
         .map(|name| (*name).to_owned())
         .collect()
 }
+
+pub(crate) use benchmark::run as run_benchmark;
 
 /// A swappable Junk-patterns handle. Search, the watcher, and the Junk drain each take a
 /// cheap snapshot (`.read().clone()`); `apply_settings` swaps the inner `Arc` so a Settings

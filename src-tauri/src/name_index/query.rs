@@ -764,6 +764,7 @@ fn scan_fuzzy_slots(
 ) -> (Vec<Candidate>, usize, bool) {
     let mut candidates = Vec::new();
     let mut scratch = String::new();
+    let mut edit_scratch = EditScratch::default();
     let mut dir_masks = new_dir_masks(index, prep);
     let mut scanned = 0usize;
     for (position, &slot) in slots.iter().enumerate() {
@@ -782,8 +783,9 @@ fn scan_fuzzy_slots(
         }
         scanned += 1;
         if let Some((score, path)) =
-            score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
-                .or_else(|| score_fuzzy_entry(index, item, prep, ctx, short_fuzzy))
+            score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch).or_else(|| {
+                score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut edit_scratch)
+            })
         {
             candidates.push(Candidate {
                 score,
@@ -804,22 +806,31 @@ fn score_fuzzy_entry(
     prep: &Prepared,
     ctx: &RankContext,
     short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
 ) -> Option<(i64, String)> {
     let (quality, corrected) = if prep.path_shaped {
-        let quality = fuzzy_path_interpretation(index, item, &prep.segments, short_fuzzy)?;
+        let quality =
+            fuzzy_path_interpretation(index, item, &prep.segments, short_fuzzy, edit_scratch)?;
         (quality + SCOPE_BONUS, false)
     } else if prep.tokens.len() > 1 {
-        let mut best = fuzzy_token_set(index, item, &prep.tokens, short_fuzzy);
+        let mut best = fuzzy_token_set(index, item, &prep.tokens, short_fuzzy, edit_scratch);
         best = best.max(fuzzy_path_interpretation(
             index,
             item,
             &prep.tokens,
             short_fuzzy,
+            edit_scratch,
         ));
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
-            let mut candidate = fuzzy_token_set(index, item, tokens, short_fuzzy);
-            candidate = candidate.max(fuzzy_path_interpretation(index, item, tokens, short_fuzzy));
+            let mut candidate = fuzzy_token_set(index, item, tokens, short_fuzzy, edit_scratch);
+            candidate = candidate.max(fuzzy_path_interpretation(
+                index,
+                item,
+                tokens,
+                short_fuzzy,
+                edit_scratch,
+            ));
             if candidate > best {
                 best = candidate;
                 corrected = true;
@@ -827,14 +838,13 @@ fn score_fuzzy_entry(
         }
         (best?, corrected)
     } else {
-        let direct = prep
-            .tokens
-            .first()
-            .and_then(|token| fuzzy_name_quality(item.entry.name, token, short_fuzzy));
+        let direct = prep.tokens.first().and_then(|token| {
+            fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch)
+        });
         let mut best = direct;
         let mut corrected = false;
         for variant in &prep.corrected {
-            let candidate = fuzzy_name_quality(item.entry.name, variant, short_fuzzy);
+            let candidate = fuzzy_name_quality(item.entry.name, variant, short_fuzzy, edit_scratch);
             if candidate > best {
                 best = candidate;
                 corrected = true;
@@ -861,19 +871,23 @@ fn fuzzy_token_set(
     item: SearchItem<'_>,
     tokens: &[String],
     short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
 ) -> Option<i64> {
     let ancestors = ancestor_names(index, item.entry.parent);
     let mut weakest = i64::MAX;
     let mut name_match = false;
     for token in tokens {
-        if let Some(quality) = fuzzy_name_quality(item.entry.name, token, short_fuzzy) {
+        if let Some(quality) = fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch)
+        {
             weakest = weakest.min(quality);
             name_match = true;
             continue;
         }
         let quality = ancestors
             .iter()
-            .filter_map(|component| fuzzy_component_quality(component, token, short_fuzzy))
+            .filter_map(|component| {
+                fuzzy_component_quality(component, token, short_fuzzy, edit_scratch)
+            })
             .max()?;
         weakest = weakest.min(quality.min(QUAL_PATH));
     }
@@ -885,9 +899,10 @@ fn fuzzy_path_interpretation(
     item: SearchItem<'_>,
     tokens: &[String],
     short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
 ) -> Option<i64> {
     let (last, parents) = tokens.split_last()?;
-    let final_quality = fuzzy_name_quality(item.entry.name, last, short_fuzzy)?;
+    let final_quality = fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch)?;
     let ancestors = ancestor_names(index, item.entry.parent);
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
@@ -895,7 +910,9 @@ fn fuzzy_path_interpretation(
         let mut found = None;
         while cursor > 0 {
             cursor -= 1;
-            if let Some(quality) = fuzzy_component_quality(&ancestors[cursor], token, short_fuzzy) {
+            if let Some(quality) =
+                fuzzy_component_quality(&ancestors[cursor], token, short_fuzzy, edit_scratch)
+            {
                 found = Some(quality.min(QUAL_PATH));
                 break;
             }
@@ -905,31 +922,53 @@ fn fuzzy_path_interpretation(
     Some(weakest)
 }
 
-fn fuzzy_name_quality(name: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+fn fuzzy_name_quality(
+    name: &str,
+    query: &str,
+    short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
+) -> Option<i64> {
     let lower = name.to_lowercase();
     let stem = lower
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
         .map_or(lower.as_str(), |(stem, _)| stem);
-    fuzzy_targets(&lower, stem, query, short_fuzzy)
+    fuzzy_targets(&lower, stem, query, short_fuzzy, edit_scratch)
 }
 
-fn fuzzy_component_quality(component: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+fn fuzzy_component_quality(
+    component: &str,
+    query: &str,
+    short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
+) -> Option<i64> {
     let lower = component.to_lowercase();
-    fuzzy_targets(&lower, &lower, query, short_fuzzy)
+    fuzzy_targets(&lower, &lower, query, short_fuzzy, edit_scratch)
 }
 
-fn fuzzy_targets(full: &str, stem: &str, query: &str, short_fuzzy: bool) -> Option<i64> {
+fn fuzzy_targets(
+    full: &str,
+    stem: &str,
+    query: &str,
+    short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
+) -> Option<i64> {
     let edits = allowed_typo_edits(query.chars().count(), short_fuzzy);
     if edits == 0 {
         return None;
     }
-    full.split(|character: char| !character.is_alphanumeric())
+    let mut best = None;
+    for target in full
+        .split(|character: char| !character.is_alphanumeric())
         .chain(std::iter::once(stem))
         .filter(|target| !target.is_empty())
-        .filter_map(|target| bounded_osa_chars(query, target, edits))
-        .map(|distance| QUAL_TYPO - distance as i64 * 100_000)
-        .max()
+    {
+        if let Some(distance) = edit_scratch.distance(query, target, edits) {
+            let quality = QUAL_TYPO - distance as i64 * 100_000;
+            best = Some(best.map_or(quality, |current: i64| current.max(quality)));
+        }
+    }
+    best
 }
 
 fn allowed_typo_edits(length: usize, short_fuzzy: bool) -> usize {
@@ -943,16 +982,101 @@ fn allowed_typo_edits(length: usize, short_fuzzy: bool) -> usize {
     }
 }
 
-fn bounded_osa_chars(left: &str, right: &str, limit: usize) -> Option<usize> {
-    if left.is_ascii() && right.is_ascii() {
-        return bounded_osa(left.as_bytes(), right.as_bytes(), limit);
-    }
-    let left = left.chars().collect::<Vec<_>>();
-    let right = right.chars().collect::<Vec<_>>();
-    bounded_osa(&left, &right, limit)
+#[derive(Default)]
+struct EditScratch {
+    left_chars: Vec<char>,
+    right_chars: Vec<char>,
+    rows: EditRows,
 }
 
-fn bounded_osa<T: Eq>(left: &[T], right: &[T], limit: usize) -> Option<usize> {
+impl EditScratch {
+    fn distance(&mut self, left: &str, right: &str, limit: usize) -> Option<usize> {
+        if left.is_ascii() && right.is_ascii() {
+            return self.rows.distance(left.as_bytes(), right.as_bytes(), limit);
+        }
+        self.left_chars.clear();
+        self.left_chars.extend(left.chars());
+        self.right_chars.clear();
+        self.right_chars.extend(right.chars());
+        self.rows
+            .distance(&self.left_chars, &self.right_chars, limit)
+    }
+}
+
+#[derive(Default)]
+struct EditRows {
+    previous_two: Vec<u16>,
+    previous: Vec<u16>,
+    current: Vec<u16>,
+}
+
+impl EditRows {
+    /// Banded optimal-string-alignment distance. Only cells within `limit` of the main
+    /// diagonal can contribute to an accepted answer; all other cells are represented by
+    /// the `limit + 1` sentinel. The three rows retain their allocation for the worker's
+    /// next candidate.
+    fn distance<T: Eq>(&mut self, left: &[T], right: &[T], limit: usize) -> Option<usize> {
+        if left.len().abs_diff(right.len()) > limit {
+            return None;
+        }
+        if left.is_empty() || right.is_empty() {
+            let distance = left.len().max(right.len());
+            return (distance <= limit).then_some(distance);
+        }
+        let width = right.len() + 1;
+        let outside = u16::try_from(limit.saturating_add(1)).unwrap_or(u16::MAX);
+        self.previous_two.resize(width, outside);
+        self.previous.resize(width, outside);
+        self.current.resize(width, outside);
+        for column in 0..width {
+            let value = u16::try_from(column.min(limit + 1)).unwrap_or(outside);
+            self.previous_two[column] = value;
+            self.previous[column] = value;
+        }
+
+        for row in 1..=left.len() {
+            self.current[..width].fill(outside);
+            if row <= limit {
+                self.current[0] = row as u16;
+            }
+            let start = row.saturating_sub(limit).max(1);
+            let end = row.saturating_add(limit).min(right.len());
+            if start > end {
+                return None;
+            }
+            let mut row_min = outside;
+            for column in start..=end {
+                let substitution = u16::from(left[row - 1] != right[column - 1]);
+                let mut distance = self.current[column - 1]
+                    .saturating_add(1)
+                    .min(self.previous[column].saturating_add(1))
+                    .min(self.previous[column - 1].saturating_add(substitution))
+                    .min(outside);
+                if row > 1
+                    && column > 1
+                    && left[row - 1] == right[column - 2]
+                    && left[row - 2] == right[column - 1]
+                {
+                    distance = distance
+                        .min(self.previous_two[column - 2].saturating_add(1))
+                        .min(outside);
+                }
+                self.current[column] = distance;
+                row_min = row_min.min(distance);
+            }
+            if usize::from(row_min) > limit {
+                return None;
+            }
+            std::mem::swap(&mut self.previous_two, &mut self.previous);
+            std::mem::swap(&mut self.previous, &mut self.current);
+        }
+        let distance = usize::from(self.previous[right.len()]);
+        (distance <= limit).then_some(distance)
+    }
+}
+
+#[cfg(test)]
+fn bounded_osa_reference<T: Eq>(left: &[T], right: &[T], limit: usize) -> Option<usize> {
     if left.len().abs_diff(right.len()) > limit {
         return None;
     }
@@ -2340,6 +2464,42 @@ mod tests {
                     .any(|hit| hit.name == "методология.md" || hit.name == "methodology.md"),
                 "no corrected result for {query}"
             );
+        }
+    }
+
+    #[test]
+    fn banded_osa_matches_full_reference_exhaustively() {
+        fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+            fn extend(all: &mut Vec<String>, prefix: &mut String, alphabet: &[char], left: usize) {
+                all.push(prefix.clone());
+                if left == 0 {
+                    return;
+                }
+                for character in alphabet {
+                    prefix.push(*character);
+                    extend(all, prefix, alphabet, left - 1);
+                    prefix.pop();
+                }
+            }
+            let mut all = Vec::new();
+            extend(&mut all, &mut String::new(), alphabet, max_len);
+            all
+        }
+
+        let corpus = strings(&['a', 'b', 'ж'], 4);
+        let mut scratch = EditScratch::default();
+        for left in &corpus {
+            for right in &corpus {
+                let left_chars = left.chars().collect::<Vec<_>>();
+                let right_chars = right.chars().collect::<Vec<_>>();
+                for limit in 0..=3 {
+                    assert_eq!(
+                        scratch.distance(left, right, limit),
+                        bounded_osa_reference(&left_chars, &right_chars, limit),
+                        "left={left:?}, right={right:?}, limit={limit}"
+                    );
+                }
+            }
         }
     }
 }

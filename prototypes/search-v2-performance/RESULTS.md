@@ -145,6 +145,59 @@ postings and a 522,142,268-byte file. The GUI remained responsive, and its post-
 footprint was about 80 MB. Building inside the GUI had taken 114.572 s at background QoS and
 left about 644 MB in retained allocator pages, so that path was rejected.
 
+## Randomized production-core benchmark — 2026-09-03
+
+The integrated production path was measured in a new headless CLI mode. The mode exits before
+Tauri initialization and therefore never creates a window. It loads the real Name Index, q-gram
+sidecar, Visit Journal, aliases, Recents, current Location, and production matcher/ranker.
+
+Method:
+
+- three independent processes before and after the change;
+- 200 observations per case per process, 600 per case in the combined distribution;
+- one warm-up per case, then all 2,000 observations shuffled by a different fixed seed;
+- AC power; `/usr/bin/time -lp` around every session;
+- top-10 result identity fingerprint and target rank checked on every observation.
+
+The baseline sessions took 294.2, 290.9, and 284.4 seconds. Sampling showed
+`bounded_osa_chars` together with repeated allocation/free as the dominant verification stack.
+The accepted change replaced three per-comparison `Vec<usize>` allocations and the full DP
+matrix with reusable per-worker `u16` rows and a `2k+1` diagonal band. An additional Myers
+prefilter was measured and rejected because its extra string pass made the suite slower.
+
+Combined 600-observation p95 timings, milliseconds:
+
+| Query | First useful, before → after | Verify/rank, before → after | Final, before → after | Final speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `skills` | 0.50 → 0.25 | 48.85 → 19.55 | 54.99 → 25.60 | 2.15× |
+| `метолология` | 0.45 → 0.25 | 7.35 → 3.96 | 7.99 → 4.41 | 1.81× |
+| `methodolgy` | 23.47 → 15.99 | 24.56 → 5.47 | 38.22 → 18.92 | 2.02× |
+| `methodoology` | 17.71 → 12.69 | 8.91 → 3.76 | 17.71 → 12.69 | 1.40× |
+| `methdoology` | 31.30 → 22.03 | 25.16 → 5.90 | 43.48 → 24.26 | 1.79× |
+| `ьуерщвщдщпн` | 35.73 → 25.49 | 27.44 → 6.13 | 48.94 → 28.09 | 1.74× |
+| `ьуерщвщдпн` | 23.20 → 16.25 | 24.11 → 5.42 | 37.38 → 18.99 | 1.97× |
+| `work wip` | 0.92 → 0.55 | 358.17 → 145.12 | 363.89 → 150.46 | 2.42× |
+| `vault methodology` | 249.14 → 78.35 | 302.09 → 91.38 | 327.27 → 118.28 | 2.77× |
+| `status report` | 1.85 → 0.88 | 631.02 → 197.19 | 657.50 → 224.12 | 2.93× |
+
+The optimized sessions took 105.9, 105.6, and 110.6 seconds: 2.70× less aggregate wall time.
+Peak physical footprint stayed within 69–70 MiB after the change versus 61–68 MiB before; the
+difference is small and there was no retained-memory growth across sessions. Every query kept
+one deterministic top-10 fingerprint across all samples, and every optimized fingerprint
+matched the baseline fingerprint.
+
+A separate reconciled run measured the current 298,588-slot in-memory overlay after an
+8.39-second diff-rescan. Its p95 target/final times were 8.49 ms for `метолология`, 31.83 ms for
+`ьуерщвщдпн`, 203.44 ms for `work wip`, 196.85 ms for `vault methodology`, and a 0.995 ms
+Working Set target followed by a 420.63 ms final wave for `status report`. This state confirms
+that broad completion still belongs in quiet progressive reranking; the common typo/layout
+targets are already comfortably below 50 ms in the production core.
+
+Two labeled targets (`skills-drafts` and the dated `status-report` workbook) appear in the
+Working Set but fall outside the final global top 50. That is a ranking/merge-quality input for
+Search Memory tuning, not a retrieval failure. The benchmark records both the early target and
+the final miss rather than hiding the distinction.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive

@@ -12,6 +12,7 @@ mod telemetry;
 
 use std::{
     env,
+    ffi::OsString,
     path::Path,
     str::FromStr,
     sync::{
@@ -56,6 +57,14 @@ pub fn build_search_qgram_sidecar(
     target_path: &Path,
 ) -> Result<(), String> {
     name_index::build_qgram_sidecar(source_path, root, target_path)
+}
+
+/// Run the current production Search v2 core without constructing a Tauri application or
+/// showing a window. This is the CLI seam used by the randomized performance harness.
+pub fn run_search_v2_benchmark(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<(), String> {
+    name_index::run_benchmark(arguments)
 }
 
 const MAIN_WINDOW_LABEL: &str = "main";

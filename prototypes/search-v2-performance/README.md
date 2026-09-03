@@ -1,5 +1,42 @@
 # Search v2 performance baseline
 
+## Production headless benchmark
+
+The application binary has a benchmark mode that exits before Tauri initialization, so it
+cannot create or activate a window. Unlike the original prototype below, this path calls the
+current production q-gram retrieval, matcher, Visit Journal, aliases, Working Set builder, and
+ranker directly. Samples from all cases are shuffled by a reproducible seed.
+
+Build once, then run independent sessions from the repository root:
+
+```sh
+cargo build --release --manifest-path src-tauri/Cargo.toml
+
+/usr/bin/time -lp src-tauri/target/release/beeline --benchmark-search-v2 \
+  --index "/Users/kiri110k/Library/Application Support/com.kiri110k.beeline/name_index/home.idx" \
+  --qgram "/Users/kiri110k/Library/Application Support/com.kiri110k.beeline/name_index/home.qgram" \
+  --root /Users/kiri110k \
+  --app-data "/Users/kiri110k/Library/Application Support/com.kiri110k.beeline" \
+  --current /Users/kiri110k/work/wip \
+  --cases prototypes/search-v2-performance/queries.tsv \
+  --samples 200 \
+  --warmups 1 \
+  --seed 1101 \
+  --session warm-1 \
+  --state base > report.json
+```
+
+Use a different seed and session name for each independent process. `--state reconciled` first
+runs the production diff-rescan into an in-memory overlay; it never persists or changes the live
+application's index. The report contains every observation plus p50/p90/p95/p99/max aggregates,
+target ranks, top-10 fingerprints, candidate counts, and phase timings. `/usr/bin/time -lp`
+supplies process memory and page-fault counters on macOS.
+
+The only missing boundary is Tauri IPC → React commit → paint. Measure that in a separately
+scheduled visible-app pass; a hidden WebView can be throttled and is not a valid paint benchmark.
+
+## Historical prototype
+
 Read-only vertical slice for issue #54. It maps the production Name Index v4 and measures
 staged Working Set and whole-index retrieval with exact matching, Keyboard Layout Correction,
 bounded Typo Correction, Path Interpretation, rank-aware top-k, and a small grouped ranker.
