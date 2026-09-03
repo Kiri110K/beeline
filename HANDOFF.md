@@ -121,6 +121,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   по Ranking Traces и использованию Кирилла; отдельный ranker prototype не нужен.
 - Следующий открытый frontier —
   [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46).
+  Progressive merge сохраняет только deliberately navigated Focused Item по
+  stable Item identity; auto-focused first Item, hover и scroll ничего не
+  закрепляют. До 150 мс indicator не показывается, затем Status Strip сообщает
+  о продолжающемся global search. Важно: threshold prototype замерял нынешний
+  exact/prefix/substring matcher и Keyboard Layout Correction, но не Typo
+  Correction. `метолология` после полного скана 5 244 905 Items вернула ноль.
+  Цифры median 32.89 / p90 63.50 / max 68.76 мс нельзя считать бюджетом полного
+  fuzzy Search v2; отдельно измерить typo, layout+typo, Candidate Evidence,
+  ranking, cancellation, IPC и rendered merge.
   Progressive merge сохраняет по stable identity только Focused Item после
   явной result navigation; auto-focused первый Item до навигации не sticky.
   Остальной список свободно rerank; hover и scroll ничего не закрепляют и не

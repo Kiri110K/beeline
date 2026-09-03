@@ -68,6 +68,14 @@ _Avoid_: Path Input, search box, address bar
 Text in the Navigation Input used to find Items and Locations when it does not resolve directly to a path. Its identity ignores case, surrounding and repeated whitespace, and canonically equivalent Unicode encoding, but preserves punctuation.
 _Avoid_: Path, filter
 
+**Keyboard Layout Correction**:
+An alternate interpretation of a Search Query produced by mapping the same physical keys between supported keyboard layouts, such as `ьуерщвщдщпн` and `methodology`. It does not repair inserted, missing, substituted, or transposed characters.
+_Avoid_: Typo Correction, transliteration
+
+**Typo Correction**:
+An approximate interpretation of a Search Query that repairs a bounded number of inserted, missing, substituted, or adjacent-transposed characters, such as `метолология` and `методология`. It is independent of Keyboard Layout Correction.
+_Avoid_: Keyboard Layout Correction, fuzzy search
+
 **Path Interpretation**:
 An ordered reading of a Search Query in which separate query tokens identify distinct path components, with any number of intermediate components omitted. It competes with ordinary search, may end at either a file or a directory, treats spaces and slashes as equivalent component separators, and preserves the meaning of `~`, `./`, and `../`.
 _Avoid_: Implicit Path, Location Chain, path mode
