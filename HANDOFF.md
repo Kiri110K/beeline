@@ -111,7 +111,8 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   obsolete alpha records при replay игнорируются. Startup поверх неизменного
   mmap base re-stat/replay-ит уникальные пути, обычный diff-rescan закрывает окно
   crash/missed event, после чего journal обнуляется до открытия watcher
-  start gate. При 64 MiB он уплотняется до уникальных путей через temp+fsync+
+  start gate. Повторный путь пишется только один раз за сессию; in-memory set
+  ограничен 100,000 путей, а при 64 MiB файл переписывается через temp+fsync+
   rename. Тест crash-replay покрывает add, remove, rename и file→directory с
   descendant; полный checkpoint — 132 Rust passed / 9 ignored и clippy green.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/

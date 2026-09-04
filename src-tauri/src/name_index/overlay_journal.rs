@@ -6,7 +6,7 @@
 //! A successful reconciliation resets the journal before queued watcher events are released.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     path::{Component, Path, PathBuf},
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u32 = 1;
 const LOG_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_UNIQUE_PATHS: usize = 100_000;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,7 +29,12 @@ struct Record {
 struct Inner {
     root: PathBuf,
     path: PathBuf,
-    file: Mutex<File>,
+    state: Mutex<State>,
+}
+
+struct State {
+    file: File,
+    seen: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -43,12 +49,16 @@ impl OverlayJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let seen = read_unique(&path)?
+            .into_iter()
+            .take(MAX_UNIQUE_PATHS)
+            .collect();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 root: root.to_path_buf(),
                 path,
-                file: Mutex::new(file),
+                state: Mutex::new(State { file, seen }),
             }),
         })
     }
@@ -56,43 +66,58 @@ impl OverlayJournal {
     /// Append before applying the matching in-memory mutations. A crash may therefore
     /// replay one event twice, but can never lose an acknowledged watcher batch.
     pub fn record_paths<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
-        let mut relative = Vec::new();
+        let mut relative = BTreeSet::new();
         for path in paths {
             let Ok(path) = path.strip_prefix(&self.inner.root) else {
                 continue;
             };
             if valid_relative(path) {
-                relative.push(path.to_string_lossy().into_owned());
+                relative.insert(path.to_string_lossy().into_owned());
             }
         }
         if relative.is_empty() {
             return Ok(());
         }
-        let mut file = self
+        let mut state = self
             .inner
-            .file
+            .state
             .lock()
             .map_err(|_| io::Error::other("overlay journal lock is poisoned"))?;
-        for path in relative {
+        let remaining = MAX_UNIQUE_PATHS.saturating_sub(state.seen.len());
+        let new_paths = relative
+            .into_iter()
+            .filter(|path| !state.seen.contains(path))
+            .take(remaining)
+            .collect::<Vec<_>>();
+        if new_paths.is_empty() {
+            return Ok(());
+        }
+        for path in &new_paths {
             serde_json::to_writer(
-                &mut *file,
+                &mut state.file,
                 &Record {
                     schema_version: SCHEMA_VERSION,
-                    path,
+                    path: path.clone(),
                 },
             )
             .map_err(io::Error::other)?;
-            file.write_all(b"\n")?;
+            state.file.write_all(b"\n")?;
         }
-        file.flush()?;
-        if file.metadata()?.len() > LOG_BUDGET_BYTES {
-            self.compact_locked(&mut file)?;
+        state.file.flush()?;
+        state.seen.extend(new_paths);
+        if state.file.metadata()?.len() > LOG_BUDGET_BYTES {
+            self.compact_locked(&mut state)?;
         }
         Ok(())
     }
 
     pub fn replay_paths(&self) -> io::Result<Vec<PathBuf>> {
-        let paths = read_unique(&self.inner.path)?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overlay journal lock is poisoned"))?;
+        let paths = state.seen.iter().cloned().collect::<BTreeSet<_>>();
         Ok(paths
             .into_iter()
             .map(|relative| self.inner.root.join(relative))
@@ -102,22 +127,23 @@ impl OverlayJournal {
     /// Called only after startup replay and diff-rescan complete, while the watcher is still
     /// queueing new events. Those events append after the watcher start gate opens.
     pub fn reset(&self) -> io::Result<()> {
-        let mut file = self
+        let mut state = self
             .inner
-            .file
+            .state
             .lock()
             .map_err(|_| io::Error::other("overlay journal lock is poisoned"))?;
-        *file = OpenOptions::new()
+        state.file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.inner.path)?;
+        state.seen.clear();
         Ok(())
     }
 
-    fn compact_locked(&self, file: &mut File) -> io::Result<()> {
-        file.flush()?;
-        let paths = read_unique(&self.inner.path)?;
+    fn compact_locked(&self, state: &mut State) -> io::Result<()> {
+        state.file.flush()?;
+        let paths = state.seen.iter().cloned().collect::<BTreeSet<_>>();
         let temporary = self.inner.path.with_extension("ndjson.tmp");
         let mut output = File::create(&temporary)?;
         for path in paths {
@@ -133,7 +159,7 @@ impl OverlayJournal {
         }
         output.sync_all()?;
         fs::rename(&temporary, &self.inner.path)?;
-        *file = OpenOptions::new().append(true).open(&self.inner.path)?;
+        state.file = OpenOptions::new().append(true).open(&self.inner.path)?;
         Ok(())
     }
 }
@@ -196,10 +222,19 @@ mod tests {
                 Path::new("/outside/not-recorded"),
             ])
             .expect("record");
+        journal
+            .record_paths([root.join("work/a.txt").as_path()])
+            .expect("record duplicate batch");
 
         assert_eq!(
             journal.replay_paths().expect("replay"),
             vec![root.join("work/a.txt"), root.join("work/b.txt")]
+        );
+        assert_eq!(
+            BufReader::new(File::open(&journal.inner.path).expect("open journal"))
+                .lines()
+                .count(),
+            2
         );
         journal.reset().expect("reset");
         assert!(journal.replay_paths().expect("empty").is_empty());
