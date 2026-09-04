@@ -453,6 +453,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   эквивалентны. Редкий rebuild уже занимает несколько секунд, поэтому quadratic
   worst case на длинных именах не принят. Код остался только в remote-ветке;
   verdict: `prototypes/qgram-linear-dedup/RESULTS.md`.
+- `experiment/qgram-dense-dedup` (`3cdf921`) отклонён. Builder-only dense marker
+  размером 1 MiB убрал сортировку и снизил rebuild wall на 18–21%, user CPU на
+  25%, instructions на 11%. Но вынос общего raw parser поднял Search v2
+  instructions на 0.08–0.13% в обеих парах; все 2,200 результатов совпали.
+  Редкий rebuild уже занимает несколько секунд, поэтому даже малый hot-query
+  обмен не принят. Код остался в remote-ветке; вернуться к нему можно при частых
+  rebuild или отдельном parser без дублирования normalization. Verdict:
+  `prototypes/qgram-dense-dedup/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
