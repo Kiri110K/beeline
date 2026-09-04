@@ -258,6 +258,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   baseline 160–172 мс, candidate 151–171 мс, средняя разница <2%. Главная цена —
   перечисление всех ~90k siblings. Код и verdict сохранены в remote-ветке; main
   должен пробовать deferred exact-path apply вместо parent-directory rescan.
+- `experiment/junk-exact-path-drain` (`aeb573f`) тоже отклонён. Один existing
+  file в 90k-child dir действительно стал 0.023–0.058 мс вместо 160–172 мс, но
+  полный production journal не подтвердил выигрыш: directory mode (517 dirs)
+  занял 1188/616 мс, hybrid (≈18.3k exact + 5 dirs) 1138/1130 мс. Оба режима
+  имели одинаковые 73 disk/index mismatch по явным journal paths, но total Item
+  count различался примерно на 3200: parent reconcile дополнительно чинит
+  unlisted siblings, exact-path вариант это теряет. 15,047 мс в installed app
+  объясняются background-QoS throttling; drain запускается только после quiet на
+  AC или синхронно при Junk-targeting query. Текущий main оставлен без изменений.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
