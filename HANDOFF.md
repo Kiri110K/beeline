@@ -188,6 +188,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   misses нет; 134 Rust passed / 11 ignored, fmt и clippy зелёные. Установленное
   приложение пока содержит предыдущий dense-qgram build без этого CPU-фикса и
   без builder-only `u32` изменения.
+- PR #60 влит в main как `d1a5259`. Fuzzy verifier теперь один раз lowercases
+  имя кандидата в существующий worker buffer и переиспользует его во всех
+  интерпретациях; уже lowercase ancestor components больше не копируются и не
+  нормализуются повторно при каждом сравнении. Относительно PR #59 suite: 44.07
+  → 35.70 с, то есть ещё 1.23x и -19.0% wall; user CPU -21.5%, instructions
+  -19.9%, cycles -21.5%. Все десять p95 улучшились; path-heavy на 19.0–25.4%.
+  Repeat: 35.50 с. Hits/fingerprints совпали, misses нет; 134 Rust passed / 11
+  ignored, fmt и clippy зелёные. Артефакты лежат в `/private/tmp` под stems
+  `beeline-fuzzy-lowercase-reuse-20260905` и
+  `beeline-fuzzy-lowercase-reuse-repeat-20260905` (`.json` + `.time`).
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
