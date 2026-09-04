@@ -711,6 +711,31 @@ fn gram_buckets(value: &str) -> Vec<u32> {
 
 fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
     buckets.clear();
+    if value.is_ascii() {
+        let mut previous = [0u8; 2];
+        let mut previous_len = 0usize;
+        for &byte in value.as_bytes() {
+            let byte = byte.to_ascii_lowercase();
+            if !byte.is_ascii_alphanumeric() {
+                previous_len = 0;
+                continue;
+            }
+            if previous_len < previous.len() {
+                previous[previous_len] = byte;
+                previous_len += 1;
+                continue;
+            }
+            buckets.push(bucket(&[
+                previous[0] as char,
+                previous[1] as char,
+                byte as char,
+            ]));
+            previous = [previous[1], byte];
+        }
+        buckets.sort_unstable();
+        buckets.dedup();
+        return;
+    }
     let mut previous = [None, None];
     for character in value.nfc().flat_map(char::to_lowercase) {
         if !character.is_alphanumeric() {
