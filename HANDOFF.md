@@ -310,6 +310,20 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   выдачи или дублированных exact paths; freeze/crash/focus loss не было. После
   Escape PID 53884 остался жив, hidden/0 windows/not frontmost. Отчёт и три
   проверенных скриншота: `/private/tmp/beeline-qgram-v2-ui.qp4vbb/`.
+- PR #67 влит в main как `e82b8e8`. Обе bucket-offset таблицы теперь checked
+  `u32`, что соответствует alpha-бюджету sidecar ≤600 MiB. Формат `BLQGM003`
+  занимает 185,963,243 bytes: ещё -8,388,616 bytes и -7.8 MiB builder physical
+  peak относительно `BLQGM002`. Rebuild занял 19.23 с / 88.11 MiB physical peak.
+  Все 136,481,293 postings/checkpoints снова совпали; paired 11-case suite дал
+  19.83 → 19.93 с, все per-observation fingerprints одинаковы. 135 Rust passed /
+  11 ignored, fmt и clippy зелёные.
+- Signed bundle `e82b8e8` и проверенный 185,963,243-byte sidecar установлены.
+  PID 62291 запущен hidden/0 windows/not frontmost, SHA build/install совпадает,
+  sidecar загрузился без rebuild. Warm prewarm 17 мс, FSEvents catch-up 182 мс,
+  overlay replay 973 мс, full diff skipped; через 22 секунды physical footprint
+  43 MiB, startup peak 78 MiB. Rollback bundle:
+  `/private/tmp/Beeline-before-qgram-u32-20260905.app`; предыдущий sidecar:
+  `/private/tmp/beeline-home-qgram-v2-20260905.qgram`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
