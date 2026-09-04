@@ -170,8 +170,12 @@ impl NameIndex {
         let data = Arc::new(RwLock::new(
             loaded.unwrap_or_else(|| IndexData::new(root.clone())),
         ));
-        let overlay_journal = OverlayJournal::load(&app_data_dir, &root)
-            .map_err(|error| format!("failed to load Name Index overlay journal: {error}"))?;
+        let overlay_journal = OverlayJournal::load(
+            &app_data_dir,
+            &root,
+            &junk.read().expect("junk lock poisoned"),
+        )
+        .map_err(|error| format!("failed to load Name Index overlay journal: {error}"))?;
         let qgrams: SharedQGrams = Arc::new(RwLock::new(None));
         if had_persisted {
             load_or_build_qgrams(
@@ -256,9 +260,10 @@ impl NameIndex {
                             let mut appended_paths = 0usize;
                             let mut all_recorded = false;
                             if catch_up.complete {
-                                match overlay_journal
-                                    .record_paths(catch_up.paths.iter().map(PathBuf::as_path))
-                                {
+                                match overlay_journal.record_paths(
+                                    catch_up.paths.iter().map(PathBuf::as_path),
+                                    &crawl_junk,
+                                ) {
                                     Ok(outcome) => {
                                         appended_paths = outcome.appended_paths;
                                         all_recorded = outcome.all_recorded;
@@ -2038,15 +2043,19 @@ mod tests {
         let added = root.path().join("added.txt");
         touch(&added);
 
-        let journal = OverlayJournal::load(state.path(), root.path()).expect("journal");
+        let junk = JunkPatterns::default();
+        let journal = OverlayJournal::load(state.path(), root.path(), &junk).expect("journal");
         journal
-            .record_paths([
-                old.as_path(),
-                renamed.as_path(),
-                gone.as_path(),
-                changing.as_path(),
-                added.as_path(),
-            ])
+            .record_paths(
+                [
+                    old.as_path(),
+                    renamed.as_path(),
+                    gone.as_path(),
+                    changing.as_path(),
+                    added.as_path(),
+                ],
+                &junk,
+            )
             .expect("record crash-safe delta");
 
         let loaded = persist::load(&index_path, root.path()).expect("reload base");
@@ -2558,9 +2567,9 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .expect("index path must be under app data/name_index");
-        let journal = OverlayJournal::load(app_data, &root).expect("load overlay journal");
-        let replay = journal.replay_paths().expect("read overlay journal");
         let junk = JunkPatterns::default();
+        let journal = OverlayJournal::load(app_data, &root, &junk).expect("load overlay journal");
+        let replay = journal.replay_paths().expect("read overlay journal");
 
         for workers in [1, 2, 4, 8, 12, 8, 4, 2, 1] {
             let index = persist::load(&index_path, &root).expect("load live persisted index");

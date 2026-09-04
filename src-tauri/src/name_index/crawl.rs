@@ -239,6 +239,15 @@ fn index_subtree_into(
 /// Apply a single filesystem change at `path` to the index. Junk paths are not
 /// rescanned; the containing directory is marked dirty for a later lazy refresh
 /// (SPEC §6). Non-Junk changes are applied immediately.
+pub fn mark_junk_dir_dirty(data: &mut IndexData, path: &Path) -> bool {
+    let Some(dir) = data.resolve_dir(path) else {
+        return false;
+    };
+    data.junk_dirty.insert(dir);
+    refresh_dir_mtime(data, dir, path);
+    true
+}
+
 pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) -> FsApplyStats {
     if path == data.root {
         let root = data.root.clone();
@@ -256,10 +265,7 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) ->
     };
 
     if tier == Tier::Junk {
-        if let Some(parent) = data.resolve_dir(parent_path) {
-            data.junk_dirty.insert(parent);
-            refresh_dir_mtime(data, parent, parent_path);
-        }
+        mark_junk_dir_dirty(data, parent_path);
         return FsApplyStats::default();
     }
 
