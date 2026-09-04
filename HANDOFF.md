@@ -409,6 +409,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   production. Полный checkpoint: 143 Rust passed / 12 ignored, clippy
   `-D warnings`, frontend contracts, typecheck, build и lint зелёные. Подробности:
   `prototypes/qgram-build-single-index-pass/RESULTS.md`.
+- Signed bundle main `bec2be6` установлен в `/Applications/Beeline.app`, binary
+  SHA build/install совпал: `fb0a77eb32e6ca70061741bbfd48088818cdb909fb99952731892bd2c26a1c91`.
+  PID 20822 запущен hidden, 0 windows/not frontmost; существующий q-gram loaded
+  без rebuild, prewarm 16 мс, FSEvents catch-up 215 мс, overlay replay 820 мс.
+  Settled physical footprint 57 MiB, startup peak 59 MiB. Rollback bundle:
+  `/private/tmp/Beeline-before-qgram-single-pass-20260905.app`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
