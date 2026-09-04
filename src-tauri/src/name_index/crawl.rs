@@ -15,6 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    thread,
     time::{Instant, UNIX_EPOCH},
 };
 
@@ -510,58 +511,85 @@ fn diff_rescan_tree(
     root: PathBuf,
     junk: &JunkPatterns,
 ) -> DiffStats {
-    fn enqueue_once(dir_id: DirId, seen: &mut Vec<bool>, pending: &mut Vec<DirId>) {
-        let position = dir_id as usize;
-        if position >= seen.len() {
-            seen.resize(position + 1, false);
-        }
-        if !seen[position] {
-            seen[position] = true;
-            pending.push(dir_id);
-        }
+    struct DirectorySnapshot {
+        id: DirId,
+        path: PathBuf,
+        stored_mtime: i64,
     }
 
-    let initial_nodes = shared.read().expect("name index lock poisoned").node_len();
-    let mut seen = vec![false; initial_nodes];
-    let mut pending = Vec::new();
     let mut stats = DiffStats::default();
-    enqueue_once(0, &mut seen, &mut pending);
-
-    while let Some(dir_id) = pending.pop() {
-        stats.visited += 1;
-        let current = {
-            let index = shared.read().expect("name index lock poisoned");
-            index
-                .node(dir_id)
-                .map(|node| (node.mtime_ms, node.tier, index.full_path(dir_id)))
-        };
-        let Some((stored_mtime, tier, path)) = current else {
-            continue;
-        };
-        if tier == Tier::Junk {
-            stats.junk += 1;
-            continue; // Lazy: Junk is refreshed on a targeting query, not on startup.
-        }
-
-        let disk_mtime = fs::metadata(&path).map(|meta| mtime_ms(&meta)).ok();
-        match disk_mtime {
-            Some(disk_mtime) if disk_mtime != stored_mtime => {
-                stats.reconciled += 1;
-                reconcile_dir(shared, dir_id, &path, &root, junk);
-            }
-            Some(_) => {}
-            None => {
-                stats.missing += 1;
+    let snapshots = {
+        let index = shared.read().expect("name index lock poisoned");
+        let mut snapshots = Vec::with_capacity(index.node_len());
+        let mut pending = vec![(0, root.clone())];
+        while let Some((id, path)) = pending.pop() {
+            stats.visited += 1;
+            let Some(node) = index.node(id) else {
                 continue;
-            } // Directory is gone; its parent's reconcile removes it.
+            };
+            if node.tier == Tier::Junk {
+                stats.junk += 1;
+                continue;
+            }
+            snapshots.push(DirectorySnapshot {
+                id,
+                path: path.clone(),
+                stored_mtime: node.mtime_ms,
+            });
+            for (name, child_id) in index.child_dirs(id) {
+                pending.push((child_id, path.join(name)));
+            }
         }
+        snapshots
+    };
 
-        let children = shared
-            .read()
-            .expect("name index lock poisoned")
-            .child_dirs(dir_id);
-        for (_, child_id) in children {
-            enqueue_once(child_id, &mut seen, &mut pending);
+    // Metadata probes dominate a warm startup. The index snapshot is immutable until the
+    // watcher gate opens, so four bounded workers can stat disjoint slices without locks.
+    let mut disk_mtimes = vec![None; snapshots.len()];
+    let workers = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let chunk_size = snapshots.len().div_ceil(workers).max(1);
+    thread::scope(|scope| {
+        for (snapshot_chunk, output_chunk) in snapshots
+            .chunks(chunk_size)
+            .zip(disk_mtimes.chunks_mut(chunk_size))
+        {
+            scope.spawn(move || {
+                set_background_qos();
+                for (snapshot, output) in snapshot_chunk.iter().zip(output_chunk) {
+                    *output = fs::metadata(&snapshot.path)
+                        .map(|metadata| mtime_ms(&metadata))
+                        .ok();
+                }
+            });
+        }
+    });
+
+    let mut changed = Vec::new();
+    for (snapshot, disk_mtime) in snapshots.into_iter().zip(disk_mtimes) {
+        match disk_mtime {
+            Some(disk_mtime) if disk_mtime != snapshot.stored_mtime => changed.push(snapshot),
+            Some(_) => {}
+            None => stats.missing += 1,
+        }
+    }
+    changed.sort_unstable_by(|left, right| {
+        left.path
+            .components()
+            .count()
+            .cmp(&right.path.components().count())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for snapshot in changed {
+        let still_same_directory = {
+            let index = shared.read().expect("name index lock poisoned");
+            index.node(snapshot.id).is_some() && index.full_path(snapshot.id) == snapshot.path
+        };
+        if still_same_directory {
+            stats.reconciled += 1;
+            reconcile_dir(shared, snapshot.id, &snapshot.path, &root, junk);
         }
     }
     stats

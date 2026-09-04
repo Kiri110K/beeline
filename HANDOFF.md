@@ -122,6 +122,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `apply_fs_event` теперь сохраняет parent mtime и для обычных, и для Junk events;
   startup telemetry пишет visited/reconciled/missing/Junk directory counts. Это
   покрыто отдельным тестом; checkpoint — 133 Rust passed / 9 ignored.
+- Новая telemetry показала 128,759 visited directories при всего 25 reconciled:
+  основное время уходило в последовательные `stat` и повторную сборку full path.
+  Diff теперь один раз под read lock строит `(DirId, path, stored mtime)` snapshot
+  прямым parent→child обходом, четырьмя bounded utility workers проверяет metadata,
+  затем parent-first применяет только реально changed directories с повторной
+  проверкой identity. Watcher gate всё это время закрыт, поэтому snapshot стабилен.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
