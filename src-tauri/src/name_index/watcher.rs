@@ -22,11 +22,11 @@ use tauri::{AppHandle, Manager};
 
 use crate::{
     name_index::{
-        crawl::{apply_fs_event, set_background_qos},
+        crawl::{self, apply_fs_event, set_background_qos},
         junk::JunkPatterns,
         junk_refresh::JunkRefresh,
         model::{IndexData, Tier},
-        overlay_journal::OverlayJournal,
+        overlay_journal::{junk_dirty_directory, OverlayJournal},
     },
     telemetry::Telemetry,
 };
@@ -194,7 +194,7 @@ pub fn spawn_deferred(
             let patterns = junk.read().expect("junk lock poisoned").clone();
             if let Some(journal) = &effects.journal {
                 if let Err(error) =
-                    journal.record_paths(prepared.paths.iter().map(PathBuf::as_path))
+                    journal.record_paths(prepared.paths.iter().map(PathBuf::as_path), &patterns)
                 {
                     record(
                         effects.app.as_ref(),
@@ -289,8 +289,23 @@ pub fn replay_paths(
     patterns: &JunkPatterns,
     paths: Vec<PathBuf>,
 ) -> (usize, usize, usize) {
+    let (dirty_markers, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+        .into_iter()
+        .partition(|path| junk_dirty_directory(path).is_some());
     let prepared = prepare_paths(root, paths.into_iter().collect());
-    let applied = apply_prepared_paths(shared, root, patterns, prepared);
+    let mut applied = apply_prepared_paths(shared, root, patterns, prepared);
+    for marker in dirty_markers {
+        let Some(directory) = junk_dirty_directory(&marker) else {
+            continue;
+        };
+        if crawl::mark_junk_dir_dirty(
+            &mut shared.write().expect("name index lock poisoned"),
+            directory,
+        ) {
+            applied.applied_paths += 1;
+            applied.saw_junk = true;
+        }
+    }
     (applied.applied_paths, applied.added, applied.removed)
 }
 

@@ -16,10 +16,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::{junk::JunkPatterns, model::Tier};
+
 const SCHEMA_VERSION: u32 = 1;
 const LOG_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNIQUE_PATHS: usize = 100_000;
 const COMPACTION_PATHS: usize = 80_000;
+// NUL cannot occur in a filesystem name, so a real user path can never collide with this
+// durable logical marker. Replay removes it before any filesystem call.
+const JUNK_DIRTY_MARKER: &str = "\0beeline-junk-dirty";
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,16 +58,22 @@ pub struct RecordOutcome {
 }
 
 impl OverlayJournal {
-    pub fn load(app_data_dir: &Path, root: &Path) -> io::Result<Self> {
+    pub fn load(app_data_dir: &Path, root: &Path, junk: &JunkPatterns) -> io::Result<Self> {
         fs::create_dir_all(app_data_dir)?;
         let path = app_data_dir.join("name_index").join("home.overlay.ndjson");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let seen = read_unique(&path)?
+        let (paths, canonicalized) = read_unique(&path, junk)?;
+        let truncated = paths.len() > MAX_UNIQUE_PATHS;
+        let retained = paths
             .into_iter()
             .take(MAX_UNIQUE_PATHS)
-            .collect();
+            .collect::<BTreeSet<_>>();
+        if canonicalized || truncated {
+            rewrite_records(&path, retained.iter())?;
+        }
+        let seen = retained.into_iter().collect();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -78,6 +89,7 @@ impl OverlayJournal {
     pub fn record_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
+        junk: &JunkPatterns,
     ) -> io::Result<RecordOutcome> {
         let mut relative = BTreeSet::new();
         for path in paths {
@@ -85,7 +97,11 @@ impl OverlayJournal {
                 continue;
             };
             if valid_relative(path) {
-                relative.insert(path.to_string_lossy().into_owned());
+                relative.insert(
+                    canonical_relative(path, junk)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
         if relative.is_empty() {
@@ -213,11 +229,14 @@ impl OverlayJournal {
     }
 }
 
-fn read_unique(path: &Path) -> io::Result<BTreeSet<String>> {
+fn read_unique(path: &Path, junk: &JunkPatterns) -> io::Result<(BTreeSet<String>, bool)> {
     let mut paths = BTreeSet::new();
+    let mut canonicalized = false;
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((paths, canonicalized));
+        }
         Err(error) => return Err(error),
     };
     for line in BufReader::new(file).lines().map_while(Result::ok) {
@@ -226,10 +245,56 @@ fn read_unique(path: &Path) -> io::Result<BTreeSet<String>> {
         };
         let relative = Path::new(&record.path);
         if record.schema_version == SCHEMA_VERSION && valid_relative(relative) {
-            paths.insert(record.path);
+            let canonical = canonical_relative(relative, junk)
+                .to_string_lossy()
+                .into_owned();
+            let changed = canonical != record.path;
+            let inserted = paths.insert(canonical);
+            canonicalized |= changed || !inserted;
         }
     }
-    Ok(paths)
+    Ok((paths, canonicalized))
+}
+
+fn canonical_relative(path: &Path, junk: &JunkPatterns) -> PathBuf {
+    if junk_dirty_directory(path).is_some() {
+        return path.to_path_buf();
+    }
+    if junk.classify(path) != Tier::Junk {
+        return path.to_path_buf();
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    if junk.classify(parent) == Tier::Junk {
+        parent.join(JUNK_DIRTY_MARKER)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub(crate) fn junk_dirty_directory(path: &Path) -> Option<&Path> {
+    (path.file_name()?.to_str()? == JUNK_DIRTY_MARKER)
+        .then(|| path.parent())
+        .flatten()
+}
+
+fn rewrite_records<'a>(path: &Path, paths: impl IntoIterator<Item = &'a String>) -> io::Result<()> {
+    let temporary = path.with_extension("ndjson.tmp");
+    let mut output = File::create(&temporary)?;
+    for path in paths {
+        serde_json::to_writer(
+            &mut output,
+            &Record {
+                schema_version: SCHEMA_VERSION,
+                path: path.clone(),
+            },
+        )
+        .map_err(io::Error::other)?;
+        output.write_all(b"\n")?;
+    }
+    output.sync_all()?;
+    fs::rename(temporary, path)
 }
 
 fn valid_relative(path: &Path) -> bool {
@@ -242,7 +307,9 @@ fn valid_relative(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::name_index::{crawl, model::IndexData, persist, watcher};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, RwLock};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -262,17 +329,21 @@ mod tests {
         let dir = temp_dir();
         let root = dir.join("home");
         fs::create_dir(&root).expect("root");
-        let journal = OverlayJournal::load(&dir, &root).expect("load");
+        let junk = JunkPatterns::default();
+        let journal = OverlayJournal::load(&dir, &root, &junk).expect("load");
         journal
-            .record_paths([
-                root.join("work/a.txt").as_path(),
-                root.join("work/a.txt").as_path(),
-                root.join("work/b.txt").as_path(),
-                Path::new("/outside/not-recorded"),
-            ])
+            .record_paths(
+                [
+                    root.join("work/a.txt").as_path(),
+                    root.join("work/a.txt").as_path(),
+                    root.join("work/b.txt").as_path(),
+                    Path::new("/outside/not-recorded"),
+                ],
+                &junk,
+            )
             .expect("record");
         journal
-            .record_paths([root.join("work/a.txt").as_path()])
+            .record_paths([root.join("work/a.txt").as_path()], &junk)
             .expect("record duplicate batch");
 
         assert_eq!(
@@ -286,7 +357,7 @@ mod tests {
             2
         );
         drop(journal);
-        let reloaded = OverlayJournal::load(&dir, &root).expect("reload");
+        let reloaded = OverlayJournal::load(&dir, &root, &junk).expect("reload");
         assert_eq!(reloaded.retained_paths(), 2);
         assert_eq!(
             reloaded.replay_paths().expect("replay after restart"),
@@ -309,10 +380,158 @@ mod tests {
             "{\"schemaVersion\":1,\"path\":\"ok/file\"}\n{broken\n{\"schemaVersion\":0,\"path\":\"old\"}\n{\"schemaVersion\":1,\"path\":\"../escape\"}\n",
         )
         .expect("seed");
-        let journal = OverlayJournal::load(&dir, &root).expect("load");
+        let journal = OverlayJournal::load(&dir, &root, &JunkPatterns::default()).expect("load");
         assert_eq!(
             journal.replay_paths().expect("replay"),
             vec![root.join("ok/file")]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn coalesces_junk_children_to_one_durable_dirty_directory_marker() {
+        let dir = temp_dir();
+        let root = dir.join("home");
+        fs::create_dir(&root).expect("root");
+        let junk = JunkPatterns::default();
+        let journal = OverlayJournal::load(&dir, &root, &junk).expect("load");
+        journal
+            .record_paths(
+                [
+                    root.join("work/target/debug/deps/a.rlib"),
+                    root.join("work/target/debug/deps/b.rlib"),
+                    root.join("work/target"),
+                    root.join("work/notes.txt"),
+                ]
+                .iter()
+                .map(PathBuf::as_path),
+                &junk,
+            )
+            .expect("record junk burst");
+
+        assert_eq!(
+            journal.replay_paths().expect("replay"),
+            vec![
+                root.join("work/notes.txt"),
+                root.join("work/target"),
+                root.join("work/target/debug/deps").join(JUNK_DIRTY_MARKER),
+            ]
+        );
+        assert_eq!(journal.retained_paths(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_atomically_compacts_existing_junk_paths() {
+        let dir = temp_dir();
+        let root = dir.join("home");
+        fs::create_dir(&root).expect("root");
+        let path = dir.join("name_index/home.overlay.ndjson");
+        fs::create_dir_all(path.parent().unwrap()).expect("parent");
+        fs::write(
+            &path,
+            "{\"schemaVersion\":1,\"path\":\"work/target/debug/a\"}\n{\"schemaVersion\":1,\"path\":\"work/target/debug/b\"}\n",
+        )
+        .expect("seed uncoalesced journal");
+
+        let junk = JunkPatterns::default();
+        let journal = OverlayJournal::load(&dir, &root, &junk).expect("load");
+        assert_eq!(
+            journal.replay_paths().expect("replay"),
+            vec![root.join("work/target/debug").join(JUNK_DIRTY_MARKER)]
+        );
+        assert_eq!(
+            BufReader::new(File::open(&path).expect("open compacted journal"))
+                .lines()
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_junk_marker_marks_the_same_directory_as_the_raw_event() {
+        let dir = temp_dir();
+        let root = dir.join("home");
+        let parent = root.join("work/target/debug");
+        fs::create_dir_all(&parent).expect("junk parent");
+        let junk = JunkPatterns::default();
+        let mut raw = IndexData::new(root.clone());
+        let work = raw.add_dir(0, "work", Tier::Normal, 0);
+        let target = raw.add_dir(work, "target", Tier::Junk, 0);
+        let debug = raw.add_dir(target, "debug", Tier::Junk, 0);
+        let mut marker_index = IndexData::new(root.clone());
+        let work = marker_index.add_dir(0, "work", Tier::Normal, 0);
+        let target = marker_index.add_dir(work, "target", Tier::Junk, 0);
+        marker_index.add_dir(target, "debug", Tier::Junk, 0);
+        let marker_index = Arc::new(RwLock::new(marker_index));
+
+        crawl::apply_fs_event(&mut raw, &parent.join("artifact.o"), &junk);
+        watcher::replay_paths(
+            &marker_index,
+            &root,
+            &JunkPatterns::from_names(Vec::<String>::new()),
+            vec![parent.join(JUNK_DIRTY_MARKER)],
+        );
+
+        assert_eq!(raw.junk_dirty, marker_index.read().unwrap().junk_dirty);
+        assert_eq!(raw.junk_dirty, HashSet::from([debug]));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_journal_coalescing_timing() {
+        let source = std::env::var_os("BEELINE_LIVE_OVERLAY")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_OVERLAY");
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT");
+        let dir = temp_dir();
+        let target = dir.join("name_index/home.overlay.ndjson");
+        fs::create_dir_all(target.parent().expect("journal parent")).expect("journal parent");
+        fs::copy(&source, &target).expect("copy live journal");
+        let raw_replay = BufReader::new(File::open(&target).expect("open source copy"))
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<Record>(&line).ok())
+            .filter(|record| record.schema_version == SCHEMA_VERSION)
+            .map(|record| root.join(record.path))
+            .collect::<Vec<_>>();
+        let before_bytes = fs::metadata(&target).expect("source metadata").len();
+        let before_records = BufReader::new(File::open(&target).expect("open source copy"))
+            .lines()
+            .count();
+        let started = std::time::Instant::now();
+        let journal = OverlayJournal::load(&dir, &root, &JunkPatterns::default()).expect("load");
+        let load_ms = started.elapsed().as_millis();
+        let replay_started = std::time::Instant::now();
+        let replay = journal.replay_paths().expect("replay");
+        let replay_ms = replay_started.elapsed().as_millis();
+        let raw_index = persist::load(&index_path, &root).expect("load live index");
+        let raw_shared = Arc::new(RwLock::new(raw_index));
+        let raw_apply_started = std::time::Instant::now();
+        watcher::replay_paths(&raw_shared, &root, &JunkPatterns::default(), raw_replay);
+        let raw_apply_ms = raw_apply_started.elapsed().as_millis();
+        let index = persist::load(&index_path, &root).expect("reload live index");
+        let shared = Arc::new(RwLock::new(index));
+        let apply_started = std::time::Instant::now();
+        let (applied, added, removed) =
+            watcher::replay_paths(&shared, &root, &JunkPatterns::default(), replay.clone());
+        let apply_ms = apply_started.elapsed().as_millis();
+        let raw_index = raw_shared.read().expect("raw index lock");
+        let index = shared.read().expect("index lock");
+        let dirty_dirs = index.junk_dirty.len();
+        assert_eq!(raw_index.len(), index.len());
+        assert_eq!(raw_index.junk_dirty, index.junk_dirty);
+        let after_bytes = fs::metadata(&target).expect("compacted metadata").len();
+        println!(
+            "before_records={before_records} before_bytes={before_bytes} retained={} after_bytes={after_bytes} load_ms={load_ms} replay_ms={replay_ms} raw_apply_ms={raw_apply_ms} apply_ms={apply_ms} applied={applied} added={added} removed={removed} dirty_dirs={dirty_dirs}",
+            replay.len(),
         );
         let _ = fs::remove_dir_all(dir);
     }
