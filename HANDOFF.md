@@ -436,6 +436,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   windows, Beeline not frontmost. Отчёт и снимки:
   `/private/tmp/beeline-streaming-ui.C8oNLf/`. Rollback bundle:
   `/private/tmp/Beeline-before-streaming-qgram-20260905.app`.
+- PR #75 влит в main как `dca56f2`. ASCII Item names и query tokens теперь
+  обходят general Unicode NFC/lowercase pipeline и используют byte-based путь с
+  тем же scalar hash; non-ASCII остаётся на прежнем Unicode пути. В двух парах
+  production rebuild ускорился с 7.6–8.7 до 3.7–4.5 с, user CPU снизился на
+  58.3–58.5%, retired instructions — на 58.0%. Все четыре sidecar побайтно
+  совпали с live. Search v2 suite снизил instructions на 0.31%; все 2,200
+  наблюдений, включая Cyrillic/wrong-layout/path, сохранили candidates, visits,
+  target ranks и fingerprints. Полный checkpoint: 144 Rust passed / 12 ignored,
+  clippy `-D warnings`, frontend contracts, typecheck, build и lint зелёные.
+  Подробности: `prototypes/qgram-ascii-fast-path/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
