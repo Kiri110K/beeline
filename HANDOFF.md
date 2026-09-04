@@ -400,6 +400,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   checkpoint: 143 Rust passed / 12 ignored, clippy `-D warnings`, frontend
   contracts, typecheck, build и lint зелёные. Подробности:
   `prototypes/qgram-build-single-decode/RESULTS.md`.
+- PR #73 влит в main как `8182b74`. Q-gram builder теперь за один ordered pass
+  по 5,668,822 Items одновременно считает bucket postings и пишет временные shard
+  records. Второй проход с повторной Unicode normalization и q-gram hashing
+  удалён. В двух production-парах rebuild ускорился с 17.1–18.1 до 10.0–10.6 с,
+  user CPU снизился на 43.5–44.0%, retired instructions — на 45.5–45.7%.
+  Physical peak остался около 68 MiB; все четыре sidecar побайтно совпали с live
+  production. Полный checkpoint: 143 Rust passed / 12 ignored, clippy
+  `-D warnings`, frontend contracts, typecheck, build и lint зелёные. Подробности:
+  `prototypes/qgram-build-single-index-pass/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
