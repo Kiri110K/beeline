@@ -262,53 +262,21 @@ impl QGramIndex {
         let mut emitted_postings = 0usize;
         for shard in 0..BUILD_SHARDS {
             let bytes = fs::read(parts.shard(shard))?;
-            let mut local_counts = vec![0u32; BUILD_SHARD_BUCKETS];
-            let records = walk_build_records(&bytes, |bucket, _| {
-                let count = local_counts
-                    .get_mut(bucket)
-                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket out of range"))?;
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket exceeds u32"))?;
-                Ok(())
-            })?;
             let first_bucket = shard * BUILD_SHARD_BUCKETS;
-            let expected_records = offsets[first_bucket + BUILD_SHARD_BUCKETS]
-                .checked_sub(offsets[first_bucket])
-                .expect("global q-gram offsets are monotone")
-                as usize;
-            if records != expected_records {
-                return Err(std::io::Error::other("q-gram shard count mismatch"));
-            }
+            let shard_base = offsets[first_bucket];
+            let local_offsets = offsets[first_bucket..=first_bucket + BUILD_SHARD_BUCKETS]
+                .iter()
+                .map(|offset| {
+                    offset
+                        .checked_sub(shard_base)
+                        .expect("global q-gram offsets are monotone")
+                })
+                .collect::<Vec<_>>();
+            let postings = decode_build_shard(&bytes, &local_offsets)?;
+            let records = postings.len();
             emitted_postings = emitted_postings
                 .checked_add(records)
                 .ok_or_else(|| std::io::Error::other("q-gram emitted posting count overflow"))?;
-            let mut local_offsets = Vec::with_capacity(BUILD_SHARD_BUCKETS + 1);
-            local_offsets.push(0u32);
-            for count in local_counts {
-                local_offsets.push(
-                    local_offsets
-                        .last()
-                        .copied()
-                        .expect("local offset seed")
-                        .checked_add(count)
-                        .ok_or_else(|| std::io::Error::other("q-gram shard exceeds u32"))?,
-                );
-            }
-            debug_assert_eq!(
-                *local_offsets.last().expect("final local offset") as usize,
-                records
-            );
-            let mut positions = local_offsets[..BUILD_SHARD_BUCKETS].to_vec();
-            let mut postings = vec![0u32; records];
-            walk_build_records(&bytes, |bucket, slot| {
-                let position = &mut positions[bucket];
-                postings[*position as usize] = slot;
-                *position = position
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
-                Ok(())
-            })?;
             for local_bucket in 0..BUILD_SHARD_BUCKETS {
                 byte_offsets.push(u32::try_from(encoded_bytes).map_err(|_| {
                     std::io::Error::other("encoded q-gram exceeds u32 byte offsets")
@@ -825,6 +793,43 @@ fn walk_build_records(
     Ok(records)
 }
 
+fn decode_build_shard(bytes: &[u8], local_offsets: &[u32]) -> std::io::Result<Vec<u32>> {
+    let (&records, bucket_starts) = local_offsets
+        .split_last()
+        .ok_or_else(|| std::io::Error::other("missing q-gram shard offsets"))?;
+    if bucket_starts.is_empty() {
+        return Err(std::io::Error::other("missing q-gram shard buckets"));
+    }
+    let records = records as usize;
+    let mut positions = bucket_starts.to_vec();
+    let mut postings = vec![0u32; records];
+    let decoded_records = walk_build_records(bytes, |bucket, slot| {
+        let expected_end = *local_offsets
+            .get(bucket + 1)
+            .ok_or_else(|| std::io::Error::other("q-gram shard bucket out of range"))?;
+        let position = positions
+            .get_mut(bucket)
+            .ok_or_else(|| std::io::Error::other("q-gram shard bucket out of range"))?;
+        if *position >= expected_end {
+            return Err(std::io::Error::other("q-gram shard bucket count mismatch"));
+        }
+        postings[*position as usize] = slot;
+        *position = position
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
+        Ok(())
+    })?;
+    if decoded_records != records
+        || positions
+            .iter()
+            .zip(&local_offsets[1..])
+            .any(|(position, expected)| position != expected)
+    {
+        return Err(std::io::Error::other("q-gram shard count mismatch"));
+    }
+    Ok(postings)
+}
+
 fn read_var_u32(bytes: &[u8], position: &mut usize, end: usize) -> Option<u32> {
     let mut value = 0u32;
     for shift in [0, 7, 14, 21, 28] {
@@ -961,6 +966,26 @@ mod tests {
 
         assert!(walk_build_records(&[1], |_, _| Ok(())).is_err());
         assert!(walk_build_records(&[1, 0, 0x80], |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn build_shard_decode_uses_expected_bucket_counts() {
+        let dir = TempDir::new();
+        let path = dir.0.join("shard.part");
+        {
+            let mut writer = BuildShardWriter::create(&path).expect("create shard writer");
+            writer.write(0, 10).expect("write first bucket");
+            writer.write(1, 12).expect("write second bucket");
+            writer.flush().expect("flush shard writer");
+        }
+        let bytes = std::fs::read(path).expect("read shard records");
+
+        assert_eq!(
+            decode_build_shard(&bytes, &[0, 1, 2]).expect("decode expected buckets"),
+            [10, 12]
+        );
+        assert!(decode_build_shard(&bytes, &[0, 0, 2]).is_err());
+        assert!(decode_build_shard(&bytes, &[0, 2]).is_err());
     }
 
     #[test]
