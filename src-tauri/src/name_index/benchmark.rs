@@ -215,6 +215,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
     let recent_paths = read_recents(&config.app_data.join("recents_cache.json"));
     let pinned_paths = read_pinned(&config.app_data.join("pinned_tabs.json"));
     let aggregate = journal.aggregate();
+    let memory = super::search_memory::MemoryEvidence::default();
 
     let (source_hash, base_items, live_items, base_slots, live_slots, working) = {
         let index = data.read().expect("name index lock poisoned");
@@ -233,6 +234,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
                 &pinned_paths,
                 &recent_paths,
                 &aggregate,
+                &memory,
             ),
         )
     };
@@ -269,6 +271,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
         journal: &aggregate,
         aliases: &aliases,
         retrieval,
+        memory: super::search_memory::MemoryEvidence::empty(),
     };
     for case in &cases {
         for _ in 0..config.warmups {

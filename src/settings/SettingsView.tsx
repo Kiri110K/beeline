@@ -24,6 +24,7 @@ import {
   type Slot,
 } from "../operations/settings";
 import { reportShellError, type ShellError } from "../shell";
+import { resetLearnedRanking } from "../search/ipc";
 import { strings } from "../strings";
 import type { SetSettingsOutcome } from "./ipc";
 import {
@@ -91,6 +92,9 @@ export function SettingsView({
   const [draft, setDraft] = useState<Settings>(settings);
   const [recording, setRecording] = useState(false);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [learnedReset, setLearnedReset] = useState<
+    "idle" | "confirm" | "running" | "done"
+  >("idle");
   // Which known apps are installed, for the slot pickers (SPEC §8 detection).
   const [installed, setInstalled] = useState<ReadonlySet<string>>(new Set());
 
@@ -626,6 +630,58 @@ export function SettingsView({
               </button>
             </div>
           </ListEditor>
+
+          {/* Search Memory reset (§6.3, §12). The explicit second click makes the local,
+              irreversible learned-state deletion deliberate without a modal dialog. */}
+          <Field label={s.learnedRanking.heading} hint={s.learnedRanking.hint}>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={learnedReset === "running"}
+                onClick={() => {
+                  if (learnedReset === "idle" || learnedReset === "done") {
+                    setLearnedReset("confirm");
+                    return;
+                  }
+                  if (learnedReset === "confirm") {
+                    setLearnedReset("running");
+                    void resetLearnedRanking().match(
+                      () => {
+                        setLearnedReset("done");
+                      },
+                      (error) => {
+                        setLearnedReset("idle");
+                        reportShellError(error);
+                      },
+                    );
+                  }
+                }}
+                className="rounded border border-neutral-600 px-3 py-1 hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {learnedReset === "confirm"
+                  ? s.learnedRanking.confirm
+                  : learnedReset === "running"
+                    ? s.learnedRanking.running
+                    : s.learnedRanking.reset}
+              </button>
+              {learnedReset === "confirm" ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLearnedReset("idle");
+                  }}
+                  className="rounded px-3 py-1 text-neutral-400 hover:text-neutral-200"
+                >
+                  {s.learnedRanking.cancel}
+                </button>
+              ) : null}
+              {learnedReset === "done" ? (
+                <span className="text-[12px] text-neutral-400">
+                  {s.learnedRanking.done}
+                </span>
+              ) : null}
+            </div>
+          </Field>
         </div>
       </div>
     </div>

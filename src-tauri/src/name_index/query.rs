@@ -35,6 +35,7 @@ use serde::Serialize;
 use crate::name_index::{
     alias::AliasDictionary,
     model::{name_filter, DirId, EntryRef, IndexData, Tier},
+    search_memory::MemoryEvidence,
     visit_journal::Aggregate,
 };
 
@@ -159,6 +160,7 @@ pub struct RankContext<'a> {
     pub journal: &'a Aggregate,
     pub aliases: &'a AliasDictionary,
     pub retrieval: RetrievalSignals,
+    pub memory: &'a MemoryEvidence,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +215,7 @@ impl RankContext<'static> {
             journal: AGG.get_or_init(Aggregate::default),
             aliases: ALIASES.get_or_init(AliasDictionary::empty),
             retrieval: RetrievalSignals::default(),
+            memory: MemoryEvidence::empty(),
         }
     }
 }
@@ -827,6 +830,7 @@ fn run_fuzzy_inner(
     if let Some(target) = ctx.aliases.resolve(&query_lower) {
         inject(&mut candidates, index, target, ALIAS_RECOMMEND, true);
     }
+    inject_memory_candidates(&mut candidates, index, ctx);
     rank_fuzzy_candidates(&mut candidates, limit);
     SearchOutcome {
         hits: fuzzy_hits(&candidates),
@@ -983,6 +987,7 @@ fn score_fuzzy_entry(
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
+    score += ctx.memory.boost(&path_str);
     if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
@@ -1319,6 +1324,7 @@ pub(crate) fn run_impl(
         let target = target.to_path_buf();
         inject(&mut candidates, index, &target, ALIAS_RECOMMEND, true);
     }
+    inject_memory_candidates(&mut candidates, index, ctx);
 
     // Higher score first; ties by shorter path, then lexicographic path (determinism).
     candidates.sort_by(|a, b| {
@@ -1591,6 +1597,7 @@ fn score_plain(
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
+    score += ctx.memory.boost(&path_str);
     if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
@@ -1643,6 +1650,7 @@ fn score_multi(
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
+    score += ctx.memory.boost(&path_str);
     if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
@@ -1822,6 +1830,7 @@ fn score_path_shaped(
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += ctx.journal.boost(&path_str);
+    score += ctx.memory.boost(&path_str);
     if prep.known.contains(&path) {
         score += KNOWN_PLACE_BOOST;
     }
@@ -2144,6 +2153,41 @@ fn inject(
     });
 }
 
+/// Merge query-relevant learned Items after retrieval. Existing textual candidates retain
+/// their match score plus the memory contribution; an Item found only through Search Memory
+/// enters with that contribution as its whole score. The learned store is bounded, so this
+/// never turns the global Name Index scan into a path walk.
+fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, ctx: &RankContext) {
+    for path in ctx.memory.paths() {
+        let score = ctx.memory.boost(path);
+        if score <= 0 {
+            continue;
+        }
+        if candidates.iter().any(|candidate| candidate.path == path) {
+            // Textual candidates already received this contribution inside `score_entry`.
+            // Do not add it twice.
+            continue;
+        }
+        let target = Path::new(path);
+        let Some((is_directory, tier)) = find_entry(index, target) else {
+            // Dormant deleted/unmounted evidence never creates a ghost result.
+            continue;
+        };
+        let name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_owned());
+        candidates.push(Candidate {
+            score,
+            path: path.to_owned(),
+            name,
+            is_directory,
+            tier,
+            slot: u32::MAX,
+        });
+    }
+}
+
 /// Look up an absolute path in the index, returning `(is_directory, tier)` if present.
 fn find_entry(index: &IndexData, path: &Path) -> Option<(bool, Tier)> {
     if path == index.root {
@@ -2291,9 +2335,28 @@ mod tests {
             journal: &aggregate,
             aliases: &AliasDictionary::empty(),
             retrieval: RetrievalSignals::default(),
+            memory: MemoryEvidence::empty(),
         };
         let boosted = search(&index, &ctx, "notes", 50);
         assert_eq!(boosted[0].path, "/home/tester/sub/notes"); // visited path lifted
+    }
+
+    #[test]
+    fn search_memory_can_retrieve_an_item_without_a_text_match() {
+        let mut index = index();
+        index.add_file(0, "methodology-notes.md", Tier::Normal);
+        index.add_file(0, "unrelated.txt", Tier::Normal);
+        let memory =
+            MemoryEvidence::from_scores(&[("/home/tester/methodology-notes.md", 3_000_000)]);
+        let ctx = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval: RetrievalSignals::default(),
+            memory: &memory,
+        };
+
+        let hits = search(&index, &ctx, "project alpha", 50);
+        assert_eq!(paths(&hits), vec!["/home/tester/methodology-notes.md"]);
     }
 
     #[test]
@@ -2313,6 +2376,7 @@ mod tests {
             journal: &Aggregate::default(),
             aliases: &AliasDictionary::empty(),
             retrieval,
+            memory: MemoryEvidence::empty(),
         };
         let hits = search(&index, &ctx, "report", 50);
 
@@ -2335,6 +2399,7 @@ mod tests {
             journal: &Aggregate::default(),
             aliases: &AliasDictionary::empty(),
             retrieval,
+            memory: MemoryEvidence::empty(),
         };
 
         let hits = search(&index, &ctx, "skills", 50);
@@ -2367,6 +2432,7 @@ mod tests {
             journal: &Aggregate::default(),
             aliases: &aliases,
             retrieval: RetrievalSignals::default(),
+            memory: MemoryEvidence::empty(),
         };
         let hits = search(&index, &ctx, "docs", 50);
         assert_eq!(hits[0].path, "/home/tester/Projects");

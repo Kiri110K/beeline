@@ -16,6 +16,7 @@ mod model;
 mod persist;
 mod qgram;
 mod query;
+mod search_memory;
 mod visit_journal;
 mod watcher;
 
@@ -42,6 +43,7 @@ use junk_refresh::JunkRefresh;
 use model::{IndexData, Tier};
 use qgram::QGramIndex;
 use query::{RankContext, RetrievalSignals, RetrievalSource, SearchHit};
+use search_memory::{MemoryEvidence, SearchMemory, SignalKind};
 use visit_journal::{VisitJournal, VisitKind};
 
 /// The volume key for the home root. Mounted volumes get their own keys later.
@@ -95,6 +97,8 @@ pub struct NameIndex {
     index_file: PathBuf,
     /// Local, ranking-only record of visits (SPEC §6, §11).
     journal: Arc<VisitJournal>,
+    /// Persistent explicit-interaction evidence and query-independent learned usage.
+    search_memory: Arc<SearchMemory>,
     /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
     /// searches rank against the current aliases.
     aliases: RwLock<Arc<AliasDictionary>>,
@@ -273,6 +277,10 @@ impl NameIndex {
             VisitJournal::load(&app_data_dir)
                 .map_err(|error| format!("failed to load visit journal: {error}"))?,
         );
+        let search_memory = Arc::new(
+            SearchMemory::load(&app_data_dir)
+                .map_err(|error| format!("failed to load Search Memory: {error}"))?,
+        );
 
         Ok(Self {
             data,
@@ -280,6 +288,7 @@ impl NameIndex {
             root,
             index_file,
             journal,
+            search_memory,
             aliases,
             generation: Arc::new(AtomicU64::new(0)),
             reuse: Arc::new(Mutex::new(None)),
@@ -529,6 +538,7 @@ fn execute_search(
     root: &Path,
     journal: &VisitJournal,
     aliases: &AliasDictionary,
+    memory: &MemoryEvidence,
     junk_refresh: Option<&JunkRefresh>,
     query: &str,
     limit: usize,
@@ -549,6 +559,7 @@ fn execute_search(
         journal: &aggregate,
         aliases,
         retrieval,
+        memory,
     };
     let index = data.read().expect("name index lock poisoned");
     let revision = index.revision;
@@ -621,12 +632,14 @@ fn run_search(
     limit: usize,
 ) -> SearchResponse {
     let started = Instant::now();
+    let memory = MemoryEvidence::default();
     let executed = execute_search(
         data,
         junk,
         root,
         journal,
         aliases,
+        &memory,
         None,
         query,
         limit,
@@ -654,6 +667,7 @@ fn working_set(
     pinned_paths: &[PathBuf],
     recent_paths: &[PathBuf],
     journal: &visit_journal::Aggregate,
+    memory: &MemoryEvidence,
 ) -> WorkingSet {
     let mut slots = BTreeSet::new();
     let mut retrieval = RetrievalSignals::default();
@@ -678,6 +692,11 @@ fn working_set(
         }
     }
     for path in journal.paths().map(Path::new) {
+        if let Some(slot) = index.resolve_item_slot(path) {
+            slots.insert(slot);
+        }
+    }
+    for path in memory.paths().map(Path::new) {
         if let Some(slot) = index.resolve_item_slot(path) {
             slots.insert(slot);
         }
@@ -733,6 +752,7 @@ pub async fn search_name_index_v2(
     }
 
     let journal = state.journal.clone();
+    let search_memory = state.search_memory.clone();
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
@@ -749,6 +769,7 @@ pub async fn search_name_index_v2(
         let stream_started = Instant::now();
         let cancel = query::Cancel::new(&generation, my_gen);
         let aggregate = journal.aggregate();
+        let memory = search_memory.evidence(&query, now_ms());
         let (working, working_slots, context, revision) = {
             let index = data.read().expect("name index lock poisoned");
             let WorkingSet { slots, retrieval } = working_set(
@@ -757,11 +778,13 @@ pub async fn search_name_index_v2(
                 &pinned_paths,
                 &recent_paths,
                 &aggregate,
+                &memory,
             );
             let context = RankContext {
                 journal: &aggregate,
                 aliases: &aliases,
                 retrieval,
+                memory: &memory,
             };
             let outcome = query::run_fuzzy(
                 &index,
@@ -964,6 +987,7 @@ pub async fn search_name_index_v2(
             &root,
             &journal,
             &aliases,
+            &memory,
             Some(&junk_refresh),
             &query,
             limit as usize,
@@ -1036,6 +1060,46 @@ pub async fn record_visit(
         .await
         .map_err(|_| "record visit task failed".to_owned())?
         .map_err(|error| format!("failed to record visit: {error}"))
+}
+
+/// Record one eligible Search v2 learning signal off the interaction path. The backend
+/// determines whether the query also proves an ordered Path Interpretation for this Item.
+#[tauri::command]
+pub async fn record_search_signal(
+    path: String,
+    query: Option<String>,
+    kind: String,
+    state: State<'_, NameIndex>,
+) -> Result<(), String> {
+    let signal = SignalKind::parse(&kind).ok_or_else(|| format!("unknown signal kind: {kind}"))?;
+    let path_interpretation = query
+        .as_deref()
+        .is_some_and(|query| search_memory::is_path_interpretation(query, Path::new(&path)));
+    let memory = state.search_memory.clone();
+    let timestamp = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        memory.record(
+            &path,
+            query.as_deref(),
+            path_interpretation,
+            signal,
+            timestamp,
+        )
+    })
+    .await
+    .map_err(|_| "Search Memory task failed".to_owned())?
+    .map_err(|error| format!("failed to record Search Memory: {error}"))
+}
+
+/// Clear learned usage and Search Memory while preserving Journal, Recents, aliases,
+/// Pinned Tabs, and the Name Index (SPEC §6.3).
+#[tauri::command]
+pub async fn reset_learned_ranking(state: State<'_, NameIndex>) -> Result<(), String> {
+    let memory = state.search_memory.clone();
+    tauri::async_runtime::spawn_blocking(move || memory.reset())
+        .await
+        .map_err(|_| "reset learned ranking task failed".to_owned())?
+        .map_err(|error| format!("failed to reset learned ranking: {error}"))
 }
 
 #[cfg(test)]
@@ -1868,6 +1932,7 @@ mod tests {
         let (_journal_dir, journal) = empty_journal();
         let junk = Arc::new(JunkPatterns::default());
         let aliases = AliasDictionary::empty();
+        let memory = MemoryEvidence::default();
 
         // Single-token «процед» matches only the directory entry, by name.
         let base = execute_search(
@@ -1876,6 +1941,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            &memory,
             None,
             "процед",
             50,
@@ -1898,6 +1964,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            &memory,
             None,
             "процедура приемки",
             50,
@@ -1911,6 +1978,7 @@ mod tests {
             root,
             &journal,
             &aliases,
+            &memory,
             None,
             "процедура приемки",
             50,

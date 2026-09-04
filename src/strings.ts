@@ -146,6 +146,15 @@ export const strings = {
       open: "Open in default app",
       menu: "Show action menu",
     },
+    learnedRanking: {
+      heading: "Learned ranking",
+      hint: "Clears Search Memory and learned usage. Recents, visit history, aliases, tabs, and the name index stay intact.",
+      reset: "Reset learned ranking",
+      confirm: "Confirm reset",
+      cancel: "Cancel",
+      running: "Resetting…",
+      done: "Learned ranking reset",
+    },
     afterAction: {
       heading: "After an action",
       hide: "Hide window",

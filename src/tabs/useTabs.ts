@@ -71,10 +71,12 @@ import type {
   ListLocationWindowResponse,
 } from "../location/schema";
 import {
+  recordSearchSignal,
   recordVisit,
   searchNameIndex,
   subscribeSearchQgramReady,
   type SearchHit,
+  type SearchSignalKind,
 } from "../search/ipc";
 import {
   displayedHits,
@@ -880,10 +882,26 @@ export function useTabs(
     }
   }, []);
 
+  // Search Memory learns only explicit eligible interactions. Most Browse actions have no
+  // active query and therefore update query-independent usage alone; Search Result Reveal
+  // passes its originating query explicitly. This keeps retained inactive input from
+  // accidentally training unrelated later browsing.
+  const recordLearnedSignal = useCallback(
+    (path: string, kind: SearchSignalKind, query: string | null = null): void => {
+      const normalizedQuery = query?.trim() === "" ? null : query;
+      void recordSearchSignal(path, normalizedQuery, kind).match(
+        () => undefined,
+        reportShellError,
+      );
+    },
+    [],
+  );
+
   const openFile = useCallback(
     (path: string): void => {
       void openPath(path).match(() => {
         fireTelemetry("file_opened", { path });
+        recordLearnedSignal(path, "completed_action");
         void recordVisit(path, "opened_file").match(
           () => undefined,
           reportShellError,
@@ -892,7 +910,7 @@ export function useTabs(
         afterAction("open_file");
       }, reportShellError);
     },
-    [afterAction],
+    [afterAction, recordLearnedSignal],
   );
 
   // Open the Action Menu on a specific Item (the "Show Action Menu" primary action, §5):
@@ -919,13 +937,15 @@ export function useTabs(
     }
     opsDispatch({ type: "openMenu", via: "row_button", x: null, y: null, focusedIndex: 0 });
     fireTelemetry("action_menu_opened", { via: "row_button" });
-  }, []);
+    recordLearnedSignal(item.path, "action_menu");
+  }, [recordLearnedSignal]);
 
   const activateItem = useCallback(
     (item: Item): void => {
       const action = primaryActionFor(item, settingsRef.current);
       switch (action.kind) {
         case "enter":
+          recordLearnedSignal(action.path, "completed_action");
           navigate(
             stateRef.current.activeId,
             directoryLocation(action.path),
@@ -945,7 +965,7 @@ export function useTabs(
           break;
       }
     },
-    [navigate, openFile, openItemMenu, afterAction],
+    [navigate, openFile, openItemMenu, afterAction, recordLearnedSignal],
   );
 
   const select = useCallback((index: number, mode: SelectMode): void => {
@@ -1167,6 +1187,7 @@ export function useTabs(
     }
     void quickLookShow([focused.path], 0).match(
       () => {
+        recordLearnedSignal(focused.path, "quick_look");
         fireTelemetry("quick_look_dispatch_completed", {
           count,
           duration_ms: Math.round(performance.now() - dispatchStartedAt),
@@ -1178,7 +1199,7 @@ export function useTabs(
         reportShellError(error);
       },
     );
-  }, []);
+  }, [recordLearnedSignal]);
 
   // Move through the open Quick Look list (Up/Down, Ctrl+J/K): re-point the panel and move the
   // app's Focused Item to the same file, leaving the Selected Items untouched so the original
@@ -1640,6 +1661,7 @@ export function useTabs(
       const isDir = hit.isDirectory;
       const target = isDir ? hit.path : parentPath(hit.path);
       const focusPath = isDir ? undefined : hit.path;
+      recordLearnedSignal(hit.path, "completed_action", origin.search.query);
 
       // Reveal transitions the origin Tab out of Search Mode; the query is retained.
       clearSlowTimer(originId);
@@ -1673,7 +1695,14 @@ export function useTabs(
       // Temporary Tab) — none of those helpers apply an After Action themselves.
       afterAction("navigation");
     },
-    [activateTab, navigate, openOrReuseTemporary, clearSlowTimer, afterAction],
+    [
+      activateTab,
+      navigate,
+      openOrReuseTemporary,
+      clearSlowTimer,
+      afterAction,
+      recordLearnedSignal,
+    ],
   );
 
   const revealResultAt = useCallback(
@@ -2336,9 +2365,14 @@ export function useTabs(
   // Open the Action Menu by keyboard (§5, Cmd+K): app scope with no Selected Items, item
   // scope otherwise. Position is derived at render (no anchor point).
   const openActionMenu = useCallback((via: MenuVia): void => {
+    const active = tabById(stateRef.current, stateRef.current.activeId);
+    const item = active === undefined ? undefined : focusedItemOf(active.browse);
+    if (active !== undefined && item !== undefined && active.browse.selected.size > 0) {
+      recordLearnedSignal(item.path, "action_menu");
+    }
     opsDispatch({ type: "openMenu", via, x: null, y: null, focusedIndex: 0 });
     fireTelemetry("action_menu_opened", { via });
-  }, []);
+  }, [recordLearnedSignal]);
 
   // Open the Action Menu from a row (§5, `…` control or context click), selecting the row
   // first unless it is already among the Selected Items (Finder behavior).
@@ -2355,10 +2389,14 @@ export function useTabs(
           action: { type: "select", index, mode: "plain" },
         });
       }
+      const item = itemAt(active.browse.load, index);
+      if (item !== undefined) {
+        recordLearnedSignal(item.path, "action_menu");
+      }
       opsDispatch({ type: "openMenu", via, x, y, focusedIndex: 0 });
       fireTelemetry("action_menu_opened", { via });
     },
-    [],
+    [recordLearnedSignal],
   );
 
   const focusMenuItem = useCallback((index: number): void => {

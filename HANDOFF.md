@@ -31,6 +31,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   usage, затем единый configurable ranker, `ranker.json`, Ranking Traces, CLI,
   manual reload и Reset Learned Ranking. Старый ranking/persistence path удалять
   в том же изменении; compatibility с экспериментальными данными не сохранять.
+- Первый Search Memory срез реализован 05.09 в #55. Append-only NDJSON хранит
+  query-independent usage и отдельные ordinary/path associations; слабый Action
+  Menu, средний Quick Look и сильные Reveal/open/enter сигналы подключены к UI.
+  Нормализация, unordered Query Family, ordered `work wip` / `work/wip`,
+  prefix, single-token add/remove и bounded edit transfer реализованы без
+  транзитивного сложения. Learned paths входят в Working Set и могут вернуться
+  как memory-only result; missing paths остаются dormant. Есть continuous aging,
+  saturation, 64 MiB log compaction, weakest-first association limit и двухшаговый
+  Reset Learned Ranking в Settings. Полный suite: 117 Rust passed / 9 ignored,
+  clippy `-D warnings`, frontend contracts, lint, typecheck и build зелёные.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.

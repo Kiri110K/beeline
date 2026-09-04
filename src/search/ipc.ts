@@ -98,6 +98,10 @@ export function subscribeSearchQgramReady(
 }
 
 export type VisitKind = "entered_location" | "opened_file";
+export type SearchSignalKind =
+  | "action_menu"
+  | "quick_look"
+  | "completed_action";
 
 export function recordVisit(
   path: string,
@@ -105,5 +109,21 @@ export function recordVisit(
 ): ResultAsync<null, ShellError> {
   return fromTauri("record_visit", unitSchema, () =>
     invoke("record_visit", { path, kind }),
+  );
+}
+
+export function recordSearchSignal(
+  path: string,
+  query: string | null,
+  kind: SearchSignalKind,
+): ResultAsync<null, ShellError> {
+  return fromTauri("record_search_signal", unitSchema, () =>
+    invoke("record_search_signal", { path, query, kind }),
+  );
+}
+
+export function resetLearnedRanking(): ResultAsync<null, ShellError> {
+  return fromTauri("reset_learned_ranking", unitSchema, () =>
+    invoke("reset_learned_ranking"),
   );
 }

@@ -34,7 +34,9 @@ use listing::{
     list_location_file_neighbor, list_location_initial, list_location_selection_paths,
     list_location_window, validate_directory, ListingSessions,
 };
-use name_index::{record_visit, search_name_index_v2, NameIndex};
+use name_index::{
+    record_search_signal, record_visit, reset_learned_ranking, search_name_index_v2, NameIndex,
+};
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
     rename_item, resolve_installed_bundle, reveal_in_finder, trash_items, Operations,
@@ -643,10 +645,12 @@ pub fn run() {
             quick_look_show,
             quick_look_update,
             quit_app,
+            record_search_signal,
             record_visit,
             rename_item,
             resolve_installed_bundle,
             reveal_in_finder,
+            reset_learned_ranking,
             save_pinned_tabs,
             search_name_index_v2,
             set_settings,
