@@ -5,10 +5,10 @@
 //! the sidecar to one exact base image; a mismatch starts a background rebuild.
 
 use std::{
-    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{BufWriter, Write},
     path::Path,
+    sync::Mutex,
 };
 
 use unicode_normalization::UnicodeNormalization;
@@ -21,6 +21,7 @@ use super::{
 const MAGIC: &[u8; 8] = b"BLQGM001";
 const HEADER_BYTES: usize = 40;
 const BUCKETS: usize = 1 << 20;
+const RETAINED_WORKSPACES: usize = 1;
 
 #[derive(Debug)]
 pub struct CandidateSet {
@@ -33,6 +34,28 @@ pub struct QGramIndex {
     mapping: MappedFile,
     postings_offset: usize,
     postings: usize,
+    source_entries: usize,
+    workspaces: Mutex<Vec<DenseWorkspace>>,
+}
+
+struct DenseWorkspace {
+    counts: Vec<u8>,
+    touched: Vec<u32>,
+}
+
+impl DenseWorkspace {
+    fn new(entries: usize) -> Self {
+        Self {
+            counts: vec![0; entries],
+            touched: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        for slot in self.touched.drain(..) {
+            self.counts[slot as usize] = 0;
+        }
+    }
 }
 
 impl QGramIndex {
@@ -56,6 +79,8 @@ impl QGramIndex {
             mapping,
             postings_offset,
             postings,
+            source_entries,
+            workspaces: Mutex::new(Vec::new()),
         })
     }
 
@@ -118,7 +143,8 @@ impl QGramIndex {
     }
 
     pub fn candidates(&self, query_text: &str, cancel: &Cancel<'_>) -> CandidateSet {
-        let mut candidates = BTreeSet::new();
+        let mut workspace = self.take_workspace();
+        let mut candidates = Vec::new();
         let mut posting_visits = 0usize;
         for variant in query_variants(query_text) {
             for token in query_tokens(&variant) {
@@ -127,11 +153,14 @@ impl QGramIndex {
                     cancel,
                     &mut candidates,
                     &mut posting_visits,
+                    &mut workspace,
                 ) {
+                    self.return_workspace(workspace);
                     return aborted(posting_visits);
                 }
             }
         }
+        self.return_workspace(workspace);
         collected(candidates, posting_visits)
     }
 
@@ -144,7 +173,7 @@ impl QGramIndex {
         query_text: &str,
         cancel: &Cancel<'_>,
     ) -> Option<CandidateSet> {
-        let mut candidates = BTreeSet::new();
+        let mut candidates = Vec::new();
         let mut posting_visits = 0usize;
         let mut found_multi = false;
         for variant in query_variants(query_text) {
@@ -169,6 +198,25 @@ impl QGramIndex {
         self.postings
     }
 
+    fn take_workspace(&self) -> DenseWorkspace {
+        self.workspaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .unwrap_or_else(|| DenseWorkspace::new(self.source_entries))
+    }
+
+    fn return_workspace(&self, mut workspace: DenseWorkspace) {
+        workspace.clear();
+        let mut retained = self
+            .workspaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if retained.len() < RETAINED_WORKSPACES {
+            retained.push(workspace);
+        }
+    }
+
     fn posting_range(&self, bucket: usize) -> (usize, usize) {
         let bytes = self.mapping.bytes();
         let start =
@@ -185,8 +233,9 @@ impl QGramIndex {
         &self,
         token: &str,
         cancel: &Cancel<'_>,
-        candidates: &mut BTreeSet<u32>,
+        candidates: &mut Vec<u32>,
         posting_visits: &mut usize,
+        workspace: &mut DenseWorkspace,
     ) -> bool {
         let buckets = gram_buckets(token);
         if buckets.is_empty() {
@@ -196,7 +245,7 @@ impl QGramIndex {
             .len()
             .saturating_sub(4 * allowed_edits(token.chars().count()))
             .max(1);
-        let mut overlaps = HashMap::<u32, u8>::new();
+        workspace.clear();
         for bucket in buckets {
             let (start, end) = self.posting_range(bucket as usize);
             for position in start..end {
@@ -206,15 +255,23 @@ impl QGramIndex {
                 *posting_visits += 1;
                 let slot = read_u32(self.mapping.bytes(), self.postings_offset + position * 4)
                     .expect("validated q-gram posting");
-                let count = overlaps.entry(slot).or_default();
+                let Some(count) = workspace.counts.get_mut(slot as usize) else {
+                    continue;
+                };
+                if *count == 0 {
+                    workspace.touched.push(slot);
+                }
                 *count = count.saturating_add(1);
             }
         }
         candidates.extend(
-            overlaps
-                .into_iter()
-                .filter_map(|(slot, count)| (count as usize >= minimum).then_some(slot)),
+            workspace
+                .touched
+                .iter()
+                .copied()
+                .filter(|slot| workspace.counts[*slot as usize] as usize >= minimum),
         );
+        workspace.clear();
         false
     }
 
@@ -225,7 +282,7 @@ impl QGramIndex {
         &self,
         token: &str,
         cancel: &Cancel<'_>,
-        candidates: &mut BTreeSet<u32>,
+        candidates: &mut Vec<u32>,
         posting_visits: &mut usize,
     ) -> bool {
         let buckets = gram_buckets(token);
@@ -265,7 +322,7 @@ impl QGramIndex {
                 }
             }
             if present {
-                candidates.insert(slot);
+                candidates.push(slot);
             }
         }
         false
@@ -305,9 +362,11 @@ fn query_variants(query_text: &str) -> Vec<String> {
     variants
 }
 
-fn collected(candidates: BTreeSet<u32>, posting_visits: usize) -> CandidateSet {
+fn collected(mut candidates: Vec<u32>, posting_visits: usize) -> CandidateSet {
+    candidates.sort_unstable();
+    candidates.dedup();
     CandidateSet {
-        slots: candidates.into_iter().collect(),
+        slots: candidates,
         posting_visits,
         aborted: false,
     }
@@ -485,11 +544,34 @@ mod tests {
 
         let cancelled_generation = AtomicU64::new(2);
         let cancelled = Cancel::new(&cancelled_generation, 1);
+        assert!(qgram.candidates("vault methodology", &cancelled).aborted);
         assert!(
             qgram
                 .ordered_tail_literal_candidates("vault methodology", &cancelled)
                 .expect("multi-token tail")
                 .aborted
         );
+
+        // Cancellation must return a clean dense workspace to the pool. The next request
+        // must produce the exact same complete candidate set as it did before the abort.
+        assert_eq!(
+            qgram.candidates("vault methodology", &cancel).slots,
+            whole.slots
+        );
+
+        // Rapid typing can overlap a cancelled query with its replacement. The shared
+        // mapped sidecar and its bounded workspace pool must stay deterministic.
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| qgram.candidates("vault methodology", &cancel));
+            let second = scope.spawn(|| qgram.candidates("vault methodology", &cancel));
+            assert_eq!(
+                first.join().expect("first candidate thread").slots,
+                whole.slots
+            );
+            assert_eq!(
+                second.join().expect("second candidate thread").slots,
+                whole.slots
+            );
+        });
     }
 }
