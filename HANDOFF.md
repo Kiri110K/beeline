@@ -354,6 +354,18 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   overlay сейчас 59,997 candidates: working-set paint 19 мс, complete backend
   25 мс, complete paint 44 мс. Footprint после UI 94 MiB; отчёт и скриншот:
   `/private/tmp/beeline-path-parallel-ui.uq63ZW/`.
+- PR #70 влит в main как `3525252`. Ordinary multi-token matcher сохраняет уже
+  вычисленное качество final name token, переиспользует его в Path Interpretation
+  и пропускает ancestor walk только когда active ranker weights доказывают, что
+  ordinary score не может проиграть. Focused 500× `status report`: total p95
+  53.03 → 51.19 мс, verify 46.37 → 44.61 мс; full suites быстрее на 0.3–0.6%,
+  user CPU ниже на 2.0–3.7%, fingerprints одинаковы. Config-sensitive тест
+  сохраняет scoped победителя при других весах. 140 Rust passed / 12 ignored.
+- `experiment/fuzzy-path-ten-shards` (`10d6b02`) отклонён. Десять path fuzzy
+  workers вместо восьми ухудшили все case p95: `work wip` 11.30 → 13.17 мс,
+  `status report` 47.32 → 48.47 мс; real wall +7.3%, user CPU +2.7%, physical
+  peak +8.10 MiB. Код оставлен только в remote-ветке; отрицательный verdict:
+  `prototypes/fuzzy-path-ten-shards/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
