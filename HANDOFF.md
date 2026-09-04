@@ -361,6 +361,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   53.03 → 51.19 мс, verify 46.37 → 44.61 мс; full suites быстрее на 0.3–0.6%,
   user CPU ниже на 2.0–3.7%, fingerprints одинаковы. Config-sensitive тест
   сохраняет scoped победителя при других весах. 140 Rust passed / 12 ignored.
+- Signed bundle `3525252` установлен, backup:
+  `/private/tmp/Beeline-before-multi-path-dominance-20260905.app`. GUI-pass
+  `status report`: первые восемь rows — подходящие `status-report_*.xlsx`, первый
+  exact path корректен, stale/duplicates/crash/focus loss нет. На live overlay с
+  189,864 candidates working-set paint 16 мс, первая global wave 44 мс, complete
+  paint 85 мс. PID 92802 после Escape hidden/0 windows/not frontmost, physical
+  footprint 45 MiB, CPU 0%. Отчёт и скриншот:
+  `/private/tmp/beeline-multi-dominance-ui.hYvtbf/`.
 - `experiment/fuzzy-path-ten-shards` (`10d6b02`) отклонён. Десять path fuzzy
   workers вместо восьми ухудшили все case p95: `work wip` 11.30 → 13.17 мс,
   `status report` 47.32 → 48.47 мс; real wall +7.3%, user CPU +2.7%, physical
