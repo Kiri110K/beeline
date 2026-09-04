@@ -446,6 +446,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   target ranks и fingerprints. Полный checkpoint: 144 Rust passed / 12 ignored,
   clippy `-D warnings`, frontend contracts, typecheck, build и lint зелёные.
   Подробности: `prototypes/qgram-ascii-fast-path/RESULTS.md`.
+- `experiment/qgram-linear-dedup` (`cda6ece`) отклонён. Линейная проверка уже
+  добавленных buckets убрала sort и снизила rebuild user CPU на 7.8–8.1%, но
+  instructions выросли на 6.3–6.7%, а wall сменил знак между парами. В Search v2
+  instructions стабильно выросли на 0.02–0.04%; все 2,200 результатов остались
+  эквивалентны. Редкий rebuild уже занимает несколько секунд, поэтому quadratic
+  worst case на длинных именах не принят. Код остался только в remote-ветке;
+  verdict: `prototypes/qgram-linear-dedup/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
