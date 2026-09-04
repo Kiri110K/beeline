@@ -345,6 +345,12 @@ produce the same candidate set in the Rust suite. The installed signed bundle th
 typing, or crash appeared. The retained query remained visible after the first Escape as required
 by SPEC §5; a second real system Escape hid the window and recorded `origin: escape`.
 
+The next isolated builder experiment reduced the count, offset, and write-position tables from
+`u64` to checked `u32` while retaining 64-bit offsets in the existing sidecar format. A full build
+produced a byte-identical 554,313,828-byte file. Wall time changed from 18.21 to 17.57 seconds and
+peak physical footprint from 543.88 to 536.09 MiB, a 7.78 MiB reduction. This is a small safe win;
+the raw 520-MiB postings vector remains the builder's dominant memory cost.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
