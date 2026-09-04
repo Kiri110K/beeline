@@ -391,6 +391,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   posting visits, target ranks и top-10 fingerprints. При текущих 185,963,243
   bytes из бюджета 600 MiB такой обмен не нужен. Код оставлен только в remote-
   ветке; отрицательный verdict: `prototypes/qgram-skip-stride-128/RESULTS.md`.
+- PR #72 влит в main как `14e8497`. Builder теперь берёт точные bucket counts из
+  уже готовой global offset table и декодирует примерно 422 MiB временных shard
+  records один раз вместо двух. Заодно он проверяет точное заполнение диапазона
+  каждого bucket. В двух production-парах retired instructions снизились на
+  1.0%, wall — на 2.7–3.3%, user CPU — на 1.1–3.5%; physical peak остался около
+  67.8 MiB. Все пять outputs побайтно совпали с установленным sidecar. Полный
+  checkpoint: 143 Rust passed / 12 ignored, clippy `-D warnings`, frontend
+  contracts, typecheck, build и lint зелёные. Подробности:
+  `prototypes/qgram-build-single-decode/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
