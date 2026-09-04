@@ -93,20 +93,32 @@ impl QGramIndex {
             fs::create_dir_all(parent)?;
         }
 
-        let mut counts = vec![0u64; BUCKETS];
+        // The on-disk format keeps 64-bit offsets, but one build cannot create more than
+        // u32::MAX postings without exceeding the current sidecar and addressable-slot
+        // contracts. Keeping all three build tables at u32 saves 12 MiB of anonymous memory.
+        let mut counts = vec![0u32; BUCKETS];
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
                 continue;
             };
             for bucket in gram_buckets(entry.name) {
-                counts[bucket as usize] += 1;
+                let count = &mut counts[bucket as usize];
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("q-gram bucket exceeds u32 postings"))?;
             }
         }
 
         let mut offsets = Vec::with_capacity(BUCKETS + 1);
-        offsets.push(0u64);
+        offsets.push(0u32);
         for count in counts {
-            offsets.push(offsets.last().copied().expect("offset seed") + count);
+            let offset = offsets
+                .last()
+                .copied()
+                .expect("offset seed")
+                .checked_add(count)
+                .ok_or_else(|| std::io::Error::other("q-gram sidecar exceeds u32 postings"))?;
+            offsets.push(offset);
         }
         let posting_count = *offsets.last().expect("final q-gram offset") as usize;
         let mut positions = offsets[..BUCKETS].to_vec();
@@ -117,8 +129,11 @@ impl QGramIndex {
             };
             for bucket in gram_buckets(entry.name) {
                 let position = &mut positions[bucket as usize];
-                postings[*position as usize] = slot as u32;
-                *position += 1;
+                postings[*position as usize] = u32::try_from(slot)
+                    .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
+                *position = position.checked_add(1).ok_or_else(|| {
+                    std::io::Error::other("q-gram write position exceeds u32 postings")
+                })?;
             }
         }
 
@@ -131,7 +146,7 @@ impl QGramIndex {
         writer.write_all(&source_hash.to_le_bytes())?;
         writer.write_all(&(source_entries as u64).to_le_bytes())?;
         for offset in offsets {
-            writer.write_all(&offset.to_le_bytes())?;
+            writer.write_all(&u64::from(offset).to_le_bytes())?;
         }
         for slot in postings {
             writer.write_all(&slot.to_le_bytes())?;
