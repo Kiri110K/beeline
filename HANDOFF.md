@@ -168,6 +168,26 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Escape был ошибкой проверки: SPEC §5 требует оставить query видимым после
   закрытия Search Results, а второй настоящий Escape скрыл окно. Ошибочный #57
   закрыт с коррекцией: https://github.com/Kiri110K/beeline/issues/57#issuecomment-5544278704
+- PR #58 влит в main как `cf7d11e`. Внутренние count/offset/write-position
+  таблицы q-gram builder переведены с `u64` на checked `u32`; существующий
+  sidecar-формат с 64-bit offsets не менялся. Полный production build дал
+  побитно одинаковый 554,313,828-byte sidecar. Время: 18.21 → 17.57 с; peak
+  physical: 543.88 → 536.09 MiB. Главный остаток — raw postings vector около
+  520 MiB.
+- Release-profile эксперимент `experiment/release-profile` отклонён и оставлен
+  отдельной remote-веткой. Thin LTO + один codegen unit + abort + strip уменьшили
+  backend binary на 49.3%, но suite стал на 1.5% медленнее, cycles выросли на
+  4.9%, а память не изменилась. В main попал только отрицательный результат
+  `prototypes/release-profile/RESULTS.md` (`6d1573b`).
+- PR #59 влит в main как `8392f0e`. Multi-token fuzzy scoring теперь один раз на
+  кандидата строит lowercase ancestor chain и переиспользует её для ordinary,
+  Path Interpretation и corrected-layout вариантов. Same-seed suite: 51.60 →
+  44.07 с, то есть 1.17x и на 14.6% меньше wall; user CPU -16.5%, instructions
+  -12.0%, cycles -16.4%. Implicit/gapped/direct-multi p95 улучшились на
+  16.1%/23.9%/21.8%. Повтор с другим seed: 44.12 с. Hits/fingerprints совпали,
+  misses нет; 134 Rust passed / 11 ignored, fmt и clippy зелёные. Установленное
+  приложение пока содержит предыдущий dense-qgram build без этого CPU-фикса и
+  без builder-only `u32` изменения.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
