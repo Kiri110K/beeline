@@ -33,7 +33,6 @@ pub struct QGramIndex {
     mapping: MappedFile,
     postings_offset: usize,
     postings: usize,
-    source_entries: usize,
 }
 
 impl QGramIndex {
@@ -57,7 +56,6 @@ impl QGramIndex {
             mapping,
             postings_offset,
             postings,
-            source_entries,
         })
     }
 
@@ -165,10 +163,6 @@ impl QGramIndex {
             }
         }
         found_multi.then(|| collected(candidates, posting_visits))
-    }
-
-    pub fn source_entries(&self) -> usize {
-        self.source_entries
     }
 
     pub fn postings(&self) -> usize {

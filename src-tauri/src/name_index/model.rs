@@ -6,7 +6,7 @@
 //! atomic rebuild.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::c_void,
     fs::File,
     os::fd::AsRawFd,
@@ -502,6 +502,8 @@ pub struct IndexData {
     base_next_sibling: Vec<DirId>,
     overlay_nodes: Vec<OwnedNode>,
     overlay_entries: Vec<Option<OwnedEntry>>,
+    free_overlay_nodes: BTreeSet<usize>,
+    free_overlay_entries: BTreeSet<usize>,
     added_by_parent: HashMap<DirId, Vec<u32>>,
     mtime_overrides: HashMap<DirId, i64>,
     live: usize,
@@ -527,6 +529,8 @@ impl IndexData {
                 removed: false,
             }],
             overlay_entries: Vec::new(),
+            free_overlay_nodes: BTreeSet::new(),
+            free_overlay_entries: BTreeSet::new(),
             added_by_parent: HashMap::new(),
             mtime_overrides: HashMap::new(),
             live: 0,
@@ -559,6 +563,8 @@ impl IndexData {
             base_next_sibling,
             overlay_nodes: Vec::new(),
             overlay_entries: Vec::new(),
+            free_overlay_nodes: BTreeSet::new(),
+            free_overlay_entries: BTreeSet::new(),
             added_by_parent: HashMap::new(),
             mtime_overrides: HashMap::new(),
             live: entry_count,
@@ -593,6 +599,21 @@ impl IndexData {
 
     pub fn slot_len(&self) -> usize {
         self.base_entry_count() + self.overlay_entries.len()
+    }
+
+    /// Live mutable slots only. Search supplements the immutable q-gram base with this
+    /// iterator instead of the overlay's whole high-water range, so removed build artifacts
+    /// do not become candidate work forever.
+    pub(crate) fn overlay_entry_slots(&self) -> impl Iterator<Item = u32> + '_ {
+        let base = self.base_entry_count();
+        self.overlay_entries
+            .iter()
+            .enumerate()
+            .filter_map(move |(offset, entry)| {
+                entry
+                    .as_ref()
+                    .map(|_| u32::try_from(base + offset).expect("Name Index exceeds u32 slots"))
+            })
     }
 
     pub fn node_len(&self) -> usize {
@@ -854,13 +875,19 @@ impl IndexData {
     }
 
     fn push_entry(&mut self, entry: OwnedEntry) -> u32 {
-        let slot = self.base_entry_count() + self.overlay_entries.len();
+        let parent = entry.parent;
+        let overlay_slot = if let Some(offset) = self.free_overlay_entries.pop_first() {
+            debug_assert!(self.overlay_entries[offset].is_none());
+            self.overlay_entries[offset] = Some(entry);
+            offset
+        } else {
+            let offset = self.overlay_entries.len();
+            self.overlay_entries.push(Some(entry));
+            offset
+        };
+        let slot = self.base_entry_count() + overlay_slot;
         let slot = u32::try_from(slot).expect("Name Index exceeds u32 slots");
-        self.added_by_parent
-            .entry(entry.parent)
-            .or_default()
-            .push(slot);
-        self.overlay_entries.push(Some(entry));
+        self.added_by_parent.entry(parent).or_default().push(slot);
         self.live += 1;
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
@@ -897,15 +924,24 @@ impl IndexData {
         tier: Tier,
         mtime_ms: i64,
     ) -> DirId {
-        let id = self.base_node_count() + self.overlay_nodes.len();
-        let id = u32::try_from(id).expect("Name Index exceeds u32 directory nodes");
-        self.overlay_nodes.push(OwnedNode {
+        let owned = OwnedNode {
             name: Box::from(name),
             parent,
             tier,
             mtime_ms,
             removed: false,
-        });
+        };
+        let overlay_id = if let Some(offset) = self.free_overlay_nodes.pop_first() {
+            debug_assert!(self.overlay_nodes[offset].removed);
+            self.overlay_nodes[offset] = owned;
+            offset
+        } else {
+            let offset = self.overlay_nodes.len();
+            self.overlay_nodes.push(owned);
+            offset
+        };
+        let id = self.base_node_count() + overlay_id;
+        let id = u32::try_from(id).expect("Name Index exceeds u32 directory nodes");
         self.push_entry(OwnedEntry {
             name: Box::from(name),
             parent,
@@ -1007,6 +1043,7 @@ impl IndexData {
         let Some(entry) = self.entry(slot) else {
             return false;
         };
+        let parent = entry.parent;
         let dir_id = entry.is_directory.then_some(entry.dir_id);
         if let Some(dir_id) = dir_id {
             self.added_by_parent.remove(&dir_id);
@@ -1018,6 +1055,13 @@ impl IndexData {
                 .get_mut(dir_id as usize - base_node_count)
             {
                 node.removed = true;
+                let overlay_id = dir_id as usize - base_node_count;
+                self.free_overlay_nodes.insert(overlay_id);
+                while self.overlay_nodes.last().is_some_and(|node| node.removed) {
+                    let tail = self.overlay_nodes.len() - 1;
+                    self.overlay_nodes.pop();
+                    self.free_overlay_nodes.remove(&tail);
+                }
             }
             self.junk_dirty.remove(&dir_id);
         }
@@ -1034,6 +1078,18 @@ impl IndexData {
             };
             if entry.take().is_none() {
                 return false;
+            }
+            if let Some(added) = self.added_by_parent.get_mut(&parent) {
+                added.retain(|candidate| *candidate as usize != slot);
+                if added.is_empty() {
+                    self.added_by_parent.remove(&parent);
+                }
+            }
+            self.free_overlay_entries.insert(overlay_slot);
+            while self.overlay_entries.last().is_some_and(Option::is_none) {
+                let tail = self.overlay_entries.len() - 1;
+                self.overlay_entries.pop();
+                self.free_overlay_entries.remove(&tail);
             }
         }
         self.live -= 1;

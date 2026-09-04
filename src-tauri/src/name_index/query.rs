@@ -672,7 +672,6 @@ pub fn run_fuzzy(
 pub fn ordered_tail_literal_slots(
     index: &IndexData,
     query: &str,
-    start: usize,
     cancel: Option<&Cancel>,
 ) -> SlotSelection {
     let trimmed = query.trim();
@@ -710,20 +709,20 @@ pub fn ordered_tail_literal_slots(
 
     let mut slots = Vec::new();
     let mut scratch = String::new();
-    for slot in start..index.slot_len() {
-        if (slot - start).is_multiple_of(ABORT_STRIDE) && cancel.is_some_and(Cancel::superseded) {
+    for (position, slot) in index.overlay_entry_slots().enumerate() {
+        if position.is_multiple_of(ABORT_STRIDE) && cancel.is_some_and(Cancel::superseded) {
             return SlotSelection {
                 slots: Vec::new(),
                 aborted: true,
             };
         }
-        let Some(entry) = index.entry(slot) else {
-            continue;
-        };
+        let entry = index
+            .entry(slot as usize)
+            .expect("live overlay iterator returned a removed entry");
         if needles.iter().any(|(needle, filter)| {
             quality_match(entry.name, entry.filter, needle, *filter, &mut scratch).is_some()
         }) {
-            slots.push(slot as u32);
+            slots.push(slot);
         }
     }
     SlotSelection {
@@ -2545,15 +2544,13 @@ mod tests {
         index.add_file(0, "vault-notes.md", Tier::Normal);
         index.add_file(0, "unrelated.txt", Tier::Normal);
 
-        let selected = ordered_tail_literal_slots(&index, "vault methodology", 0, None);
+        let selected = ordered_tail_literal_slots(&index, "vault methodology", None);
         assert!(!selected.aborted);
         assert_eq!(selected.slots, vec![target_slot]);
 
         let generation = AtomicU64::new(2);
         let cancelled = Cancel::new(&generation, 1);
-        assert!(
-            ordered_tail_literal_slots(&index, "vault methodology", 0, Some(&cancelled)).aborted
-        );
+        assert!(ordered_tail_literal_slots(&index, "vault methodology", Some(&cancelled)).aborted);
     }
 
     #[test]

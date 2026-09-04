@@ -190,6 +190,7 @@ impl NameIndex {
         let watcher_ready = watcher::spawn_deferred(
             data.clone(),
             root.clone(),
+            Some(app_data_dir.clone()),
             junk.clone(),
             Some(junk_refresh.clone()),
             Some(app.clone()),
@@ -818,12 +819,8 @@ pub async fn search_name_index_v2(
                     let mut priority_slots = seed.slots;
                     {
                         let index = data.read().expect("name index lock poisoned");
-                        let overlay = query::ordered_tail_literal_slots(
-                            &index,
-                            &query,
-                            qgram.source_entries(),
-                            Some(&cancel),
-                        );
+                        let overlay =
+                            query::ordered_tail_literal_slots(&index, &query, Some(&cancel));
                         if overlay.aborted {
                             return Err("search superseded".to_owned());
                         }
@@ -875,8 +872,7 @@ pub async fn search_name_index_v2(
             let mut candidate_slots = candidate_set.slots;
             {
                 let index = data.read().expect("name index lock poisoned");
-                candidate_slots
-                    .extend((qgram.source_entries()..index.slot_len()).map(|slot| slot as u32));
+                candidate_slots.extend(index.overlay_entry_slots());
             }
             candidate_slots.extend(working_slots);
             candidate_slots.sort_unstable();
@@ -1339,6 +1335,63 @@ mod tests {
     }
 
     #[test]
+    fn overlay_entry_churn_reuses_holes_without_crossing_parents() {
+        let dir = TempDir::new();
+        let mut index = IndexData::new(dir.path().to_path_buf());
+        let left = index.add_dir(0, "left", model::Tier::Normal, 0);
+        let right = index.add_dir(0, "right", model::Tier::Normal, 0);
+        index.add_file(left, "temporary.txt", model::Tier::Normal);
+        let temporary_slot = index.child_slot(left, "temporary.txt").unwrap();
+        index.add_file(left, "sentinel.txt", model::Tier::Normal);
+        let high_water = index.slot_len();
+
+        assert!(index.remove_child(left, "temporary.txt"));
+        assert!(!index
+            .overlay_entry_slots()
+            .any(|slot| slot == temporary_slot));
+
+        index.add_file(right, "replacement.txt", model::Tier::Normal);
+        assert_eq!(
+            index.child_slot(right, "replacement.txt"),
+            Some(temporary_slot)
+        );
+        assert!(!index.has_child(left, "replacement.txt"));
+        assert_eq!(index.slot_len(), high_water);
+        assert_eq!(
+            index.overlay_entry_slots().count(),
+            index.len(),
+            "an overlay-only index must expose every live Item exactly once"
+        );
+
+        for iteration in 0..10_000 {
+            let name = format!("churn-{iteration}.tmp");
+            index.add_file(left, &name, model::Tier::Normal);
+            assert!(index.remove_child(left, &name));
+        }
+        assert_eq!(index.slot_len(), high_water);
+    }
+
+    #[test]
+    fn overlay_directory_churn_reuses_nodes_with_the_new_parent() {
+        let dir = TempDir::new();
+        let mut index = IndexData::new(dir.path().to_path_buf());
+        let left = index.add_dir(0, "left", model::Tier::Normal, 0);
+        let right = index.add_dir(0, "right", model::Tier::Normal, 0);
+        let removed = index.add_dir(left, "removed", model::Tier::Normal, 0);
+        let _sentinel = index.add_dir(left, "sentinel", model::Tier::Normal, 0);
+        let node_high_water = index.node_len();
+
+        assert!(index.remove_child(left, "removed"));
+        let replacement = index.add_dir(right, "replacement", model::Tier::Normal, 0);
+
+        assert_eq!(replacement, removed);
+        assert_eq!(index.node(replacement).unwrap().parent, right);
+        assert_eq!(index.node_len(), node_high_water);
+        assert!(index.child_dir(left, "replacement").is_none());
+        assert_eq!(index.child_dir(right, "replacement"), Some(replacement));
+    }
+
+    #[test]
     fn persistence_round_trip() {
         let dir = TempDir::new();
         build_sample_tree(dir.path());
@@ -1626,8 +1679,15 @@ mod tests {
         persist::save(&shared, &mapped_dir.path().join("watcher-v4.idx"))
             .expect("start watcher from mapped v4 base");
         let (start_tx, start_rx) = mpsc::channel();
-        let ready =
-            watcher::spawn_deferred(shared.clone(), root.clone(), junk, None, None, start_rx);
+        let ready = watcher::spawn_deferred(
+            shared.clone(),
+            root.clone(),
+            None,
+            junk,
+            None,
+            None,
+            start_rx,
+        );
         ready
             .recv_timeout(Duration::from_secs(5))
             .expect("FSEvents watcher did not become ready");

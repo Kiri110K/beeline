@@ -100,8 +100,29 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `status-report` — rank 8; worst first-useful p95 32,33 мс, worst final p95
   372,91 мс, peak physical footprint 89 048 264 bytes. Eager shared dense path
   masks отдельно проверены и отвергнуты как регрессия; остаются lazy shard-local.
-  Exact-build foreground visual recheck поставлен на паузу по просьбе Кирилла;
-  hidden/non-frontmost WKWebView нельзя использовать для paint timing.
+  Foreground recheck exact build затем завершён: `skills-drafts` и Graphify
+  methodology были rank 1, датированный `status-report` — rank 8. First useful
+  paint: 18 мс для `skills`, 56 мс для `vault methodology` после пустой Working
+  Set волны в 20 мс и 13 мс для `status report`. Stale rows, duplicate paths и
+  неверного target ordering не обнаружено. Broad final для двух последних
+  запросов не успел завершиться в окне наблюдения, что совпало с headless tail.
+- Этот foreground pass нашёл long-session деградацию: global retrieval добавлял
+  весь исторический high-water mutable overlay, включая tombstones. В живом
+  процессе `skills` получил 1 901 798 candidates вместо примерно 346k после
+  свежего reconcile. Overlay теперь отдаёт search только live slots, повторно
+  использует освобождённые Item/directory holes, удаляет старую parent membership
+  и обрезает удалённый хвост. App-data subtree самой Beeline исключён из watcher,
+  поэтому telemetry/journal writes больше не подают события обратно в индекс.
+  Регрессии покрывают churn, reuse, смену parent и live-slot iterator.
+- После фикса reconciled overlay содержал 335 015 slots. В 30/30 targeted
+  observations все цели найдены: `work wip` rank 1, `vault methodology` rank 5
+  в headless empty-memory state, status workbook rank 8. Candidate pools — 369k
+  и около 503k, а не 1,9M; first-useful p95 — 0,59/3,79/0,99 мс, final p95 —
+  198,32/211,09/420,74 мс. Обновлённый signed bundle установлен и тихо запущен
+  с `--hidden`: 74,8 MiB settled physical footprint, 105,5 MiB startup peak,
+  окон нет. Полный Rust suite: 109 passed, 8 ignored; clippy `-D warnings` и все
+  frontend contract tests зелёные. Backup предыдущего приложения:
+  `/private/tmp/Beeline-before-overlay-fix.app`.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/

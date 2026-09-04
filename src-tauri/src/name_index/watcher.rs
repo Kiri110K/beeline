@@ -90,6 +90,12 @@ fn prepare_paths(root: &Path, changed: HashSet<PathBuf>) -> PreparedPaths {
     prepare_paths_with(root, changed, |path| fs::symlink_metadata(path).is_ok())
 }
 
+fn retain_external_paths(paths: &mut Vec<PathBuf>, ignored_subtree: Option<&Path>) {
+    if let Some(ignored) = ignored_subtree {
+        paths.retain(|path| !path.starts_with(ignored));
+    }
+}
+
 fn record(app: Option<&AppHandle>, event: &str, fields: serde_json::Value) {
     if let Some(app) = app {
         if let Err(error) = app.state::<Telemetry>().record(event, fields) {
@@ -104,39 +110,23 @@ fn record(app: Option<&AppHandle>, event: &str, fields: serde_json::Value) {
 pub fn spawn_deferred(
     shared: Arc<RwLock<IndexData>>,
     root: PathBuf,
+    ignored_subtree: Option<PathBuf>,
     junk: Arc<RwLock<Arc<JunkPatterns>>>,
     junk_refresh: Option<JunkRefresh>,
     app: Option<AppHandle>,
     start: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
-    spawn_inner(
-        shared,
-        root,
-        junk,
-        junk_refresh,
-        app,
-        Some(start),
-        Some(ready_tx),
-    );
-    ready_rx
-}
-
-fn spawn_inner(
-    shared: Arc<RwLock<IndexData>>,
-    root: PathBuf,
-    junk: Arc<RwLock<Arc<JunkPatterns>>>,
-    junk_refresh: Option<JunkRefresh>,
-    app: Option<AppHandle>,
-    start: Option<mpsc::Receiver<()>>,
-    ready: Option<mpsc::Sender<()>>,
-) {
     thread::spawn(move || {
         set_background_qos();
 
         let (tx, rx) = mpsc::channel();
-        let mut watcher = match recommended_watcher(move |result| {
-            if let Ok(event) = result {
+        let mut watcher = match recommended_watcher(move |result: notify::Result<notify::Event>| {
+            if let Ok(mut event) = result {
+                retain_external_paths(&mut event.paths, ignored_subtree.as_deref());
+                if event.paths.is_empty() {
+                    return;
+                }
                 let _ = tx.send(event);
             }
         }) {
@@ -150,10 +140,8 @@ fn spawn_inner(
             eprintln!("name index watch failed: {error}");
             return;
         }
-        if let Some(ready) = ready {
-            let _ = ready.send(());
-        }
-        if start.is_some_and(|start| start.recv().is_err()) {
+        let _ = ready_tx.send(());
+        if start.recv().is_err() {
             return;
         }
 
@@ -248,6 +236,7 @@ fn spawn_inner(
             }
         }
     });
+    ready_rx
 }
 
 #[cfg(test)]
@@ -285,5 +274,23 @@ mod tests {
         let prepared = prepare_paths_with(&root, changed, |_| true);
         assert_eq!(prepared.paths.len(), 3);
         assert_eq!(prepared.pruned_missing_descendants, 0);
+    }
+
+    #[test]
+    fn internal_app_data_is_filtered_without_hiding_siblings() {
+        let root = PathBuf::from("/Users/test");
+        let ignored = root.join("Library/Application Support/com.beeline.app");
+        let mut paths = vec![
+            ignored.join("telemetry.ndjson"),
+            ignored.join("settings.json"),
+            root.join("Library/Application Support/another-app/data.json"),
+            root.join("work/project/readme.md"),
+        ];
+
+        retain_external_paths(&mut paths, Some(&ignored));
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&root.join("Library/Application Support/another-app/data.json")));
+        assert!(paths.contains(&root.join("work/project/readme.md")));
     }
 }

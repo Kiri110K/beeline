@@ -412,12 +412,7 @@ fn measure(
                 return Err(format!("priority retrieval aborted for {}", case.id));
             }
             let mut priority_slots = seed.slots;
-            let overlay = query::ordered_tail_literal_slots(
-                index,
-                &case.query,
-                qgram.source_entries(),
-                Some(&cancel),
-            );
+            let overlay = query::ordered_tail_literal_slots(index, &case.query, Some(&cancel));
             if overlay.aborted {
                 return Err(format!("priority overlay scan aborted for {}", case.id));
             }
@@ -460,7 +455,7 @@ fn measure(
 
     let prepare_started = Instant::now();
     let mut candidate_slots = candidate_set.slots;
-    candidate_slots.extend((qgram.source_entries()..index.slot_len()).map(|slot| slot as u32));
+    candidate_slots.extend(index.overlay_entry_slots());
     candidate_slots.extend(working_slots.iter().copied());
     candidate_slots.sort_unstable();
     candidate_slots.dedup();

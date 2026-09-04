@@ -252,8 +252,39 @@ is not the next optimization.
 
 A later automation pass that deliberately avoided taking foreground focus is not a valid paint
 benchmark: WKWebView deferred its `requestAnimationFrame` callbacks until several minutes after
-the searches. It did confirm final visible rows and a 60 MiB settled physical footprint, but its
-paint timings are discarded. Foreground visual revalidation of this exact build remains pending.
+the searches. Its paint timings are discarded.
+
+A foreground pass on the exact ordered-tail build then confirmed the intended visible ordering:
+`skills-drafts` was rank 1, the Graphify methodology Item was rank 1 for
+`vault methodology`, and the dated status-report workbook was rank 8. The first non-empty
+Working Set paint was 18 ms for `skills`; `vault methodology` painted its empty Working Set at
+20 ms and its useful priority wave at 56 ms; `status report` painted ten useful Working Set rows
+at 13 ms. No stale rows, duplicate exact paths, or incorrect target ordering appeared. Broad
+completion still exceeded the observation window for the latter two queries, consistent with
+the headless final-tail measurements.
+
+That pass also exposed a long-session overlay defect. One completed `skills` search prepared
+1,901,798 candidates even though a freshly reconciled session needed roughly 346k. Search was
+supplementing the immutable q-gram base with every overlay slot below its historical high-water
+mark, including removed build artifacts. Repeated filesystem churn also kept appending new slots
+and stale per-parent references. The watcher included Beeline's own app-data directory, so
+telemetry and journal writes generated needless filesystem batches while the whole home was
+watched.
+
+The mutable overlay now exposes only live slots to both priority and global retrieval, reuses
+removed Item and directory holes, removes stale parent membership, and trims removed tails.
+Beeline's app-data subtree is excluded at the watcher callback, preventing internal persistence
+from feeding the index. Churn regressions cover slot reuse, directory-node reuse, parent
+correctness, and the live-slot iterator.
+
+A post-fix reconciled run contained 335,015 overlay slots. Across 30 targeted observations,
+the three labeled targets were found every time: `work wip` rank 1,
+`vault methodology` rank 5 in the headless empty-memory state, and the status-report workbook
+rank 8. Candidate pools were 369,177 for `work wip` and about 503k for both broad multi-token
+queries, rather than the 1.9M long-session pool. First-useful p95 was 0.59, 3.79, and 0.99 ms;
+final p95 was 198.32, 211.09, and 420.74 ms respectively. In the newly installed hidden bundle,
+physical footprint settled at 74.8 MiB after startup, with a 105.5 MiB startup peak. The app
+remained hidden with no windows during this verification.
 
 ## Known limits
 
