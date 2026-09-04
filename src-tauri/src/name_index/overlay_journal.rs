@@ -3,7 +3,8 @@
 //! The mapped v4 base stays immutable. Filesystem event paths append here before the
 //! corresponding in-memory update. On the next launch Beeline re-stats those paths and
 //! reconstructs the overlay, then the normal bounded diff-rescan closes any crash window.
-//! A successful reconciliation resets the journal before queued watcher events are released.
+//! Records stay until a new full base snapshot subsumes them; ordinary restarts replay the
+//! same bounded set and append only paths not already represented.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -124,8 +125,16 @@ impl OverlayJournal {
             .collect())
     }
 
-    /// Called only after startup replay and diff-rescan complete, while the watcher is still
-    /// queueing new events. Those events append after the watcher start gate opens.
+    pub fn retained_paths(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.seen.len())
+            .unwrap_or(MAX_UNIQUE_PATHS)
+    }
+
+    /// A newly written full base already contains every earlier delta. Ordinary mapped-base
+    /// startups must retain the journal across sessions.
     pub fn reset(&self) -> io::Result<()> {
         let mut state = self
             .inner
@@ -209,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_unique_relative_paths_and_resets() {
+    fn persists_unique_relative_paths_and_only_explicitly_resets() {
         let dir = temp_dir();
         let root = dir.join("home");
         fs::create_dir(&root).expect("root");
@@ -236,8 +245,15 @@ mod tests {
                 .count(),
             2
         );
-        journal.reset().expect("reset");
-        assert!(journal.replay_paths().expect("empty").is_empty());
+        drop(journal);
+        let reloaded = OverlayJournal::load(&dir, &root).expect("reload");
+        assert_eq!(reloaded.retained_paths(), 2);
+        assert_eq!(
+            reloaded.replay_paths().expect("replay after restart"),
+            vec![root.join("work/a.txt"), root.join("work/b.txt")]
+        );
+        reloaded.reset().expect("explicit base checkpoint reset");
+        assert!(reloaded.replay_paths().expect("empty").is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

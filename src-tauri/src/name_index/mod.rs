@@ -262,23 +262,18 @@ impl NameIndex {
                     }
                     crawl::diff_rescan(&data, root.clone(), &crawl_junk, Some(&app));
                     let index = data.read().expect("name index lock poisoned");
-                    // Keep the startup delta in the mutable overlay for this session. A
-                    // full 5M-entry rewrite makes the old mmap and the growing temp file
-                    // resident together; repeating the now-subsecond diff next launch is
-                    // safer until v4 gains bounded incremental compaction.
+                    // The immutable base remains mapped; the append-only path journal is
+                    // the persistent overlay checkpoint. A full 5M-entry rewrite would make
+                    // the old mmap and growing temp file resident together.
                     record(
                         &app,
-                        "index_persist_deferred",
-                        json!({ "entries": index.len(), "mutations": index.revision }),
+                        "index_overlay_checkpointed",
+                        json!({
+                            "entries": index.len(),
+                            "mutations": index.revision,
+                            "retained_paths": overlay_journal.retained_paths(),
+                        }),
                     );
-                    drop(index);
-                    if let Err(error) = overlay_journal.reset() {
-                        record(
-                            &app,
-                            "index_overlay_journal_failed",
-                            json!({ "phase": "reset", "error": error.to_string() }),
-                        );
-                    }
                 } else {
                     crawl::initial_crawl(&data, root.clone(), &crawl_junk, Some(&app));
                     let persist_started = Instant::now();
