@@ -96,6 +96,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   противоречащий deferred-persistence пути. Initial crawl по-прежнему сохраняет
   base и затем строит sidecar; последующие session deltas восстанавливаются
   быстрым diff-rescan до появления bounded incremental compaction.
+- Signed bundle с live control и trace v2 установлен в `/Applications/Beeline.app`.
+  UI-pass через настоящий global shortcut прошёл: `метолология` показал
+  `МЕТОДОЛОГИЯ.md` rank 2, `ьуерщвщдщпн` дал methodology results с rank 1,
+  `work wip` дал `/Users/kiri110k/work/wip` rank 1, финальное окно скрыто.
+  Свежий trace содержал 3 result snapshots / 381 ranked Items; установленный CLI
+  replay подтвердил его без расхождений и missing snapshots. Live apply вернул
+  `reloadConfirmed: true` и точный active fingerprint. После одноразового rebuild
+  sidecar занял 554,315,648 bytes; следующий restart загрузил его без helper,
+  search prewarm занял 16 ms, diff-rescan 385 ms, hidden footprint 51 MiB.
+  Backup до exit-fix: `/private/tmp/Beeline-before-qgram-exit-fix-20260905.app`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
