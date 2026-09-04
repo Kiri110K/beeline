@@ -27,6 +27,7 @@ const SKIP_STRIDE: usize = 64;
 const SKIP_RECORD_BYTES: usize = 8;
 const BUILD_SHARDS: usize = 64;
 const BUILD_SHARD_BUCKETS: usize = BUCKETS / BUILD_SHARDS;
+const BUILD_SHARD_BUFFER_BYTES: usize = 64 * 1024;
 const ENCODED_POSTING_SLOTS: usize = 256 * 1024;
 
 #[derive(Debug)]
@@ -71,7 +72,7 @@ struct BuildShardWriter {
 impl BuildShardWriter {
     fn create(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            writer: BufWriter::new(File::create(path)?),
+            writer: BufWriter::with_capacity(BUILD_SHARD_BUFFER_BYTES, File::create(path)?),
             previous_slot: 0,
         })
     }
