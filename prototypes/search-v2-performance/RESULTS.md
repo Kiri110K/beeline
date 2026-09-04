@@ -436,6 +436,23 @@ total p95, 10.48 ms verify/rank p95, and nearly identical instruction and cycle 
 kept `/Users/kiri110k/work/wip` first, one top-10 fingerprint, and zero target misses. The explicit
 path case is now part of `queries.tsv`, closing a gap in the standard suite.
 
+## Name-first implicit multi-token verification — 2026-09-05
+
+Ordinary multi-token matching requires at least one query token to fuzzy-match the Item name. The
+old verifier nevertheless prepared the ancestor chain before proving that condition. It now finds
+and retains the first name-token quality, rejects a candidate immediately if no token matches, and
+only then asks the per-parent cache for ancestors. Implicit Path Interpretation also verifies its
+final name token before requesting ancestors. Passing candidates reuse the retained first quality;
+the rank calculation and candidate set are unchanged.
+
+On the expanded 11-case suite, the same-seed process fell from 32.50 to 19.80 seconds, 39.1% less
+wall time. User CPU fell 47.1%, retired instructions 52.5%, and cycles 47.1%. Final-stage p95 fell
+54.1% for `work wip`, 37.6% for `vault methodology`, and 55.7% for `status report`. A different-seed
+repeat finished in 19.40 seconds and held those p95 values at 46.03, 32.85, and 51.05 ms. Both runs
+preserved every final hit and top-10 fingerprint with zero target misses. Peak physical footprint
+was unchanged within noise at 69.97 MiB versus 69.27 MiB. Single-token timings moved in both
+directions because this change does not execute on their code path.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive

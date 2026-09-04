@@ -1256,15 +1256,6 @@ fn score_fuzzy_entry(
     // interpretation.
     lower_into(item.entry.name, &mut fuzzy_scratch.name_lower);
     let name_lower = fuzzy_scratch.name_lower.as_str();
-    // The direct query, its ordered Path Interpretation, and every layout variant all
-    // inspect the same directory chain. Lowercase that chain once per Item.
-    let ancestors = if !prep.path_shaped && prep.tokens.len() > 1 {
-        fuzzy_scratch
-            .ancestors
-            .lower_names(index, item.entry.parent)
-    } else {
-        &[]
-    };
     let (quality, corrected, path_scope) = if prep.path_shaped {
         let (last, parents) = prep.segments.split_last()?;
         let final_quality = fuzzy_lower_name_quality(
@@ -1292,36 +1283,44 @@ fn score_fuzzy_entry(
         (quality, false, true)
     } else if prep.tokens.len() > 1 {
         let mut best = fuzzy_token_set(
+            index,
+            item.entry.parent,
             name_lower,
             &prep.tokens,
-            ancestors,
             short_fuzzy,
+            &mut fuzzy_scratch.ancestors,
             &mut fuzzy_scratch.edit,
             &prep.text,
         );
         best = best.max(fuzzy_path_interpretation(
+            index,
+            item.entry.parent,
             name_lower,
             &prep.tokens,
-            ancestors,
             short_fuzzy,
+            &mut fuzzy_scratch.ancestors,
             &mut fuzzy_scratch.edit,
             &prep.text,
         ));
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
             let mut candidate = fuzzy_token_set(
+                index,
+                item.entry.parent,
                 name_lower,
                 tokens,
-                ancestors,
                 short_fuzzy,
+                &mut fuzzy_scratch.ancestors,
                 &mut fuzzy_scratch.edit,
                 &prep.text,
             );
             candidate = candidate.max(fuzzy_path_interpretation(
+                index,
+                item.entry.parent,
                 name_lower,
                 tokens,
-                ancestors,
                 short_fuzzy,
+                &mut fuzzy_scratch.ancestors,
                 &mut fuzzy_scratch.edit,
                 &prep.text,
             ));
@@ -1376,22 +1375,34 @@ fn score_fuzzy_entry(
     Some((score, path_str, text_evidence))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fuzzy_token_set(
+    index: &IndexData,
+    parent: DirId,
     name_lower: &str,
     tokens: &[String],
-    ancestors: &[String],
     short_fuzzy: bool,
+    ancestor_scratch: &mut AncestorScratch,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
 ) -> Option<MatchQuality> {
+    // Ordinary multi-token matching requires at least one name token. Find and retain that
+    // proof before touching the directory chain so q-gram false positives stop here.
+    let (name_index, name_quality) = tokens.iter().enumerate().find_map(|(index, token)| {
+        fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, weights)
+            .map(|quality| (index, quality))
+    })?;
+    let ancestors = ancestor_scratch.lower_names(index, parent);
     let mut weakest: Option<MatchQuality> = None;
-    let mut name_match = false;
-    for token in tokens {
+    for (token_index, token) in tokens.iter().enumerate() {
+        if token_index == name_index {
+            weakest = Some(weakest.map_or(name_quality, |current| current.min(name_quality)));
+            continue;
+        }
         if let Some(quality) =
             fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, weights)
         {
             weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
-            name_match = true;
             continue;
         }
         let quality = ancestors
@@ -1403,24 +1414,24 @@ fn fuzzy_token_set(
         let quality = quality.cap_as_path(weights);
         weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
     }
-    if name_match {
-        weakest
-    } else {
-        None
-    }
+    weakest
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fuzzy_path_interpretation(
+    index: &IndexData,
+    parent: DirId,
     name_lower: &str,
     tokens: &[String],
-    ancestors: &[String],
     short_fuzzy: bool,
+    ancestor_scratch: &mut AncestorScratch,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
 ) -> Option<MatchQuality> {
     let (last, parents) = tokens.split_last()?;
     let final_quality =
         fuzzy_lower_name_quality(name_lower, last, short_fuzzy, edit_scratch, weights)?;
+    let ancestors = ancestor_scratch.lower_names(index, parent);
     fuzzy_path_from_final(
         final_quality,
         parents,
