@@ -400,6 +400,21 @@ to that code path. Both runs preserved every final hit and top-10 fingerprint wi
 misses. Peak physical footprint stayed within noise: 64.25 MiB versus 63.83 MiB in the same-seed
 pair and 67.83 MiB versus 68.58 MiB in the repeat pair.
 
+## Cached fuzzy parent chain — 2026-09-05
+
+Q-gram candidate slots are sorted, so adjacent candidates often share one parent directory. The
+per-worker ancestor scratch now remembers which `DirId` it contains and returns the existing slice
+when the next candidate has the same parent. The Name Index stays read-locked for the search, so the
+cached names cannot change underneath the verifier.
+
+The same-seed suite fell from 33.20 to 30.60 seconds, 7.8% less wall time. User CPU fell 10.6%,
+retired instructions 6.7%, and cycles 10.5%. Path-heavy final-stage p95 improved by 2.7% to 10.1%.
+The paired-seed repeat fell from 33.60 to 31.30 seconds, with the three path-heavy p95 values 6.8%
+to 7.4% lower. Small single-token movements again changed sign between runs. Both runs preserved
+every final hit and top-10 fingerprint with zero target misses. Peak physical footprint remained
+noise-bound: 66.81 MiB versus 64.25 MiB in the same-seed pair and 67.74 MiB versus 67.83 MiB in the
+repeat pair.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive

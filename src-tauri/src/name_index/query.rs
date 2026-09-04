@@ -1526,6 +1526,7 @@ struct FuzzyScratch {
 
 #[derive(Default)]
 struct AncestorScratch {
+    prepared_dir: Option<DirId>,
     dirs: Vec<DirId>,
     names: Vec<String>,
 }
@@ -1534,6 +1535,10 @@ impl AncestorScratch {
     /// Return lowercase component names from the root down to `dir`, retaining every backing
     /// allocation for the worker's next candidate.
     fn lower_names(&mut self, index: &IndexData, mut dir: DirId) -> &[String] {
+        if self.prepared_dir == Some(dir) {
+            return &self.names[..self.dirs.len()];
+        }
+        self.prepared_dir = Some(dir);
         self.dirs.clear();
         while dir != 0 {
             self.dirs.push(dir);
