@@ -44,6 +44,9 @@ const PATH_FUZZY_PAR_THRESHOLD: usize = 20_000;
 /// reference 10-core machine measures 8 workers consistently faster than 10 on its live 5M
 /// index. Smaller machines still use every available core.
 const MAX_SEARCH_SHARDS: usize = 8;
+/// Q-gram candidate verification touches a narrower slot set than a cold full scan and can
+/// profit from both performance cores without increasing the full-scan memory fan-out.
+const MAX_PATH_FUZZY_SHARDS: usize = 10;
 /// Name-only fuzzy verification has no per-shard directory-mask allocation, so it can use
 /// every core on the reference 10-core Mac to reduce time to the first completed wave.
 const MAX_NAME_FUZZY_SHARDS: usize = 10;
@@ -1153,7 +1156,7 @@ fn resolve_fuzzy_shards(slots: usize, uses_path_masks: bool) -> usize {
         return 1;
     }
     let maximum = if uses_path_masks {
-        MAX_SEARCH_SHARDS
+        MAX_PATH_FUZZY_SHARDS
     } else {
         MAX_NAME_FUZZY_SHARDS
     };
@@ -3592,7 +3595,7 @@ mod tests {
         let expected = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1)
-            .clamp(1, super::MAX_SEARCH_SHARDS);
+            .clamp(1, super::MAX_PATH_FUZZY_SHARDS);
         assert_eq!(
             super::resolve_fuzzy_shards(super::PATH_FUZZY_PAR_THRESHOLD, true),
             expected
