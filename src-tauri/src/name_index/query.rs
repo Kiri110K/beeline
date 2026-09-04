@@ -1276,40 +1276,26 @@ fn score_fuzzy_entry(
         )?;
         (quality, false, true)
     } else if prep.tokens.len() > 1 {
-        let mut best = fuzzy_token_set(
+        let mut best = fuzzy_multi_interpretation(
             name_lower,
             &prep.tokens,
             ancestors,
             short_fuzzy,
+            &mut fuzzy_scratch.name_qualities,
             &mut fuzzy_scratch.edit,
             &prep.text,
         );
-        best = best.max(fuzzy_path_interpretation(
-            name_lower,
-            &prep.tokens,
-            ancestors,
-            short_fuzzy,
-            &mut fuzzy_scratch.edit,
-            &prep.text,
-        ));
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
-            let mut candidate = fuzzy_token_set(
+            let candidate = fuzzy_multi_interpretation(
                 name_lower,
                 tokens,
                 ancestors,
                 short_fuzzy,
+                &mut fuzzy_scratch.name_qualities,
                 &mut fuzzy_scratch.edit,
                 &prep.text,
             );
-            candidate = candidate.max(fuzzy_path_interpretation(
-                name_lower,
-                tokens,
-                ancestors,
-                short_fuzzy,
-                &mut fuzzy_scratch.edit,
-                &prep.text,
-            ));
             if candidate > best {
                 best = candidate;
                 corrected = true;
@@ -1361,9 +1347,53 @@ fn score_fuzzy_entry(
     Some((score, path_str, text_evidence))
 }
 
-fn fuzzy_token_set(
+fn fuzzy_multi_interpretation(
     name_lower: &str,
     tokens: &[String],
+    ancestors: &[String],
+    short_fuzzy: bool,
+    name_qualities: &mut Vec<Option<MatchQuality>>,
+    edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
+) -> Option<MatchQuality> {
+    name_qualities.clear();
+    for token in tokens {
+        name_qualities.push(fuzzy_lower_name_quality(
+            name_lower,
+            token,
+            short_fuzzy,
+            edit_scratch,
+            weights,
+        ));
+    }
+    fuzzy_token_set(
+        tokens,
+        name_qualities,
+        ancestors,
+        short_fuzzy,
+        edit_scratch,
+        weights,
+    )
+    .max(
+        tokens
+            .split_last()
+            .zip(name_qualities.last().copied().flatten())
+            .and_then(|((_, parents), final_quality)| {
+                fuzzy_path_from_final(
+                    final_quality,
+                    parents,
+                    ancestors,
+                    short_fuzzy,
+                    edit_scratch,
+                    weights,
+                )
+            }),
+    )
+}
+
+fn fuzzy_token_set(
+    tokens: &[String],
+    name_qualities: &[Option<MatchQuality>],
     ancestors: &[String],
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
@@ -1371,10 +1401,8 @@ fn fuzzy_token_set(
 ) -> Option<MatchQuality> {
     let mut weakest: Option<MatchQuality> = None;
     let mut name_match = false;
-    for token in tokens {
-        if let Some(quality) =
-            fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, weights)
-        {
+    for (token, &name_quality) in tokens.iter().zip(name_qualities) {
+        if let Some(quality) = name_quality {
             weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
             name_match = true;
             continue;
@@ -1406,6 +1434,24 @@ fn fuzzy_path_interpretation(
     let (last, parents) = tokens.split_last()?;
     let final_quality =
         fuzzy_lower_name_quality(name_lower, last, short_fuzzy, edit_scratch, weights)?;
+    fuzzy_path_from_final(
+        final_quality,
+        parents,
+        ancestors,
+        short_fuzzy,
+        edit_scratch,
+        weights,
+    )
+}
+
+fn fuzzy_path_from_final(
+    final_quality: MatchQuality,
+    parents: &[String],
+    ancestors: &[String],
+    short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
+) -> Option<MatchQuality> {
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
     for token in parents.iter().rev() {
@@ -1520,6 +1566,7 @@ struct EditScratch {
 #[derive(Default)]
 struct FuzzyScratch {
     name_lower: String,
+    name_qualities: Vec<Option<MatchQuality>>,
     edit: EditScratch,
     ancestors: AncestorScratch,
 }
