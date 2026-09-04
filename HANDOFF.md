@@ -106,6 +106,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   sidecar занял 554,315,648 bytes; следующий restart загрузил его без helper,
   search prewarm занял 16 ms, diff-rescan 385 ms, hidden footprint 51 MiB.
   Backup до exit-fix: `/private/tmp/Beeline-before-qgram-exit-fix-20260905.app`.
+- Bounded overlay persistence (#40) получил append-only path journal. Watcher
+  сначала flush-ит relative paths, затем меняет in-memory overlay; partial и
+  obsolete alpha records при replay игнорируются. Startup поверх неизменного
+  mmap base re-stat/replay-ит уникальные пути, обычный diff-rescan закрывает окно
+  crash/missed event, после чего journal обнуляется до открытия watcher
+  start gate. При 64 MiB он уплотняется до уникальных путей через temp+fsync+
+  rename. Тест crash-replay покрывает add, remove, rename и file→directory с
+  descendant; полный checkpoint — 132 Rust passed / 9 ignored и clippy green.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

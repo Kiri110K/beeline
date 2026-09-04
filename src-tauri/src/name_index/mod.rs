@@ -13,6 +13,7 @@ mod crawl;
 mod junk;
 mod junk_refresh;
 mod model;
+mod overlay_journal;
 mod persist;
 mod qgram;
 mod query;
@@ -43,6 +44,7 @@ use alias::AliasDictionary;
 use junk::JunkPatterns;
 use junk_refresh::JunkRefresh;
 use model::{IndexData, Tier};
+use overlay_journal::OverlayJournal;
 use qgram::QGramIndex;
 use query::{RankContext, RetrievalSignals, RetrievalSource, SearchHit};
 use ranker_config::RankerConfig;
@@ -167,6 +169,8 @@ impl NameIndex {
         let data = Arc::new(RwLock::new(
             loaded.unwrap_or_else(|| IndexData::new(root.clone())),
         ));
+        let overlay_journal = OverlayJournal::load(&app_data_dir, &root)
+            .map_err(|error| format!("failed to load Name Index overlay journal: {error}"))?;
         let qgrams: SharedQGrams = Arc::new(RwLock::new(None));
         if had_persisted {
             load_or_build_qgrams(
@@ -206,8 +210,11 @@ impl NameIndex {
             root.clone(),
             Some(app_data_dir.clone()),
             junk.clone(),
-            Some(junk_refresh.clone()),
-            Some(app.clone()),
+            watcher::SideEffects {
+                junk_refresh: Some(junk_refresh.clone()),
+                journal: Some(overlay_journal.clone()),
+                app: Some(app.clone()),
+            },
             watcher_start_rx,
         );
 
@@ -219,6 +226,7 @@ impl NameIndex {
             let index_file = index_file.clone();
             let qgram_file = qgram_file.clone();
             let qgrams = qgrams.clone();
+            let overlay_journal = overlay_journal.clone();
             thread::spawn(move || {
                 crawl::set_crawl_qos();
                 // The watcher is registered before the crawl begins, so changes made during
@@ -227,6 +235,31 @@ impl NameIndex {
                 if had_persisted {
                     let entries = data.read().expect("name index lock poisoned").len();
                     record(&app, "index_loaded", json!({ "entries": entries }));
+                    let replay_started = Instant::now();
+                    match overlay_journal.replay_paths() {
+                        Ok(paths) => {
+                            let queued_paths = paths.len();
+                            let (applied_paths, added, removed) =
+                                watcher::replay_paths(&data, &root, &crawl_junk, paths);
+                            record(
+                                &app,
+                                "index_overlay_replayed",
+                                json!({
+                                    "queued_paths": queued_paths,
+                                    "applied_paths": applied_paths,
+                                    "added_slots": added,
+                                    "removed_slots": removed,
+                                    "duration_ms": u64::try_from(replay_started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                }),
+                            );
+                        }
+                        Err(error) => record(
+                            &app,
+                            "index_overlay_journal_failed",
+                            json!({ "phase": "replay", "error": error.to_string() }),
+                        ),
+                    }
                     crawl::diff_rescan(&data, root.clone(), &crawl_junk, Some(&app));
                     let index = data.read().expect("name index lock poisoned");
                     // Keep the startup delta in the mutable overlay for this session. A
@@ -238,6 +271,14 @@ impl NameIndex {
                         "index_persist_deferred",
                         json!({ "entries": index.len(), "mutations": index.revision }),
                     );
+                    drop(index);
+                    if let Err(error) = overlay_journal.reset() {
+                        record(
+                            &app,
+                            "index_overlay_journal_failed",
+                            json!({ "phase": "reset", "error": error.to_string() }),
+                        );
+                    }
                 } else {
                     crawl::initial_crawl(&data, root.clone(), &crawl_junk, Some(&app));
                     let persist_started = Instant::now();
@@ -269,6 +310,13 @@ impl NameIndex {
                         qgrams,
                         app.clone(),
                     );
+                    if let Err(error) = overlay_journal.reset() {
+                        record(
+                            &app,
+                            "index_overlay_journal_failed",
+                            json!({ "phase": "reset", "error": error.to_string() }),
+                        );
+                    }
                 }
                 // Applying FSEvents concurrently with the first crawl can discover the same
                 // large subtree twice, hold the write lock for minutes, and starve the first
@@ -1754,6 +1802,60 @@ mod tests {
     }
 
     #[test]
+    fn overlay_journal_replays_add_remove_rename_and_type_change() {
+        let root = TempDir::new();
+        let state = TempDir::new();
+        touch(&root.path().join("old.txt"));
+        touch(&root.path().join("gone.txt"));
+        touch(&root.path().join("changing"));
+        let junk = JunkPatterns::default();
+        let base = new_index(root.path());
+        crawl::initial_crawl(&base, root.path().to_path_buf(), &junk, None);
+        let index_path = state.path().join("base.idx");
+        persist::save(&base, &index_path).expect("persist base");
+
+        let old = root.path().join("old.txt");
+        let renamed = root.path().join("renamed.txt");
+        fs::rename(&old, &renamed).expect("rename");
+        let gone = root.path().join("gone.txt");
+        fs::remove_file(&gone).expect("remove");
+        let changing = root.path().join("changing");
+        fs::remove_file(&changing).expect("remove old type");
+        fs::create_dir(&changing).expect("create replacement directory");
+        touch(&changing.join("child.txt"));
+        let added = root.path().join("added.txt");
+        touch(&added);
+
+        let journal = OverlayJournal::load(state.path(), root.path()).expect("journal");
+        journal
+            .record_paths([
+                old.as_path(),
+                renamed.as_path(),
+                gone.as_path(),
+                changing.as_path(),
+                added.as_path(),
+            ])
+            .expect("record crash-safe delta");
+
+        let loaded = persist::load(&index_path, root.path()).expect("reload base");
+        let restored = Arc::new(RwLock::new(loaded));
+        let paths = journal.replay_paths().expect("read delta");
+        let (applied, added_count, removed_count) =
+            watcher::replay_paths(&restored, root.path(), &junk, paths);
+        assert_eq!(applied, 5);
+        assert!(added_count >= 4);
+        assert!(removed_count >= 3);
+
+        let index = restored.read().unwrap();
+        assert!(!index.has_child(0, "old.txt"));
+        assert!(!index.has_child(0, "gone.txt"));
+        assert!(index.has_child(0, "renamed.txt"));
+        assert!(index.has_child(0, "added.txt"));
+        let changing_dir = index.resolve_dir(&changing).expect("changed to directory");
+        assert!(index.has_child(changing_dir, "child.txt"));
+    }
+
+    #[test]
     fn removing_a_mapped_directory_unlinks_its_node_tree() {
         let dir = TempDir::new();
         let file = dir.path().join("mapped-removal.idx");
@@ -2016,8 +2118,7 @@ mod tests {
             root.clone(),
             None,
             junk,
-            None,
-            None,
+            watcher::SideEffects::default(),
             start_rx,
         );
         ready

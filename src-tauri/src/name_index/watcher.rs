@@ -26,6 +26,7 @@ use crate::{
         junk::JunkPatterns,
         junk_refresh::JunkRefresh,
         model::{IndexData, Tier},
+        overlay_journal::OverlayJournal,
     },
     telemetry::Telemetry,
 };
@@ -38,6 +39,14 @@ struct PreparedPaths {
     paths: Vec<PathBuf>,
     pruned_missing_descendants: usize,
     outside_root: usize,
+}
+
+struct AppliedPaths {
+    applied_paths: usize,
+    pruned_indexed_descendants: usize,
+    added: usize,
+    removed: usize,
+    saw_junk: bool,
 }
 
 fn prepare_paths_with(
@@ -104,6 +113,13 @@ fn record(app: Option<&AppHandle>, event: &str, fields: serde_json::Value) {
     }
 }
 
+#[derive(Default)]
+pub struct SideEffects {
+    pub junk_refresh: Option<JunkRefresh>,
+    pub journal: Option<OverlayJournal>,
+    pub app: Option<AppHandle>,
+}
+
 /// Register the recursive watcher immediately, but defer applying its queued events until
 /// startup has produced the mapped base. This closes the crawl/watch race without letting a
 /// large event subtree compete with the initial crawl for the index write lock.
@@ -112,8 +128,7 @@ pub fn spawn_deferred(
     root: PathBuf,
     ignored_subtree: Option<PathBuf>,
     junk: Arc<RwLock<Arc<JunkPatterns>>>,
-    junk_refresh: Option<JunkRefresh>,
-    app: Option<AppHandle>,
+    effects: SideEffects,
     start: mpsc::Receiver<()>,
 ) -> mpsc::Receiver<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -177,66 +192,106 @@ pub fn spawn_deferred(
             let unique_paths = changed.len();
             let prepared = prepare_paths(&root, changed);
             let patterns = junk.read().expect("junk lock poisoned").clone();
-            let mut saw_junk = false;
-            let started = Instant::now();
-            let mut applied_paths = 0usize;
-            let mut indexed_subtrees = HashSet::new();
-            let mut pruned_indexed_descendants = 0usize;
-            let mut added = 0usize;
-            let mut removed = 0usize;
-            for path in prepared.paths {
-                if path
-                    .ancestors()
-                    .skip(1)
-                    .any(|ancestor| indexed_subtrees.contains(ancestor))
+            if let Some(journal) = &effects.journal {
+                if let Err(error) =
+                    journal.record_paths(prepared.paths.iter().map(PathBuf::as_path))
                 {
-                    pruned_indexed_descendants += 1;
-                    continue;
+                    record(
+                        effects.app.as_ref(),
+                        "index_overlay_journal_failed",
+                        json!({ "phase": "append", "error": error.to_string() }),
+                    );
                 }
-                if let Ok(relative) = path.strip_prefix(&root) {
-                    saw_junk |= patterns.classify(relative) == Tier::Junk;
-                }
-                let mut index = shared.write().expect("name index lock poisoned");
-                let stats = apply_fs_event(&mut index, &path, &patterns);
-                applied_paths += 1;
-                if stats.indexed_subtree {
-                    indexed_subtrees.insert(path);
-                }
-                added += stats.added;
-                removed += stats.removed;
             }
+            let started = Instant::now();
+            let pruned_missing_descendants = prepared.pruned_missing_descendants;
+            let outside_root = prepared.outside_root;
+            let applied = apply_prepared_paths(&shared, &root, &patterns, prepared);
             let duration = started.elapsed();
             if duration >= TELEMETRY_MIN_DURATION
                 || received_paths >= 16
-                || prepared.pruned_missing_descendants > 0
+                || pruned_missing_descendants > 0
             {
                 record(
-                    app.as_ref(),
+                    effects.app.as_ref(),
                     "index_fs_batch_finished",
                     json!({
                         "received_paths": received_paths,
                         "unique_paths": unique_paths,
-                        "applied_paths": applied_paths,
+                        "applied_paths": applied.applied_paths,
                         "deduplicated_paths": received_paths.saturating_sub(unique_paths),
-                        "pruned_missing_descendants": prepared.pruned_missing_descendants,
-                        "pruned_indexed_descendants": pruned_indexed_descendants,
-                        "outside_root": prepared.outside_root,
-                        "added_slots": added,
-                        "removed_slots": removed,
+                        "pruned_missing_descendants": pruned_missing_descendants,
+                        "pruned_indexed_descendants": applied.pruned_indexed_descendants,
+                        "outside_root": outside_root,
+                        "added_slots": applied.added,
+                        "removed_slots": applied.removed,
                         "duration_ms": u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     }),
                 );
             }
             // Ordinary activity elsewhere in the home directory must not reset the Junk
             // quiet window. Only another Junk event extends that one-shot delay.
-            if saw_junk {
-                if let Some(junk_refresh) = &junk_refresh {
+            if applied.saw_junk {
+                if let Some(junk_refresh) = &effects.junk_refresh {
                     junk_refresh.after_fs_burst();
                 }
             }
         }
     });
     ready_rx
+}
+
+fn apply_prepared_paths(
+    shared: &Arc<RwLock<IndexData>>,
+    root: &Path,
+    patterns: &JunkPatterns,
+    prepared: PreparedPaths,
+) -> AppliedPaths {
+    let mut applied_paths = 0usize;
+    let mut indexed_subtrees = HashSet::new();
+    let mut pruned_indexed_descendants = 0usize;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut saw_junk = false;
+    for path in prepared.paths {
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| indexed_subtrees.contains(ancestor))
+        {
+            pruned_indexed_descendants += 1;
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(root) {
+            saw_junk |= patterns.classify(relative) == Tier::Junk;
+        }
+        let mut index = shared.write().expect("name index lock poisoned");
+        let stats = apply_fs_event(&mut index, &path, patterns);
+        applied_paths += 1;
+        if stats.indexed_subtree {
+            indexed_subtrees.insert(path);
+        }
+        added += stats.added;
+        removed += stats.removed;
+    }
+    AppliedPaths {
+        applied_paths,
+        pruned_indexed_descendants,
+        added,
+        removed,
+        saw_junk,
+    }
+}
+
+pub fn replay_paths(
+    shared: &Arc<RwLock<IndexData>>,
+    root: &Path,
+    patterns: &JunkPatterns,
+    paths: Vec<PathBuf>,
+) -> (usize, usize, usize) {
+    let prepared = prepare_paths(root, paths.into_iter().collect());
+    let applied = apply_prepared_paths(shared, root, patterns, prepared);
+    (applied.applied_paths, applied.added, applied.removed)
 }
 
 #[cfg(test)]
