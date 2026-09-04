@@ -35,6 +35,9 @@ const MAX_CANDIDATES: usize = 4096;
 /// split across cores. The threshold keeps the tiny indexes in tests (and a cold,
 /// nearly-empty index) from paying thread-spawn overhead for no gain.
 const PAR_THRESHOLD: usize = 50_000;
+/// Path-aware fuzzy verification reconstructs ancestor evidence for most surviving slots.
+/// It repays bounded thread-spawn and per-shard scratch below the cheaper name-only threshold.
+const PATH_FUZZY_PAR_THRESHOLD: usize = 20_000;
 
 /// Cold scans are memory-bound once eight workers chase Item-name pointers and build path
 /// masks. More workers add transient per-shard caches and contend for memory bandwidth: the
@@ -1141,7 +1144,12 @@ fn run_fuzzy_inner(
 }
 
 fn resolve_fuzzy_shards(slots: usize, uses_path_masks: bool) -> usize {
-    if slots < PAR_THRESHOLD {
+    let threshold = if uses_path_masks {
+        PATH_FUZZY_PAR_THRESHOLD
+    } else {
+        PAR_THRESHOLD
+    };
+    if slots < threshold {
         return 1;
     }
     let maximum = if uses_path_masks {
@@ -3480,6 +3488,26 @@ mod tests {
         assert!(!partials.is_empty());
         assert_eq!(partials.last(), Some(&outcome.hits));
         assert_eq!(outcome.hits.len(), 6);
+    }
+
+    #[test]
+    fn path_fuzzy_work_parallelizes_below_the_name_only_threshold() {
+        assert_eq!(
+            super::resolve_fuzzy_shards(super::PATH_FUZZY_PAR_THRESHOLD - 1, true),
+            1
+        );
+        let expected = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1)
+            .clamp(1, super::MAX_SEARCH_SHARDS);
+        assert_eq!(
+            super::resolve_fuzzy_shards(super::PATH_FUZZY_PAR_THRESHOLD, true),
+            expected
+        );
+        assert_eq!(
+            super::resolve_fuzzy_shards(super::PATH_FUZZY_PAR_THRESHOLD, false),
+            1
+        );
     }
 
     #[test]
