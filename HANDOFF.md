@@ -72,6 +72,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   получает penalty. CLI `replay` строго парсит NDJSON и проверяет contiguous rank,
   невозрастающий score и совпадение score с contribution total. Config snapshots,
   на которые больше не ссылаются retained traces, удаляются во время maintenance.
+- Signal points, saturation/aging/transfer curves Search Memory и frequency/
+  recency curve General Usage вынесены в тот же strict `ranker.json`; активный
+  snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
+  обучает Item после фактического завершения. Обычный same-volume Move переносит
+  learned identity на collision-resolved destination; EXDEV copy+delete считается
+  новым объектом и намеренно не наследует прежнюю query association. Trash/Delete
+  по-прежнему ничего не обучают. Чекпоинт: 127 Rust passed / 9 ignored, clippy,
+  typecheck, lint и все frontend contract tests зелёные.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.

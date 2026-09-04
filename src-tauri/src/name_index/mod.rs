@@ -288,10 +288,6 @@ impl NameIndex {
             VisitJournal::load(&app_data_dir)
                 .map_err(|error| format!("failed to load visit journal: {error}"))?,
         );
-        let search_memory = Arc::new(
-            SearchMemory::load(&app_data_dir)
-                .map_err(|error| format!("failed to load Search Memory: {error}"))?,
-        );
         let ranker = match RankerConfig::load(&app_data_dir) {
             Ok(Some(config)) => {
                 record(
@@ -311,6 +307,10 @@ impl NameIndex {
                 RankerConfig::default()
             }
         };
+        let search_memory = Arc::new(
+            SearchMemory::load(&app_data_dir, &ranker)
+                .map_err(|error| format!("failed to load Search Memory: {error}"))?,
+        );
         let traces = RankingTraces::init(&app_data_dir)
             .map_err(|error| format!("failed to initialize Ranking Traces: {error}"))?;
         traces.snapshot_config(&ranker);
@@ -857,7 +857,7 @@ pub async fn search_name_index_v2(
         let stream_started = Instant::now();
         let cancel = query::Cancel::new(&generation, my_gen);
         let aggregate = journal.aggregate();
-        let memory = search_memory.evidence(&query, now_ms());
+        let memory = search_memory.evidence(&query, now_ms(), &ranker);
         let (working, working_slots, context, revision) = {
             let index = data.read().expect("name index lock poisoned");
             let WorkingSet { slots, retrieval } = working_set(
@@ -1210,6 +1210,7 @@ pub async fn record_search_signal(
             path_interpretation,
             signal,
             timestamp,
+            &ranker,
         )
     })
     .await

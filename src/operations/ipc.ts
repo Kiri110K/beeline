@@ -173,17 +173,33 @@ const failureSchema = z
   .strict();
 export type OperationFailure = z.infer<typeof failureSchema>;
 
+const operationKindSchema = z.enum([
+  "paste_copy",
+  "paste_move",
+  "trash",
+  "delete_permanently",
+]);
+const pathChangeSchema = z
+  .object({ previous_path: z.string(), next_path: z.string() })
+  .strict();
+
 const finishedPayloadSchema = z
   .object({
     job_id: jobIdSchema,
+    kind: operationKindSchema,
     ok_count: z.number().int().nonnegative(),
     failures: z.array(failureSchema),
+    completed_paths: z.array(z.string()),
+    path_changes: z.array(pathChangeSchema),
   })
   .strict();
 export interface OperationFinished {
   jobId: JobId;
+  kind: z.infer<typeof operationKindSchema>;
   okCount: number;
   failures: OperationFailure[];
+  completedPaths: string[];
+  pathChanges: { previousPath: string; nextPath: string }[];
 }
 
 const unlistenSchema = z.custom<UnlistenFn>(
@@ -217,8 +233,14 @@ export function subscribeOperationFinished(
       if (parsed.success) {
         handler({
           jobId: parsed.data.job_id,
+          kind: parsed.data.kind,
           okCount: parsed.data.ok_count,
           failures: parsed.data.failures,
+          completedPaths: parsed.data.completed_paths,
+          pathChanges: parsed.data.path_changes.map((change) => ({
+            previousPath: change.previous_path,
+            nextPath: change.next_path,
+          })),
         });
       }
     }),

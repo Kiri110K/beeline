@@ -49,12 +49,25 @@ pub struct TextMatchWeights {
 pub struct SearchMemoryWeights {
     pub max: i64,
     pub usage_max: i64,
+    pub saturation_points: u64,
+    pub half_life_days: i64,
+    pub action_menu_points: u32,
+    pub quick_look_points: u32,
+    pub completed_action_points: u32,
+    pub exact_similarity_milli: i64,
+    pub prefix_extension_similarity_milli: i64,
+    pub prefix_contraction_similarity_milli: i64,
+    pub token_delta_similarity_milli: i64,
+    pub edit_similarity_milli: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GeneralUsageWeights {
     pub visit_max: i64,
+    pub visit_frequency_cap: u32,
+    pub visit_frequency_share_milli: i64,
+    pub visit_recency_scale_days: i64,
     pub recents: i64,
 }
 
@@ -107,9 +120,22 @@ impl Default for RankerConfig {
             search_memory: SearchMemoryWeights {
                 max: 3_000_000,
                 usage_max: 200_000,
+                saturation_points: 12,
+                half_life_days: 90,
+                action_menu_points: 1,
+                quick_look_points: 3,
+                completed_action_points: 8,
+                exact_similarity_milli: 1_000,
+                prefix_extension_similarity_milli: 850,
+                prefix_contraction_similarity_milli: 700,
+                token_delta_similarity_milli: 750,
+                edit_similarity_milli: 650,
             },
             general_usage: GeneralUsageWeights {
                 visit_max: 30_000,
+                visit_frequency_cap: 10,
+                visit_frequency_share_milli: 667,
+                visit_recency_scale_days: 1,
                 recents: 24_000,
             },
             context: ContextWeights {
@@ -161,6 +187,44 @@ impl RankerConfig {
         }
         if !(1..=64).contains(&self.global_retrieval_significant_chars) {
             return Err("globalRetrievalSignificantChars must be between 1 and 64".to_owned());
+        }
+        if self.search_memory.saturation_points == 0
+            || self.search_memory.half_life_days <= 0
+            || self.search_memory.action_menu_points == 0
+            || self.search_memory.quick_look_points < self.search_memory.action_menu_points
+            || self.search_memory.completed_action_points < self.search_memory.quick_look_points
+        {
+            return Err(
+                "Search Memory curve and signal points must be positive and weak ≤ medium ≤ strong"
+                    .to_owned(),
+            );
+        }
+        if self.general_usage.visit_frequency_cap == 0
+            || self.general_usage.visit_recency_scale_days <= 0
+            || !(0..=1_000).contains(&self.general_usage.visit_frequency_share_milli)
+        {
+            return Err("General Usage visit curve is invalid".to_owned());
+        }
+        let similarities = [
+            self.search_memory.exact_similarity_milli,
+            self.search_memory.prefix_extension_similarity_milli,
+            self.search_memory.prefix_contraction_similarity_milli,
+            self.search_memory.token_delta_similarity_milli,
+            self.search_memory.edit_similarity_milli,
+        ];
+        if similarities
+            .into_iter()
+            .any(|similarity| !(0..=1_000).contains(&similarity))
+        {
+            return Err("Search Memory similarities must be between 0 and 1000".to_owned());
+        }
+        if similarities[1..]
+            .iter()
+            .any(|similarity| *similarity > similarities[0])
+        {
+            return Err(
+                "transferred Search Memory similarity cannot exceed exact similarity".to_owned(),
+            );
         }
         let values = [
             ("textMatch.exactName", self.text_match.exact_name),

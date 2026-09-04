@@ -87,8 +87,17 @@ struct ProgressPayload {
 #[derive(Serialize, Clone)]
 struct FinishedPayload {
     job_id: u64,
+    kind: &'static str,
     ok_count: usize,
     failures: Vec<Failure>,
+    completed_paths: Vec<String>,
+    path_changes: Vec<PathChange>,
+}
+
+#[derive(Serialize, Clone)]
+struct PathChange {
+    previous_path: String,
+    next_path: String,
 }
 
 /// The kind of batch, for the `operation_finished` telemetry line.
@@ -162,17 +171,32 @@ impl UnitOp {
     }
 
     /// Perform this unit, returning a concrete cause string on failure.
-    fn execute(&self, trash: &dyn TrashBin) -> Result<(), String> {
+    fn execute(&self, trash: &dyn TrashBin) -> Result<UnitSuccess, String> {
         match self {
             UnitOp::Copy { src, target_dir } => {
                 let name = file_name_str(src)?;
                 let dst = fsops::resolve_collision(target_dir, &name);
-                fsops::copy_tree(src, &dst).map_err(|error| cause::describe("copying", src, &error))
+                fsops::copy_tree(src, &dst)
+                    .map_err(|error| cause::describe("copying", src, &error))?;
+                Ok(UnitSuccess {
+                    completed_path: Some(src.to_string_lossy().into_owned()),
+                    path_change: None,
+                })
             }
             UnitOp::Move { src, target_dir } => {
                 let name = file_name_str(src)?;
                 let dst = fsops::resolve_collision(target_dir, &name);
-                fsops::move_item(src, &dst).map_err(|error| cause::describe("moving", src, &error))
+                let move_outcome = fsops::move_item(src, &dst)
+                    .map_err(|error| cause::describe("moving", src, &error))?;
+                Ok(UnitSuccess {
+                    completed_path: Some(dst.to_string_lossy().into_owned()),
+                    path_change: (move_outcome == fsops::MoveOutcome::Renamed).then(|| {
+                        PathChange {
+                            previous_path: src.to_string_lossy().into_owned(),
+                            next_path: dst.to_string_lossy().into_owned(),
+                        }
+                    }),
+                })
             }
             UnitOp::Trash { path } => {
                 // A vanished source is this item's own failure, not a batch-wide refusal
@@ -183,19 +207,30 @@ impl UnitOp {
                         path.display()
                     ));
                 }
-                trash.trash(path)
+                trash.trash(path)?;
+                Ok(UnitSuccess::default())
             }
             UnitOp::Delete { path } => {
-                fsops::remove_tree(path).map_err(|error| cause::describe("deleting", path, &error))
+                fsops::remove_tree(path)
+                    .map_err(|error| cause::describe("deleting", path, &error))?;
+                Ok(UnitSuccess::default())
             }
         }
     }
+}
+
+#[derive(Default)]
+struct UnitSuccess {
+    completed_path: Option<String>,
+    path_change: Option<PathChange>,
 }
 
 /// The final tally of a batch run.
 struct BatchOutcome {
     ok_count: usize,
     failures: Vec<Failure>,
+    completed_paths: Vec<String>,
+    path_changes: Vec<PathChange>,
 }
 
 /// Run the planned units in order, reporting progress before each and collecting failures
@@ -211,6 +246,8 @@ fn run_units(
     let total = units.len();
     let mut ok_count = 0;
     let mut failures = Vec::new();
+    let mut completed_paths = Vec::new();
+    let mut path_changes = Vec::new();
 
     for (index, unit) in units.into_iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
@@ -218,7 +255,15 @@ fn run_units(
         }
         on_progress(index, total, unit.path());
         match unit.execute(trash) {
-            Ok(()) => ok_count += 1,
+            Ok(success) => {
+                ok_count += 1;
+                if let Some(path) = success.completed_path {
+                    completed_paths.push(path);
+                }
+                if let Some(change) = success.path_change {
+                    path_changes.push(change);
+                }
+            }
             Err(cause) => failures.push(Failure {
                 path: unit.path().display().to_string(),
                 cause,
@@ -226,7 +271,12 @@ fn run_units(
         }
     }
 
-    BatchOutcome { ok_count, failures }
+    BatchOutcome {
+        ok_count,
+        failures,
+        completed_paths,
+        path_changes,
+    }
 }
 
 /// The UTF-8 basename of a path, or a concrete cause when it has none (the filesystem
@@ -302,8 +352,11 @@ impl Operations {
                 FINISHED_EVENT,
                 FinishedPayload {
                     job_id,
+                    kind: kind.as_str(),
                     ok_count: outcome.ok_count,
                     failures: outcome.failures,
+                    completed_paths: outcome.completed_paths,
+                    path_changes: outcome.path_changes,
                 },
             ) {
                 eprintln!("failed to emit operation-finished event: {error}");
@@ -724,9 +777,50 @@ mod tests {
 
         assert_eq!(outcome.ok_count, 2);
         assert!(outcome.failures.is_empty());
+        assert_eq!(
+            outcome.completed_paths,
+            vec![
+                original.to_string_lossy().into_owned(),
+                original.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(outcome.path_changes.is_empty());
         assert!(dir.path().join("doc 2.txt").exists());
         assert!(dir.path().join("doc 3.txt").exists());
         assert_eq!(fs::read(dir.path().join("doc 2.txt")).unwrap(), b"content");
+    }
+
+    #[test]
+    fn move_reports_the_actual_collision_resolved_path_change() {
+        let source_dir = TempDir::new();
+        let target_dir = TempDir::new();
+        let source = source_dir.path().join("doc.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(target_dir.path().join("doc.txt"), b"existing").unwrap();
+        let outcome = run_units(
+            vec![UnitOp::Move {
+                src: source.clone(),
+                target_dir: target_dir.path().to_path_buf(),
+            }],
+            &FakeTrash::new(),
+            &no_cancel(),
+            |_, _, _| {},
+        );
+
+        assert_eq!(outcome.ok_count, 1);
+        assert_eq!(outcome.path_changes.len(), 1);
+        assert_eq!(
+            outcome.path_changes[0].previous_path,
+            source.to_string_lossy()
+        );
+        assert_eq!(
+            outcome.path_changes[0].next_path,
+            target_dir.path().join("doc 2.txt").to_string_lossy()
+        );
+        assert_eq!(
+            outcome.completed_paths,
+            vec![outcome.path_changes[0].next_path.clone()]
+        );
     }
 
     #[test]

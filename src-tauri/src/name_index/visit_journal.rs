@@ -21,14 +21,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// Frequency weight per visit, capped at [`FREQ_CAP_VISITS`] visits.
-const FREQ_WEIGHT: i64 = 2_000;
-/// Visits beyond this count no longer raise the frequency component.
-const FREQ_CAP_VISITS: i64 = 10;
-/// Maximum recency component (awarded to a path visited at the journal's newest moment).
-const RECENCY_MAX: i64 = 10_000;
-/// Upper bound on the whole visit boost, so it can never cross a match-quality band.
-pub const VISIT_CAP: i64 = 30_000;
+use super::ranker_config::GeneralUsageWeights;
+#[cfg(test)]
+use super::ranker_config::RankerConfig;
+
 /// One day in milliseconds, the unit of the recency decay.
 const DAY_MS: i64 = 86_400_000;
 
@@ -87,22 +83,19 @@ impl Aggregate {
         self.newest_ms = self.newest_ms.max(timestamp_ms);
     }
 
-    /// The ranking boost for `path`: recency-weighted frequency, `0` if never visited.
-    /// Deterministic — recency is measured from the journal's newest visit, so it does
-    /// not depend on when the query runs.
-    pub fn boost(&self, path: &str) -> i64 {
+    /// Code-defined recency/frequency curve normalized for the configurable ranker.
+    pub fn strength_milli(&self, path: &str, config: &GeneralUsageWeights) -> i64 {
         let Some(stats) = self.by_path.get(path) else {
             return 0;
         };
-        let freq = i64::from(stats.count).min(FREQ_CAP_VISITS) * FREQ_WEIGHT;
-        let age_days = (self.newest_ms - stats.last_ms).max(0) / DAY_MS;
-        let recency = RECENCY_MAX / (1 + age_days);
-        (freq + recency).min(VISIT_CAP)
-    }
-
-    /// Code-defined recency/frequency curve normalized for the configurable ranker.
-    pub fn strength_milli(&self, path: &str) -> i64 {
-        self.boost(path).saturating_mul(1_000) / VISIT_CAP
+        let frequency = i64::from(stats.count.min(config.visit_frequency_cap))
+            .saturating_mul(config.visit_frequency_share_milli)
+            / i64::from(config.visit_frequency_cap);
+        let age_days = self.newest_ms.saturating_sub(stats.last_ms).max(0) / DAY_MS;
+        let recency_steps = age_days / config.visit_recency_scale_days;
+        let recency_share = 1_000i64.saturating_sub(config.visit_frequency_share_milli);
+        let recency = recency_share / (1 + recency_steps);
+        frequency.saturating_add(recency).min(1_000)
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
@@ -219,20 +212,30 @@ mod tests {
 
     #[test]
     fn frequency_and_recency_raise_the_boost() {
+        let config = GeneralUsageWeights {
+            visit_max: 30_000,
+            visit_frequency_cap: 10,
+            visit_frequency_share_milli: 667,
+            visit_recency_scale_days: 1,
+            recents: 24_000,
+        };
         // More frequent → higher; among equal frequency, more recent → higher.
         let often = Aggregate::from_visits(&[("/p", 10), ("/p", 20), ("/p", 30)]);
         let once = Aggregate::from_visits(&[("/p", 30)]);
-        assert!(often.boost("/p") > once.boost("/p"));
+        assert!(often.strength_milli("/p", &config) > once.strength_milli("/p", &config));
 
         // With the same count, a later last-visit (relative to the journal's newest)
         // scores higher. Recency decays per day, so the gap must be day-scale.
         let recent = Aggregate::from_visits(&[("/a", 100), ("/b", 100)]);
-        assert_eq!(recent.boost("/a"), recent.boost("/b"));
+        assert_eq!(
+            recent.strength_milli("/a", &config),
+            recent.strength_milli("/b", &config)
+        );
         let mixed = Aggregate::from_visits(&[("/a", 100), ("/b", 100 + 3 * DAY_MS)]);
-        assert!(mixed.boost("/b") > mixed.boost("/a"));
+        assert!(mixed.strength_milli("/b", &config) > mixed.strength_milli("/a", &config));
 
         // Never-visited paths get no boost.
-        assert_eq!(once.boost("/unknown"), 0);
+        assert_eq!(once.strength_milli("/unknown", &config), 0);
     }
 
     #[test]
@@ -246,13 +249,26 @@ mod tests {
             journal
                 .record("/home/tester/a.txt", VisitKind::OpenedFile, 2_000)
                 .expect("record");
-            assert!(journal.aggregate().boost("/home/tester/Downloads") > 0);
+            assert!(
+                journal.aggregate().strength_milli(
+                    "/home/tester/Downloads",
+                    &RankerConfig::default().general_usage
+                ) > 0
+            );
         }
 
         // A fresh load replays the on-disk log.
         let reloaded = VisitJournal::load(&dir.0).expect("reload");
         let aggregate = reloaded.aggregate();
-        assert!(aggregate.boost("/home/tester/Downloads") > 0);
-        assert!(aggregate.boost("/home/tester/a.txt") > 0);
+        assert!(
+            aggregate.strength_milli(
+                "/home/tester/Downloads",
+                &RankerConfig::default().general_usage
+            ) > 0
+        );
+        assert!(
+            aggregate.strength_milli("/home/tester/a.txt", &RankerConfig::default().general_usage)
+                > 0
+        );
     }
 }

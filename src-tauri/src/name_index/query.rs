@@ -2121,7 +2121,7 @@ fn tier_penalty(tier: Tier, weights: &PenaltyWeights) -> i64 {
 fn personal_boost(ctx: &RankContext, path: &str, is_directory: bool) -> i64 {
     let visit = ctx
         .journal
-        .strength_milli(path)
+        .strength_milli(path, &ctx.config.general_usage)
         .saturating_mul(ctx.config.general_usage.visit_max)
         / 1_000;
     let learned = ctx.memory.boost(path, ctx.config);
@@ -2148,7 +2148,7 @@ fn score_contributions(
     let (search_memory, learned_usage) = ctx.memory.contributions(path, ctx.config);
     let visit = ctx
         .journal
-        .strength_milli(path)
+        .strength_milli(path, &ctx.config.general_usage)
         .saturating_mul(ctx.config.general_usage.visit_max)
         / 1_000;
     let (retrieval_context, recents) = ctx.retrieval.contributions(slot, ctx.config);

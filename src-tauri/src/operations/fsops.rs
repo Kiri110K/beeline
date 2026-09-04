@@ -102,22 +102,31 @@ pub fn remove_tree(path: &Path) -> io::Result<()> {
 
 /// Move `src` to `dst`, falling back to copy + delete on a cross-volume rename (SPEC §8,
 /// point 5). Production path; the EXDEV branch is exercised by `move_item_with`.
-pub fn move_item(src: &Path, dst: &Path) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// `rename(2)` preserved the filesystem object and therefore its learned identity.
+    Renamed,
+    /// EXDEV required copy + delete, which creates a new filesystem object.
+    CopiedAcrossVolumes,
+}
+
+pub fn move_item(src: &Path, dst: &Path) -> io::Result<MoveOutcome> {
     move_item_with(src, dst, |from, to| fs::rename(from, to))
 }
 
 /// The move core with an injectable rename, so tests force the EXDEV fallback without a
 /// real second volume. On a cross-device error the source is copied then removed; a copy
 /// failure aborts before the delete so nothing is lost.
-fn move_item_with<R>(src: &Path, dst: &Path, rename: R) -> io::Result<()>
+fn move_item_with<R>(src: &Path, dst: &Path, rename: R) -> io::Result<MoveOutcome>
 where
     R: Fn(&Path, &Path) -> io::Result<()>,
 {
     match rename(src, dst) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(MoveOutcome::Renamed),
         Err(error) if error.raw_os_error() == Some(EXDEV) => {
             copy_tree(src, dst)?;
-            remove_tree(src)
+            remove_tree(src)?;
+            Ok(MoveOutcome::CopiedAcrossVolumes)
         }
         Err(error) => Err(error),
     }
@@ -231,8 +240,10 @@ mod tests {
         let dst = dir.path().join("moved.txt");
 
         // Force the cross-volume branch with a rename that always reports EXDEV.
-        move_item_with(&src, &dst, |_, _| Err(io::Error::from_raw_os_error(EXDEV))).unwrap();
+        let outcome =
+            move_item_with(&src, &dst, |_, _| Err(io::Error::from_raw_os_error(EXDEV))).unwrap();
 
+        assert_eq!(outcome, MoveOutcome::CopiedAcrossVolumes);
         assert_eq!(fs::read(&dst).unwrap(), b"payload");
         // The source is gone: copy succeeded, then the fallback removed it.
         assert!(!path_exists(&src));
@@ -246,8 +257,10 @@ mod tests {
         fs::write(src.join("inner.txt"), b"z").unwrap();
         let dst = dir.path().join("tree-moved");
 
-        move_item_with(&src, &dst, |_, _| Err(io::Error::from_raw_os_error(EXDEV))).unwrap();
+        let outcome =
+            move_item_with(&src, &dst, |_, _| Err(io::Error::from_raw_os_error(EXDEV))).unwrap();
 
+        assert_eq!(outcome, MoveOutcome::CopiedAcrossVolumes);
         assert_eq!(fs::read(dst.join("inner.txt")).unwrap(), b"z");
         assert!(!path_exists(&src));
     }

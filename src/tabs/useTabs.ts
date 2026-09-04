@@ -2585,6 +2585,15 @@ export function useTabs(
         jobId: finished.jobId,
         failures: finished.failures,
       });
+      for (const change of finished.pathChanges) {
+        void rebindSearchMemory(change.previousPath, change.nextPath).match(
+          () => undefined,
+          reportShellError,
+        );
+      }
+      for (const path of finished.completedPaths) {
+        recordLearnedSignal(path, "completed_action");
+      }
       // Rows disappear only after success (§8): re-list the active Tab so trashed/deleted
       // rows leave and pasted/moved rows arrive, selection re-resolved by path.
       const active = tabById(stateRef.current, stateRef.current.activeId);
@@ -2610,7 +2619,7 @@ export function useTabs(
         progressRafRef.current = null;
       }
     };
-  }, [revalidate, navigate]);
+  }, [revalidate, navigate, recordLearnedSignal]);
 
   // Whenever the active Tab changes, revalidate its cached listing (or retry a
   // failed one) so switching paints instantly, then refreshes in place (§10, §11).
