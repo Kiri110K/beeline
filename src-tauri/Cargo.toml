@@ -39,3 +39,14 @@ unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4.1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
