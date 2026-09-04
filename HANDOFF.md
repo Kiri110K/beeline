@@ -374,6 +374,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `status report` 47.32 → 48.47 мс; real wall +7.3%, user CPU +2.7%, physical
   peak +8.10 MiB. Код оставлен только в remote-ветке; отрицательный verdict:
   `prototypes/fuzzy-path-ten-shards/RESULTS.md`.
+- PR #71 влит в main как `0b52143`. Временные q-gram build shards теперь хранят
+  двухбайтовый local bucket и varint-дельту монотонного slot вместо фиксированных
+  шести байт. На полном production index пик временных parts снизился примерно
+  с 797.42 до 438.33 MiB (-45.0%), physical peak — с 88.11 до 67.8 MiB (-23%).
+  Три rebuild заняли 17.46–18.69 с против прежних 19.23 с. Все три результата
+  побайтно совпали с установленным `BLQGM003` sidecar: 185,963,243 bytes и SHA-256
+  `90be476b47b843840b9a2c3007dc0361ca83ce84fe8077139d99c0350aa43945`.
+  Финальный sidecar format и query path не менялись. Полный checkpoint: 142 Rust
+  passed / 12 ignored, clippy `-D warnings`, frontend contracts, typecheck, build
+  и lint зелёные. Подробности: `prototypes/qgram-delta-shard-records/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
