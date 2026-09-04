@@ -253,6 +253,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Через quiet window обнаружен новый energy-хвост: 499 dirty Junk dirs drained за
   15,047 мс на external power. Backup предыдущего ночного bundle:
   `/private/tmp/Beeline-before-multi-name-first-20260905.app`.
+- Независимый GUI-pass установленного PR #64 через настоящий global shortcut
+  подтвердил четыре последовательных запроса без restart: `work wip` и
+  `work/wip` дали `/Users/kiri110k/work/wip` rank 1, `vault methodology` и
+  `status report` полностью заменили предыдущие выдачи без stale rows или
+  видимых дублей. Freeze, crash и потеря focus не обнаружены. Два Escape сначала
+  закрыли результаты с сохранением query, затем скрыли приложение; PID 15111
+  остался жив, hidden/0 windows/not frontmost. Скриншоты и отчёт:
+  `/private/tmp/beeline-installed-ui.9YN3vx/`.
 - `experiment/junk-single-child-snapshot` (`140fe5d`) отклонён. Удаление второго
   `direct_children` прохода не изменило широкий `target/debug/deps` reconcile:
   baseline 160–172 мс, candidate 151–171 мс, средняя разница <2%. Главная цена —
