@@ -18,9 +18,10 @@ use super::{
     query::{self, Cancel},
 };
 
-const MAGIC: &[u8; 8] = b"BLQGM002";
+const MAGIC: &[u8; 8] = b"BLQGM003";
 const HEADER_BYTES: usize = 64;
 const BUCKETS: usize = 1 << 20;
+const BUCKET_OFFSET_BYTES: usize = 4;
 const RETAINED_WORKSPACES: usize = 1;
 const SKIP_STRIDE: usize = 64;
 const SKIP_RECORD_BYTES: usize = 8;
@@ -122,7 +123,7 @@ impl QGramIndex {
         if read_u64(bytes, 56)? as usize != SKIP_STRIDE {
             return None;
         }
-        let offsets_bytes = (BUCKETS + 1).checked_mul(8)?;
+        let offsets_bytes = (BUCKETS + 1).checked_mul(BUCKET_OFFSET_BYTES)?;
         let skip_offsets_offset = HEADER_BYTES.checked_add(offsets_bytes)?;
         let postings_offset = skip_offsets_offset.checked_add(offsets_bytes)?;
         let skips_offset = postings_offset.checked_add(encoded_bytes)?;
@@ -130,8 +131,9 @@ impl QGramIndex {
         if bytes.len() != expected {
             return None;
         }
-        if read_u64(bytes, HEADER_BYTES + BUCKETS * 8)? as usize != encoded_bytes
-            || read_u64(bytes, skip_offsets_offset + BUCKETS * 8)? as usize != skip_count
+        if read_u32(bytes, HEADER_BYTES + BUCKETS * BUCKET_OFFSET_BYTES)? as usize != encoded_bytes
+            || read_u32(bytes, skip_offsets_offset + BUCKETS * BUCKET_OFFSET_BYTES)? as usize
+                != skip_count
         {
             return None;
         }
@@ -221,7 +223,7 @@ impl QGramIndex {
         writer.write_all(&0u64.to_le_bytes())?; // encoded posting bytes, backfilled below
         writer.write_all(&0u64.to_le_bytes())?; // skip record count, backfilled below
         writer.write_all(&(SKIP_STRIDE as u64).to_le_bytes())?;
-        write_zeroes(&mut writer, (BUCKETS + 1) * 16)?;
+        write_zeroes(&mut writer, (BUCKETS + 1) * BUCKET_OFFSET_BYTES * 2)?;
 
         let mut encoded = Vec::with_capacity(ENCODED_POSTING_SLOTS * 4);
         let mut byte_offsets = Vec::with_capacity(BUCKETS + 1);
@@ -282,8 +284,13 @@ impl QGramIndex {
                     .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
             }
             for local_bucket in 0..BUILD_SHARD_BUCKETS {
-                byte_offsets.push(encoded_bytes);
-                skip_offsets.push(skip_count);
+                byte_offsets.push(u32::try_from(encoded_bytes).map_err(|_| {
+                    std::io::Error::other("encoded q-gram exceeds u32 byte offsets")
+                })?);
+                skip_offsets.push(
+                    u32::try_from(skip_count)
+                        .map_err(|_| std::io::Error::other("q-gram skips exceed u32 offsets"))?,
+                );
                 let bucket_start = encoded_bytes;
                 let start = local_offsets[local_bucket] as usize;
                 let end = local_offsets[local_bucket + 1] as usize;
@@ -322,8 +329,14 @@ impl QGramIndex {
         if emitted_postings != posting_count {
             return Err(std::io::Error::other("q-gram posting count mismatch"));
         }
-        byte_offsets.push(encoded_bytes);
-        skip_offsets.push(skip_count);
+        byte_offsets.push(
+            u32::try_from(encoded_bytes)
+                .map_err(|_| std::io::Error::other("encoded q-gram exceeds u32 byte offsets"))?,
+        );
+        skip_offsets.push(
+            u32::try_from(skip_count)
+                .map_err(|_| std::io::Error::other("q-gram skips exceed u32 offsets"))?,
+        );
         if byte_offsets.len() != BUCKETS + 1 || skip_offsets.len() != BUCKETS + 1 {
             return Err(std::io::Error::other("q-gram bucket offset count mismatch"));
         }
@@ -433,20 +446,26 @@ impl QGramIndex {
 
     fn posting_byte_range(&self, bucket: usize) -> (usize, usize) {
         let bytes = self.mapping.bytes();
-        let start =
-            read_u64(bytes, HEADER_BYTES + bucket * 8).expect("validated q-gram offset") as usize;
-        let end = read_u64(bytes, HEADER_BYTES + (bucket + 1) * 8).expect("validated q-gram offset")
-            as usize;
+        let start = read_u32(bytes, HEADER_BYTES + bucket * BUCKET_OFFSET_BYTES)
+            .expect("validated q-gram offset") as usize;
+        let end = read_u32(bytes, HEADER_BYTES + (bucket + 1) * BUCKET_OFFSET_BYTES)
+            .expect("validated q-gram offset") as usize;
         debug_assert!(start <= end);
         (self.postings_offset + start, self.postings_offset + end)
     }
 
     fn skip_range(&self, bucket: usize) -> (usize, usize) {
         let bytes = self.mapping.bytes();
-        let start = read_u64(bytes, self.skip_offsets_offset + bucket * 8)
-            .expect("validated q-gram skip offset") as usize;
-        let end = read_u64(bytes, self.skip_offsets_offset + (bucket + 1) * 8)
-            .expect("validated q-gram skip offset") as usize;
+        let start = read_u32(
+            bytes,
+            self.skip_offsets_offset + bucket * BUCKET_OFFSET_BYTES,
+        )
+        .expect("validated q-gram skip offset") as usize;
+        let end = read_u32(
+            bytes,
+            self.skip_offsets_offset + (bucket + 1) * BUCKET_OFFSET_BYTES,
+        )
+        .expect("validated q-gram skip offset") as usize;
         debug_assert!(start <= end);
         (start, end)
     }
