@@ -2219,18 +2219,44 @@ fn best_multi_interpretation(
     scratch: &mut String,
 ) -> Option<TextMatchEvidence> {
     let ordinary = match_token_set(index, item, tokens, offset, prep, dir_masks, scratch);
-    let scoped = implicit_path_quality(index, item, tokens, offset, prep, scratch);
+    if let Some(ordinary) = &ordinary {
+        if let Some(final_name_quality) = ordinary.final_name_quality {
+            let strongest_scoped = TextMatchEvidence {
+                feature: final_name_quality.feature,
+                typo_edits: final_name_quality.typo_edits,
+                path_scope: true,
+                ..TextMatchEvidence::default()
+            };
+            if ordinary.evidence.contribution_with_weights(&prep.text)
+                >= strongest_scoped.contribution_with_weights(&prep.text)
+            {
+                return Some(ordinary.evidence.clone());
+            }
+        }
+    }
+    let scoped = implicit_path_quality(
+        index,
+        item,
+        tokens,
+        offset,
+        prep,
+        scratch,
+        ordinary
+            .as_ref()
+            .and_then(|matched| matched.final_name_quality),
+    );
     match (ordinary, scoped) {
         (Some(left), Some(right)) => {
             if right.contribution_with_weights(&prep.text)
-                > left.contribution_with_weights(&prep.text)
+                > left.evidence.contribution_with_weights(&prep.text)
             {
                 Some(right)
             } else {
-                Some(left)
+                Some(left.evidence)
             }
         }
-        (left, right) => left.or(right),
+        (Some(left), None) => Some(left.evidence),
+        (None, right) => right,
     }
 }
 
@@ -2241,6 +2267,7 @@ fn implicit_path_quality(
     offset: usize,
     prep: &Prepared,
     scratch: &mut String,
+    known_last_quality: Option<MatchQuality>,
 ) -> Option<TextMatchEvidence> {
     let (last, prefix) = tokens.split_last()?;
     if prefix.is_empty() {
@@ -2249,14 +2276,17 @@ fn implicit_path_quality(
     let last_filter = *prep
         .path_needle_name_filters
         .get(offset + tokens.len() - 1)?;
-    let quality = quality_match(
-        item.entry.name,
-        item.name_filter,
-        last,
-        last_filter,
-        scratch,
-        &prep.text,
-    )?;
+    let quality = match known_last_quality {
+        Some(quality) => quality,
+        None => quality_match(
+            item.entry.name,
+            item.name_filter,
+            last,
+            last_filter,
+            scratch,
+            &prep.text,
+        )?,
+    };
     ancestors_match(index, item.entry.parent, prefix).then_some(TextMatchEvidence {
         feature: quality.feature,
         typo_edits: quality.typo_edits,
@@ -2269,6 +2299,11 @@ fn implicit_path_quality(
 /// `None` if any token matches neither the name nor the path (the AND fails). Token sets are
 /// never empty (a multi-token query has ≥2 tokens, and a corrected variant preserves the
 /// count), so `None` here always means an unmatched token, not an empty set.
+struct TokenSetMatch {
+    evidence: TextMatchEvidence,
+    final_name_quality: Option<MatchQuality>,
+}
+
 fn match_token_set(
     index: &IndexData,
     item: SearchItem<'_>,
@@ -2277,22 +2312,29 @@ fn match_token_set(
     prep: &Prepared,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<TextMatchEvidence> {
+) -> Option<TokenSetMatch> {
     let mut band: Option<MatchQuality> = None;
     let mut all_in_name = true;
+    let mut final_name_quality = None;
     for (j, token) in tokens.iter().enumerate() {
         // `offset + j` is this token's index in `Prepared::path_needles`, i.e. its bit in a
         // dir mask.
         let quality = token_quality(index, item, token, offset + j, prep, dir_masks, scratch)?;
         band = Some(band.map_or(quality.quality, |current| current.min(quality.quality)));
         all_in_name &= quality.in_name;
+        if j + 1 == tokens.len() && quality.in_name {
+            final_name_quality = Some(quality.quality);
+        }
     }
     let band = band?;
-    Some(TextMatchEvidence {
-        feature: band.feature,
-        typo_edits: band.typo_edits,
-        all_tokens_in_name: all_in_name,
-        ..TextMatchEvidence::default()
+    Some(TokenSetMatch {
+        evidence: TextMatchEvidence {
+            feature: band.feature,
+            typo_edits: band.typo_edits,
+            all_tokens_in_name: all_in_name,
+            ..TextMatchEvidence::default()
+        },
+        final_name_quality,
     })
 }
 
@@ -3439,6 +3481,57 @@ mod tests {
             "/home/tester/Downloads/status-report_2026.xlsx"
         );
         assert_eq!(hits[1].path, "/home/tester/status-all/report-data.ts");
+    }
+
+    #[test]
+    fn multi_token_dominance_respects_configured_path_scope_score() {
+        let mut index = index();
+        let status = index.add_dir(0, "status", Tier::Normal, 0);
+        let dominant_slot = index.slot_len();
+        index.add_file(status, "status-report.xlsx", Tier::Normal);
+        let vault = index.add_dir(0, "vault", Tier::Normal, 0);
+        let scoped_slot = index.slot_len();
+        index.add_file(vault, "report-vualt.txt", Tier::Normal);
+        let ctx = RankContext::empty();
+
+        let query = "status report";
+        let lower = query.to_lowercase();
+        let prep = Prepared::new(&index, query, &lower, ctx.config);
+        let entry = index.entry(dominant_slot).expect("dominant entry");
+        let evidence = best_multi_interpretation(
+            &index,
+            SearchItem {
+                entry,
+                name_filter: entry.filter,
+            },
+            &prep.tokens,
+            0,
+            &prep,
+            &mut new_dir_masks(&index, &prep),
+            &mut String::new(),
+        )
+        .expect("all-name interpretation");
+        assert!(evidence.all_tokens_in_name);
+        assert!(!evidence.path_scope);
+
+        let query = "vault report";
+        let lower = query.to_lowercase();
+        let prep = Prepared::new(&index, query, &lower, ctx.config);
+        let entry = index.entry(scoped_slot).expect("scoped entry");
+        let evidence = best_multi_interpretation(
+            &index,
+            SearchItem {
+                entry,
+                name_filter: entry.filter,
+            },
+            &prep.tokens,
+            0,
+            &prep,
+            &mut new_dir_masks(&index, &prep),
+            &mut String::new(),
+        )
+        .expect("scoped interpretation");
+        assert!(evidence.path_scope);
     }
 
     #[test]
