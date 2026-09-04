@@ -320,6 +320,31 @@ physical footprint was 60.6 MiB with a 66.8 MiB peak. During the first three min
 batches in 605 ms total, with no Junk refresh; the machine was on battery, so this run validates the
 deferred path rather than the external-power quiet drain.
 
+## Dense q-gram aggregation — 2026-09-05
+
+Production q-gram postings are sorted by Item slot. The old retrieval path nevertheless built one
+`HashMap<u32, u8>` per token and a global `BTreeSet<u32>`. The measured replacement uses one bounded
+reusable `Vec<u8>` counter table plus a touched-slot list. It clears only counters touched by the
+current token, appends qualifying slots to a flat vector, then sorts and deduplicates once. A pool
+retains at most one 5.7M-byte workspace; overlapping cancelled queries may allocate another, but it
+is dropped when the pooled workspace returns.
+
+A same-seed 200-sample-per-case A/B run on the current 5,668,822-Item base measured:
+
+- complete suite: 127.62 s to 101.32 s, a 1.26x speedup;
+- candidate retrieval p95: 3.8x to 7.8x faster across all ten cases;
+- typo/layout final p95: 1.03x to 2.56x faster;
+- peak physical footprint: 91.44 MiB to 90.90 MiB;
+- identical final hits, one top-10 fingerprint per case, and zero target misses.
+
+A second 100-sample-per-case process with a different seed kept retrieval p95 between 0.055 and
+4.625 ms and peaked at 67.95 MiB physical footprint. Cancellation reuse and two concurrent readers
+produce the same candidate set in the Rust suite. The installed signed bundle then returned
+`МЕТОДОЛОГИЯ.md` at rank 2 for `метолология`, a methodology result at rank 1 for `ьуерщвщдпн`, and
+`/Users/kiri110k/work/wip` at rank 1. No stale final rows, duplicates, freeze, focus jump during
+typing, or crash appeared. That UI pass separately found an existing Escape/query-state defect;
+it is unrelated to candidate aggregation and is tracked outside this experiment.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
