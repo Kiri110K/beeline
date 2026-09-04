@@ -206,6 +206,15 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   134 Rust passed / 11 ignored, fmt и clippy зелёные. Артефакты в `/private/tmp`
   под stems `beeline-fuzzy-ancestor-scratch-20260905` и
   `beeline-fuzzy-ancestor-scratch-repeat-20260905` (`.json` + `.time`).
+- PR #62 влит в main как `8c45b2e`. Sorted q-gram candidates часто идут
+  sibling-группами, поэтому worker запоминает prepared parent `DirId` и повторно
+  отдаёт ту же lowercase ancestor slice для следующего sibling. Same-seed suite:
+  33.20 → 30.60 с (-7.8% wall, -10.6% user CPU, -6.7% instructions, -10.5%
+  cycles); paired-seed: 33.60 → 31.30 с. Path-heavy p95 улучшился на 2.7–10.1%.
+  Hits/fingerprints совпали, misses нет; 134 Rust passed / 11 ignored, fmt и
+  clippy зелёные. Артефакты в `/private/tmp` под stems
+  `beeline-fuzzy-parent-ancestor-cache-20260905` и
+  `beeline-fuzzy-parent-ancestor-cache-repeat-20260905` (`.json` + `.time`).
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
