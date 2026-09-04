@@ -415,6 +415,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   без rebuild, prewarm 16 мс, FSEvents catch-up 215 мс, overlay replay 820 мс.
   Settled physical footprint 57 MiB, startup peak 59 MiB. Rollback bundle:
   `/private/tmp/Beeline-before-qgram-single-pass-20260905.app`.
+- PR #74 влит в main как `694e0e9`. Q-grams теперь извлекаются прямо из потока
+  NFC+lowercase Unicode chars через rolling window, без временной normalized
+  String и token char vectors; builder переиспользует один bucket vector для
+  всех Items. Production rebuild ускорился с 10.2–11.1 до 7.8–8.1 с, user CPU
+  снизился на 27.9–28.1%, retired instructions — на 34.8–35.3%. Все четыре
+  sidecar побайтно совпали с live. В paired Search v2 suite все 2,200 наблюдений
+  сохранили candidates, posting visits, target ranks и top-10 fingerprints;
+  query instructions снизились на 0.36–0.37%. Полный checkpoint: 144 Rust
+  passed / 12 ignored, clippy `-D warnings`, frontend contracts, typecheck,
+  build и lint зелёные. Подробности: `prototypes/qgram-streaming-grams/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
