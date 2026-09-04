@@ -351,6 +351,23 @@ produced a byte-identical 554,313,828-byte file. Wall time changed from 18.21 to
 peak physical footprint from 543.88 to 536.09 MiB, a 7.78 MiB reduction. This is a small safe win;
 the raw 520-MiB postings vector remains the builder's dominant memory cost.
 
+## Sharded q-gram builder — 2026-09-05
+
+The builder no longer allocates the global raw postings vector. Its second Name Index pass writes
+six-byte `(local bucket, slot)` records into 64 temporary shards. Each shard covers 16,384 adjacent
+buckets. The final phase reads one shard, counting-sorts its records by local bucket while retaining
+their ascending slot order, and appends the encoded slots to the unchanged sidecar format. A drop
+guard removes the temporary directory on success or error; count checks reject partial shards.
+
+The production build emitted the same 136,481,293 postings and a byte-identical 554,313,828-byte
+sidecar with SHA-256 `33160717b15d8de5a5b8e63d818e38f2b88380cdb350874f5933c0ee5a792107`.
+Peak physical footprint fell from 536.09 to 79.83 MiB, an 85.1% reduction. Max RSS, which includes
+mapped clean pages, fell from 864.89 to 412.88 MiB. Wall time was effectively unchanged at 18.55
+versus 18.41 seconds; a repeat took 17.06 seconds and peaked at 79.92 MiB physical / 412.95 MiB RSS.
+The largest production shard held 2,872,017 postings, or 10.96 MiB as its in-memory `u32` output.
+The tradeoff is 780.95 MiB of temporary six-byte records during a rebuild. They are deleted before
+the final atomic rename returns.
+
 ## Reused fuzzy ancestor paths — 2026-09-05
 
 Multi-token fuzzy matching uses the same lowercase directory chain for the direct token-set match,

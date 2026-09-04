@@ -7,7 +7,7 @@
 use std::{
     fs::{self, File},
     io::{BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -22,6 +22,10 @@ const MAGIC: &[u8; 8] = b"BLQGM001";
 const HEADER_BYTES: usize = 40;
 const BUCKETS: usize = 1 << 20;
 const RETAINED_WORKSPACES: usize = 1;
+const BUILD_SHARDS: usize = 64;
+const BUILD_SHARD_BUCKETS: usize = BUCKETS / BUILD_SHARDS;
+const BUILD_RECORD_BYTES: usize = 6;
+const ENCODED_POSTING_SLOTS: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct CandidateSet {
@@ -41,6 +45,33 @@ pub struct QGramIndex {
 struct DenseWorkspace {
     counts: Vec<u8>,
     touched: Vec<u32>,
+}
+
+struct BuildParts {
+    path: PathBuf,
+}
+
+impl BuildParts {
+    fn create(sidecar: &Path) -> std::io::Result<Self> {
+        let path = sidecar.with_extension("qgram.parts");
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn shard(&self, shard: usize) -> PathBuf {
+        self.path.join(format!("{shard:02}.part"))
+    }
+}
+
+impl Drop for BuildParts {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 impl DenseWorkspace {
@@ -121,21 +152,32 @@ impl QGramIndex {
             offsets.push(offset);
         }
         let posting_count = *offsets.last().expect("final q-gram offset") as usize;
-        let mut positions = offsets[..BUCKETS].to_vec();
-        let mut postings = vec![0u32; posting_count];
+        // Partition `(bucket, slot)` records by the bucket's high bits. Each part is written in
+        // ascending slot order, then counting-sorted in memory and appended to the final sidecar.
+        // This replaces the 520-MiB global postings vector with one roughly 8-MiB shard.
+        let parts = BuildParts::create(path)?;
+        let mut part_writers = (0..BUILD_SHARDS)
+            .map(|shard| File::create(parts.shard(shard)).map(BufWriter::new))
+            .collect::<std::io::Result<Vec<_>>>()?;
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
                 continue;
             };
+            let slot = u32::try_from(slot)
+                .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
             for bucket in gram_buckets(entry.name) {
-                let position = &mut positions[bucket as usize];
-                postings[*position as usize] = u32::try_from(slot)
-                    .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
-                *position = position.checked_add(1).ok_or_else(|| {
-                    std::io::Error::other("q-gram write position exceeds u32 postings")
-                })?;
+                let bucket = bucket as usize;
+                let shard = bucket / BUILD_SHARD_BUCKETS;
+                let local_bucket = u16::try_from(bucket % BUILD_SHARD_BUCKETS)
+                    .expect("q-gram build shard bucket fits u16");
+                part_writers[shard].write_all(&local_bucket.to_le_bytes())?;
+                part_writers[shard].write_all(&slot.to_le_bytes())?;
             }
         }
+        for writer in &mut part_writers {
+            writer.flush()?;
+        }
+        drop(part_writers);
 
         let temporary = path.with_extension("qgram.tmp");
         let file = File::create(&temporary)?;
@@ -145,11 +187,72 @@ impl QGramIndex {
         writer.write_all(&(posting_count as u64).to_le_bytes())?;
         writer.write_all(&source_hash.to_le_bytes())?;
         writer.write_all(&(source_entries as u64).to_le_bytes())?;
-        for offset in offsets {
+        for &offset in &offsets {
             writer.write_all(&u64::from(offset).to_le_bytes())?;
         }
-        for slot in postings {
-            writer.write_all(&slot.to_le_bytes())?;
+        let mut encoded = Vec::with_capacity(ENCODED_POSTING_SLOTS * 4);
+        let mut emitted_postings = 0usize;
+        for shard in 0..BUILD_SHARDS {
+            let bytes = fs::read(parts.shard(shard))?;
+            if !bytes.len().is_multiple_of(BUILD_RECORD_BYTES) {
+                return Err(std::io::Error::other("partial q-gram build record"));
+            }
+            let records = bytes.len() / BUILD_RECORD_BYTES;
+            let first_bucket = shard * BUILD_SHARD_BUCKETS;
+            let expected_records = offsets[first_bucket + BUILD_SHARD_BUCKETS]
+                .checked_sub(offsets[first_bucket])
+                .expect("global q-gram offsets are monotone")
+                as usize;
+            if records != expected_records {
+                return Err(std::io::Error::other("q-gram shard count mismatch"));
+            }
+            emitted_postings = emitted_postings
+                .checked_add(records)
+                .ok_or_else(|| std::io::Error::other("q-gram emitted posting count overflow"))?;
+            let mut local_counts = vec![0u32; BUILD_SHARD_BUCKETS];
+            for record in bytes.chunks_exact(BUILD_RECORD_BYTES) {
+                let bucket = u16::from_le_bytes([record[0], record[1]]) as usize;
+                local_counts[bucket] = local_counts[bucket]
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket exceeds u32"))?;
+            }
+            let mut local_offsets = Vec::with_capacity(BUILD_SHARD_BUCKETS + 1);
+            local_offsets.push(0u32);
+            for count in local_counts {
+                local_offsets.push(
+                    local_offsets
+                        .last()
+                        .copied()
+                        .expect("local offset seed")
+                        .checked_add(count)
+                        .ok_or_else(|| std::io::Error::other("q-gram shard exceeds u32"))?,
+                );
+            }
+            debug_assert_eq!(
+                *local_offsets.last().expect("final local offset") as usize,
+                records
+            );
+            let mut positions = local_offsets[..BUILD_SHARD_BUCKETS].to_vec();
+            let mut postings = vec![0u32; records];
+            for record in bytes.chunks_exact(BUILD_RECORD_BYTES) {
+                let bucket = u16::from_le_bytes([record[0], record[1]]) as usize;
+                let slot = u32::from_le_bytes([record[2], record[3], record[4], record[5]]);
+                let position = &mut positions[bucket];
+                postings[*position as usize] = slot;
+                *position = position
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
+            }
+            for chunk in postings.chunks(ENCODED_POSTING_SLOTS) {
+                encoded.clear();
+                for slot in chunk {
+                    encoded.extend_from_slice(&slot.to_le_bytes());
+                }
+                writer.write_all(&encoded)?;
+            }
+        }
+        if emitted_postings != posting_count {
+            return Err(std::io::Error::other("q-gram posting count mismatch"));
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -536,6 +639,7 @@ mod tests {
         let index = persist::load(&index_path, &root).expect("load mapped test index");
         let qgram_path = dir.0.join("index.qgram");
         QGramIndex::build(&index, &qgram_path).expect("build test q-gram");
+        assert!(!qgram_path.with_extension("qgram.parts").exists());
         let qgram = QGramIndex::open(
             &qgram_path,
             index.base_content_hash().expect("base hash"),
