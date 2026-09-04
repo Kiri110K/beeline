@@ -342,8 +342,8 @@ A second 100-sample-per-case process with a different seed kept retrieval p95 be
 produce the same candidate set in the Rust suite. The installed signed bundle then returned
 `МЕТОДОЛОГИЯ.md` at rank 2 for `метолология`, a methodology result at rank 1 for `ьуерщвщдпн`, and
 `/Users/kiri110k/work/wip` at rank 1. No stale final rows, duplicates, freeze, focus jump during
-typing, or crash appeared. That UI pass separately found an existing Escape/query-state defect;
-it is unrelated to candidate aggregation and is tracked outside this experiment.
+typing, or crash appeared. The retained query remained visible after the first Escape as required
+by SPEC §5; a second real system Escape hid the window and recorded `origin: escape`.
 
 ## Known limits
 

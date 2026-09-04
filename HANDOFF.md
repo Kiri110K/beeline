@@ -153,6 +153,21 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   `/Applications/Beeline.app`, PID последнего скрытого запуска — 58924. Backup:
   `/private/tmp/Beeline-before-fsevents-20260905.app`. GitHub verdict:
   https://github.com/Kiri110K/beeline/issues/40#issuecomment-5544038900
+- PR #56 влит в main как `b4eda4c`. Q-gram retrieval больше не создаёт per-token
+  `HashMap` и общий `BTreeSet`: один переиспользуемый dense counter очищает только
+  touched slots, а плоский кандидатный список сортируется один раз. Same-seed
+  2000-query A/B: 127.62 → 101.32 с, candidate retrieval p95 быстрее в 3.8–7.8x,
+  peak physical 91.44 → 90.90 MiB, все final hits/fingerprints совпали. Повторные
+  1000 queries с другим seed дали retrieval p95 0.055–4.625 мс и peak 67.95 MiB.
+  Signed build стоит в `/Applications/Beeline.app`; UI ranks: `метолология` 2,
+  `ьуерщвщдпн` 1, `work wip` 1. JSON-отчёты:
+  `/private/tmp/beeline-qgram-dense-baseline-20260905.json`,
+  `/private/tmp/beeline-qgram-dense-candidate-20260905.json` и
+  `/private/tmp/beeline-qgram-dense-repeat-20260905.json`; рядом лежат `.time`.
+  GUI report: `/private/tmp/beeline-qgram-dense-ui.uasaJz/report.md`. Его FAIL по
+  Escape был ошибкой проверки: SPEC §5 требует оставить query видимым после
+  закрытия Search Results, а второй настоящий Escape скрыл окно. Ошибочный #57
+  закрыт с коррекцией: https://github.com/Kiri110K/beeline/issues/57#issuecomment-5544278704
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
