@@ -231,6 +231,22 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   targets. 134 Rust passed / 11 ignored, fmt и clippy зелёные. Артефакты в
   `/private/tmp` имеют prefix `beeline-path-final-first-`; это baseline,
   candidate, candidate-repeat и standard JSON/time pairs.
+- PR #64 влит в main как `836e6a4`. Для ordinary multi-token verifier теперь
+  сначала доказывает обязательный Item-name match и сохраняет его качество;
+  false-positive candidate уходит до ancestor work. Implicit Path Interpretation
+  тоже проверяет final name первым. Расширенный 11-case suite: 32.50 → 19.80 с
+  (-39.1% wall, -47.1% user CPU, -52.5% instructions, -47.1% cycles). Final p95:
+  `work wip` -54.1%, `vault methodology` -37.6%, `status report` -55.7%. Repeat:
+  19.40 с с теми же hits/fingerprints и zero misses. 134 Rust passed / 11
+  ignored, fmt и clippy зелёные. Артефакты в `/private/tmp` под stems
+  `beeline-fuzzy-multi-name-first-20260905` и
+  `beeline-fuzzy-multi-name-first-repeat-20260905` (`.json` + `.time`).
+- После PR #63 был установлен signed bundle с code commit `ca125b2`: startup
+  FSEvents catch-up 20,438 paths за 599 мс, overlay replay 514 мс, full diff
+  skipped; после оседания 37 MiB physical footprint, 0 окон, process не
+  frontmost. PID 11837. Backup предыдущего dense-qgram bundle:
+  `/private/tmp/Beeline-before-search-verifier-20260905.app`. Этот установленный
+  bundle ещё не содержит PR #64; его надо заменить следующей сборкой main.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
