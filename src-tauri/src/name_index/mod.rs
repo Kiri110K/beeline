@@ -1600,6 +1600,41 @@ mod tests {
     }
 
     #[test]
+    fn child_event_refreshes_parent_mtime_for_next_startup_diff() {
+        let dir = TempDir::new();
+        touch(&dir.path().join("sub/a.txt"));
+        let junk = JunkPatterns::default();
+        let shared = new_index(dir.path());
+        crawl::initial_crawl(&shared, dir.path().to_path_buf(), &junk, None);
+        let subdir = dir.path().join("sub");
+        let dir_id = shared.read().unwrap().resolve_dir(&subdir).unwrap();
+        let before = shared.read().unwrap().node(dir_id).unwrap().mtime_ms;
+
+        thread::sleep(std::time::Duration::from_millis(5));
+        let added = subdir.join("b.txt");
+        touch(&added);
+        crawl::apply_fs_event(&mut shared.write().unwrap(), &added, &junk);
+
+        let after = shared.read().unwrap().node(dir_id).unwrap().mtime_ms;
+        assert!(after >= before);
+        let disk = fs::metadata(&subdir)
+            .map(|metadata| {
+                use std::time::UNIX_EPOCH;
+                i64::try_from(
+                    metadata
+                        .modified()
+                        .unwrap()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert_eq!(after, disk);
+    }
+
+    #[test]
     fn wide_new_subtree_is_indexed_once() {
         let dir = TempDir::new();
         touch(&dir.path().join("existing.txt"));

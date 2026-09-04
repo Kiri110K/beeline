@@ -116,6 +116,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   ограничен 100,000 путей, а при 64 MiB файл переписывается через temp+fsync+
   rename. Тест crash-replay покрывает add, remove, rename и file→directory с
   descendant; полный checkpoint — 132 Rust passed / 9 ignored и clippy green.
+- Два последующих live restart остались функционально корректны, но diff-rescan
+  занял 3.42/3.85 s и не прошёл `<2 s` acceptance #40. Найдена причина повторной
+  работы: file-level FSEvent обновлял Item, но не mtime его parent directory.
+  `apply_fs_event` теперь сохраняет parent mtime и для обычных, и для Junk events;
+  startup telemetry пишет visited/reconciled/missing/Junk directory counts. Это
+  покрыто отдельным тестом; checkpoint — 133 Rust passed / 9 ignored.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

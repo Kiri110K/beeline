@@ -257,6 +257,7 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) ->
     if tier == Tier::Junk {
         if let Some(parent) = data.resolve_dir(parent_path) {
             data.junk_dirty.insert(parent);
+            refresh_dir_mtime(data, parent, parent_path);
         }
         return FsApplyStats::default();
     }
@@ -271,7 +272,7 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) ->
         return FsApplyStats::default();
     };
 
-    match fs::symlink_metadata(path) {
+    let stats = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.is_dir() {
                 // FSEvents on a dir means its direct children changed. Reconcile an
@@ -327,6 +328,17 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) ->
             removed: data.remove_child_count(parent, &name),
             indexed_subtree: false,
         },
+    };
+    // Directory mtimes represent changes to their direct children. FSEvents commonly
+    // reports only the child path; without refreshing its parent, every restart re-reads
+    // that directory even though the journal already reconstructed the change.
+    refresh_dir_mtime(data, parent, parent_path);
+    stats
+}
+
+fn refresh_dir_mtime(data: &mut IndexData, dir_id: DirId, path: &Path) {
+    if let Ok(metadata) = fs::metadata(path) {
+        data.set_node_mtime(dir_id, mtime_ms(&metadata));
     }
 }
 
@@ -468,17 +480,36 @@ pub fn diff_rescan(
     app: Option<&AppHandle>,
 ) {
     let started = Instant::now();
-    diff_rescan_tree(shared, root, junk);
+    let stats = diff_rescan_tree(shared, root, junk);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let entries = shared.read().expect("name index lock poisoned").len();
     record(
         app,
         "index_diff_rescan_finished",
-        json!({ "entries": entries, "duration_ms": duration_ms }),
+        json!({
+            "entries": entries,
+            "duration_ms": duration_ms,
+            "visited_dirs": stats.visited,
+            "reconciled_dirs": stats.reconciled,
+            "missing_dirs": stats.missing,
+            "junk_dirs": stats.junk,
+        }),
     );
 }
 
-fn diff_rescan_tree(shared: &Arc<RwLock<IndexData>>, root: PathBuf, junk: &JunkPatterns) {
+#[derive(Default)]
+struct DiffStats {
+    visited: usize,
+    reconciled: usize,
+    missing: usize,
+    junk: usize,
+}
+
+fn diff_rescan_tree(
+    shared: &Arc<RwLock<IndexData>>,
+    root: PathBuf,
+    junk: &JunkPatterns,
+) -> DiffStats {
     fn enqueue_once(dir_id: DirId, seen: &mut Vec<bool>, pending: &mut Vec<DirId>) {
         let position = dir_id as usize;
         if position >= seen.len() {
@@ -493,9 +524,11 @@ fn diff_rescan_tree(shared: &Arc<RwLock<IndexData>>, root: PathBuf, junk: &JunkP
     let initial_nodes = shared.read().expect("name index lock poisoned").node_len();
     let mut seen = vec![false; initial_nodes];
     let mut pending = Vec::new();
+    let mut stats = DiffStats::default();
     enqueue_once(0, &mut seen, &mut pending);
 
     while let Some(dir_id) = pending.pop() {
+        stats.visited += 1;
         let current = {
             let index = shared.read().expect("name index lock poisoned");
             index
@@ -506,16 +539,21 @@ fn diff_rescan_tree(shared: &Arc<RwLock<IndexData>>, root: PathBuf, junk: &JunkP
             continue;
         };
         if tier == Tier::Junk {
+            stats.junk += 1;
             continue; // Lazy: Junk is refreshed on a targeting query, not on startup.
         }
 
         let disk_mtime = fs::metadata(&path).map(|meta| mtime_ms(&meta)).ok();
         match disk_mtime {
             Some(disk_mtime) if disk_mtime != stored_mtime => {
+                stats.reconciled += 1;
                 reconcile_dir(shared, dir_id, &path, &root, junk);
             }
             Some(_) => {}
-            None => continue, // Directory is gone; its parent's reconcile removes it.
+            None => {
+                stats.missing += 1;
+                continue;
+            } // Directory is gone; its parent's reconcile removes it.
         }
 
         let children = shared
@@ -526,6 +564,7 @@ fn diff_rescan_tree(shared: &Arc<RwLock<IndexData>>, root: PathBuf, junk: &JunkP
             enqueue_once(child_id, &mut seen, &mut pending);
         }
     }
+    stats
 }
 
 /// One completed lazy Junk refresh, used by energy telemetry.
