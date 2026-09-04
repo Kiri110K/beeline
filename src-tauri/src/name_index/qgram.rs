@@ -196,13 +196,15 @@ impl QGramIndex {
             .map(|shard| BuildShardWriter::create(&parts.shard(shard)))
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut counts = vec![0u32; BUCKETS];
+        let mut gram_scratch = Vec::new();
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
                 continue;
             };
             let slot = u32::try_from(slot)
                 .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
-            for bucket in gram_buckets(entry.name) {
+            gram_buckets_into(entry.name, &mut gram_scratch);
+            for &bucket in &gram_scratch {
                 let bucket = bucket as usize;
                 let count = &mut counts[bucket];
                 *count = count
@@ -702,17 +704,30 @@ fn normalize(value: &str) -> String {
 }
 
 fn gram_buckets(value: &str) -> Vec<u32> {
-    let normalized = normalize(value);
-    let mut buckets = normalized
-        .split(|character: char| !character.is_alphanumeric())
-        .flat_map(|token| {
-            let characters = token.chars().collect::<Vec<_>>();
-            characters.windows(3).map(bucket).collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let mut buckets = Vec::new();
+    gram_buckets_into(value, &mut buckets);
+    buckets
+}
+
+fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
+    buckets.clear();
+    let mut previous = [None, None];
+    for character in value.nfc().flat_map(char::to_lowercase) {
+        if !character.is_alphanumeric() {
+            previous = [None, None];
+            continue;
+        }
+        match previous {
+            [None, _] => previous[0] = Some(character),
+            [Some(_), None] => previous[1] = Some(character),
+            [Some(first), Some(second)] => {
+                buckets.push(bucket(&[first, second, character]));
+                previous = [Some(second), Some(character)];
+            }
+        }
+    }
     buckets.sort_unstable();
     buckets.dedup();
-    buckets
 }
 
 fn bucket(gram: &[char]) -> u32 {
@@ -887,6 +902,33 @@ mod tests {
         assert!(gram_buckets("ab").is_empty());
         assert_eq!(gram_buckets("abcd").len(), 2);
         assert_eq!(significant_len("work/w"), 5);
+    }
+
+    #[test]
+    fn streaming_qgrams_match_the_normalized_token_reference() {
+        for value in [
+            "Methodology",
+            "метолология",
+            "re\u{301}sume\u{301}",
+            "İstanbul",
+            "foo--bar_baz",
+            "a1b2c3",
+            "😀abc🔥def",
+            "AAaaAA",
+        ] {
+            let normalized = normalize(value);
+            let mut expected = normalized
+                .split(|character: char| !character.is_alphanumeric())
+                .flat_map(|token| {
+                    let characters = token.chars().collect::<Vec<_>>();
+                    characters.windows(3).map(bucket).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            expected.dedup();
+
+            assert_eq!(gram_buckets(value), expected, "{value}");
+        }
     }
 
     #[test]
