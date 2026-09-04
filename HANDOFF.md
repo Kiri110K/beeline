@@ -247,6 +247,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   frontmost. PID 11837. Backup предыдущего dense-qgram bundle:
   `/private/tmp/Beeline-before-search-verifier-20260905.app`. Этот установленный
   bundle ещё не содержит PR #64; его надо заменить следующей сборкой main.
+- Signed bundle с PR #64 затем установлен в `/Applications/Beeline.app`, PID
+  15111, hidden/0 windows, SHA совпал с build artifact. Startup FSEvents catch-up:
+  3,263 paths / 139 мс; replay 16,635 applied paths / 734 мс; full diff skipped.
+  Через quiet window обнаружен новый energy-хвост: 499 dirty Junk dirs drained за
+  15,047 мс на external power. Backup предыдущего ночного bundle:
+  `/private/tmp/Beeline-before-multi-name-first-20260905.app`.
+- `experiment/junk-single-child-snapshot` (`140fe5d`) отклонён. Удаление второго
+  `direct_children` прохода не изменило широкий `target/debug/deps` reconcile:
+  baseline 160–172 мс, candidate 151–171 мс, средняя разница <2%. Главная цена —
+  перечисление всех ~90k siblings. Код и verdict сохранены в remote-ветке; main
+  должен пробовать deferred exact-path apply вместо parent-directory rescan.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
