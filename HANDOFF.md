@@ -128,6 +128,11 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   прямым parent→child обходом, четырьмя bounded utility workers проверяет metadata,
   затем parent-first применяет только реально changed directories с повторной
   проверкой identity. Watcher gate всё это время закрыт, поэтому snapshot стабилен.
+- Первый live-pass этой версии дал 4.97 s: workers ошибочно получили background
+  QoS, который на macOS throttles metadata IO (противоречило уже записанному
+  правилу самого crawl module). Workers переключены на utility QoS. Telemetry
+  дополнена отдельными `snapshot_ms`, `metadata_ms`, `apply_ms` для следующего
+  измерения; total остаётся источником acceptance.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

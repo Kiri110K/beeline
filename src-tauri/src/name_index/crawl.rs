@@ -494,6 +494,9 @@ pub fn diff_rescan(
             "reconciled_dirs": stats.reconciled,
             "missing_dirs": stats.missing,
             "junk_dirs": stats.junk,
+            "snapshot_ms": stats.snapshot_ms,
+            "metadata_ms": stats.metadata_ms,
+            "apply_ms": stats.apply_ms,
         }),
     );
 }
@@ -504,6 +507,9 @@ struct DiffStats {
     reconciled: usize,
     missing: usize,
     junk: usize,
+    snapshot_ms: u64,
+    metadata_ms: u64,
+    apply_ms: u64,
 }
 
 fn diff_rescan_tree(
@@ -518,6 +524,7 @@ fn diff_rescan_tree(
     }
 
     let mut stats = DiffStats::default();
+    let snapshot_started = Instant::now();
     let snapshots = {
         let index = shared.read().expect("name index lock poisoned");
         let mut snapshots = Vec::with_capacity(index.node_len());
@@ -542,6 +549,7 @@ fn diff_rescan_tree(
         }
         snapshots
     };
+    stats.snapshot_ms = u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Metadata probes dominate a warm startup. The index snapshot is immutable until the
     // watcher gate opens, so four bounded workers can stat disjoint slices without locks.
@@ -551,13 +559,14 @@ fn diff_rescan_tree(
         .unwrap_or(1)
         .clamp(1, 4);
     let chunk_size = snapshots.len().div_ceil(workers).max(1);
+    let metadata_started = Instant::now();
     thread::scope(|scope| {
         for (snapshot_chunk, output_chunk) in snapshots
             .chunks(chunk_size)
             .zip(disk_mtimes.chunks_mut(chunk_size))
         {
             scope.spawn(move || {
-                set_background_qos();
+                set_crawl_qos();
                 for (snapshot, output) in snapshot_chunk.iter().zip(output_chunk) {
                     *output = fs::metadata(&snapshot.path)
                         .map(|metadata| mtime_ms(&metadata))
@@ -566,6 +575,7 @@ fn diff_rescan_tree(
             });
         }
     });
+    stats.metadata_ms = u64::try_from(metadata_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut changed = Vec::new();
     for (snapshot, disk_mtime) in snapshots.into_iter().zip(disk_mtimes) {
@@ -582,6 +592,7 @@ fn diff_rescan_tree(
             .cmp(&right.path.components().count())
             .then_with(|| left.path.cmp(&right.path))
     });
+    let apply_started = Instant::now();
     for snapshot in changed {
         let still_same_directory = {
             let index = shared.read().expect("name index lock poisoned");
@@ -592,6 +603,7 @@ fn diff_rescan_tree(
             reconcile_dir(shared, snapshot.id, &snapshot.path, &root, junk);
         }
     }
+    stats.apply_ms = u64::try_from(apply_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     stats
 }
 
