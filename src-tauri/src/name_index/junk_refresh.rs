@@ -89,12 +89,13 @@ impl JunkRefresh {
         refresh
     }
 
-    fn dirty_dirs(&self) -> usize {
-        self.data
-            .read()
-            .expect("name index lock poisoned")
-            .junk_dirty
-            .len()
+    fn pending(&self) -> (usize, usize, bool) {
+        let index = self.data.read().expect("name index lock poisoned");
+        (
+            index.junk_dirty.len(),
+            index.junk_changed_paths.len(),
+            index.junk_paths_saturated,
+        )
     }
 
     fn record(&self, event: &str, fields: serde_json::Value) {
@@ -110,7 +111,7 @@ impl JunkRefresh {
         let junk = self.junk.read().expect("junk lock poisoned").clone();
         let outcome = crawl::drain_junk_dirty(&self.data, &self.root, &junk);
         self.scheduled_recorded.store(false, Ordering::Release);
-        if outcome.dirty_dirs == 0 {
+        if outcome.dirty_dirs == 0 && outcome.retained_paths == 0 {
             return;
         }
         self.deferred_recorded.store(false, Ordering::Release);
@@ -119,14 +120,17 @@ impl JunkRefresh {
             json!({
                 "reason": reason,
                 "dirty_dirs": outcome.dirty_dirs,
+                "retained_paths": outcome.retained_paths,
+                "exact_paths": outcome.exact_paths,
+                "fallback_dirs": outcome.fallback_dirs,
                 "duration_ms": outcome.duration_ms,
             }),
         );
     }
 
     pub fn after_fs_burst(&self) {
-        let dirty_dirs = self.dirty_dirs();
-        if dirty_dirs == 0 {
+        let (dirty_dirs, exact_paths, paths_saturated) = self.pending();
+        if dirty_dirs == 0 && exact_paths == 0 {
             // This exposes a missed-parent/index inconsistency without scheduling an empty
             // five-second wakeup. It is emitted only for a path classified as Junk by the
             // watcher, so ordinary filesystem traffic cannot create noise here.
@@ -134,7 +138,14 @@ impl JunkRefresh {
             return;
         }
         if !self.scheduled_recorded.swap(true, Ordering::AcqRel) {
-            self.record("junk_rescan_scheduled", json!({ "dirty_dirs": dirty_dirs }));
+            self.record(
+                "junk_rescan_scheduled",
+                json!({
+                    "dirty_dirs": dirty_dirs,
+                    "exact_paths": exact_paths,
+                    "paths_saturated": paths_saturated,
+                }),
+            );
         }
         if let Some(tx) = &self.idle_tx {
             // Capacity one deliberately coalesces bursts while the quiet-window worker is
@@ -150,8 +161,8 @@ impl JunkRefresh {
     }
 
     fn after_fs_burst_for_reason(&self, source: PowerSource, reason: &str) {
-        let dirty_dirs = self.dirty_dirs();
-        if dirty_dirs == 0 {
+        let (dirty_dirs, exact_paths, paths_saturated) = self.pending();
+        if dirty_dirs == 0 && exact_paths == 0 {
             return;
         }
         if source == PowerSource::External {
@@ -161,16 +172,26 @@ impl JunkRefresh {
         if !self.deferred_recorded.swap(true, Ordering::AcqRel) {
             self.record(
                 "junk_rescan_deferred",
-                json!({ "source": source.as_str(), "dirty_dirs": dirty_dirs }),
+                json!({
+                    "source": source.as_str(),
+                    "dirty_dirs": dirty_dirs,
+                    "exact_paths": exact_paths,
+                    "paths_saturated": paths_saturated,
+                }),
             );
         }
     }
 
     pub fn power_source_changed(&self, source: PowerSource) {
-        self.record(
-            "power_source_changed",
-            json!({ "source": source.as_str(), "junk_dirty": self.dirty_dirs() }),
-        );
+        self.record("power_source_changed", {
+            let (dirty_dirs, exact_paths, paths_saturated) = self.pending();
+            json!({
+                "source": source.as_str(),
+                "junk_dirty": dirty_dirs,
+                "junk_exact_paths": exact_paths,
+                "junk_paths_saturated": paths_saturated,
+            })
+        });
         if source == PowerSource::External {
             self.drain("external_power");
         }

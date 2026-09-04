@@ -32,6 +32,13 @@ use crate::{
 
 /// Progress telemetry cadence: one event per this many indexed entries.
 const PROGRESS_STEP: usize = 100_000;
+/// Bound deferred exact Junk paths. If a single quiet-window burst exceeds this, the drain
+/// falls back to the older per-directory reconcile without retaining an unbounded path set.
+const MAX_PENDING_JUNK_PATHS: usize = 100_000;
+/// Listing one directory wins once a burst changed many of its direct children. Below this count,
+/// exact `stat`/apply avoids cloning and hashing every untouched sibling. The value is deliberately
+/// conservative; the production 90k-child reference directory crosses over far below it.
+const MAX_EXACT_JUNK_PATHS_PER_DIR: usize = 256;
 
 /// Steady-state index work (FSEvents increments, junk drains) stays at background
 /// QoS: rare small bursts where throttling costs nothing. The libSystem shim lives in
@@ -236,10 +243,19 @@ fn index_subtree_into(
     added
 }
 
-/// Apply a single filesystem change at `path` to the index. Junk paths are not
-/// rescanned; the containing directory is marked dirty for a later lazy refresh
-/// (SPEC §6). Non-Junk changes are applied immediately.
+/// Apply a single filesystem change at `path` to the index. Junk paths are retained for a
+/// later exact-path drain and their containing directory is kept as the bounded-overflow
+/// fallback (SPEC §6). Non-Junk changes are applied immediately.
 pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) -> FsApplyStats {
+    apply_fs_event_with_junk_policy(data, path, junk, true)
+}
+
+fn apply_fs_event_with_junk_policy(
+    data: &mut IndexData,
+    path: &Path,
+    junk: &JunkPatterns,
+    defer_junk: bool,
+) -> FsApplyStats {
     if path == data.root {
         let root = data.root.clone();
         let mtime = fs::metadata(path)
@@ -255,7 +271,14 @@ pub fn apply_fs_event(data: &mut IndexData, path: &Path, junk: &JunkPatterns) ->
         return FsApplyStats::default();
     };
 
-    if tier == Tier::Junk {
+    if tier == Tier::Junk && defer_junk {
+        if !data.junk_paths_saturated {
+            data.junk_changed_paths.insert(path.to_path_buf());
+            if data.junk_changed_paths.len() > MAX_PENDING_JUNK_PATHS {
+                data.junk_changed_paths.clear();
+                data.junk_paths_saturated = true;
+            }
+        }
         if let Some(parent) = data.resolve_dir(parent_path) {
             data.junk_dirty.insert(parent);
             refresh_dir_mtime(data, parent, parent_path);
@@ -621,37 +644,122 @@ pub(crate) fn diff_rescan_tree_with_workers(
 /// One completed lazy Junk refresh, used by energy telemetry.
 pub struct JunkDrainOutcome {
     pub dirty_dirs: usize,
+    pub retained_paths: usize,
+    pub exact_paths: usize,
+    pub fallback_dirs: usize,
     pub duration_ms: u64,
 }
 
-/// Reconcile every dirty Junk directory, then clear the dirty set. A targeting query always
-/// calls this; filesystem-idle and external-power callers are gated by the energy policy.
-/// Only direct children are compared. Existing descendants keep their stable slots, while a
-/// genuinely new directory is crawled once from its nearest indexed parent.
+struct PendingJunkDrain {
+    dirty_dirs: Vec<(DirId, PathBuf)>,
+    changed_paths: Vec<(Option<DirId>, PathBuf)>,
+    paths_saturated: bool,
+}
+
+/// Apply every retained Junk event path, then clear the dirty set. A targeting query always calls
+/// this; filesystem-idle and external-power callers are gated by the energy policy. Exact files
+/// avoid enumerating their siblings. Existing directory events still reconcile direct children,
+/// and a genuinely new directory is crawled once from its nearest indexed parent. If the retained
+/// path cap was exceeded, fall back to reconciling the dirty parent directories.
 pub fn drain_junk_dirty(
     shared: &Arc<RwLock<IndexData>>,
     root: &Path,
     junk: &JunkPatterns,
 ) -> JunkDrainOutcome {
     let started = Instant::now();
-    let mut dirty: Vec<(DirId, PathBuf)> = {
+    let PendingJunkDrain {
+        dirty_dirs: dirty,
+        changed_paths,
+        paths_saturated,
+    } = {
         let mut index = shared.write().expect("name index lock poisoned");
         let ids: HashSet<DirId> = index.junk_dirty.drain().collect();
-        ids.into_iter()
+        let dirty = ids
+            .into_iter()
             .filter_map(|id| index.node(id).map(|_| (id, index.full_path(id))))
-            .collect()
+            .collect();
+        let pending_paths: Vec<PathBuf> = index.junk_changed_paths.drain().collect();
+        let changed_paths = pending_paths
+            .into_iter()
+            .map(|path| {
+                let parent = path.parent().and_then(|parent| index.resolve_dir(parent));
+                (parent, path)
+            })
+            .collect();
+        let paths_saturated = std::mem::take(&mut index.junk_paths_saturated);
+        PendingJunkDrain {
+            dirty_dirs: dirty,
+            changed_paths,
+            paths_saturated,
+        }
     };
+    let dirty_dirs = dirty.len();
+    let retained_paths = changed_paths.len();
+    let mut parent_counts = HashMap::<DirId, usize>::new();
+    for (parent, _) in &changed_paths {
+        if let Some(parent) = parent {
+            *parent_counts.entry(*parent).or_default() += 1;
+        }
+    }
+    let dense_parents: HashSet<DirId> = parent_counts
+        .iter()
+        .filter_map(|(&parent, &count)| (count > MAX_EXACT_JUNK_PATHS_PER_DIR).then_some(parent))
+        .collect();
+    let grouped_parents: HashSet<DirId> = parent_counts.into_keys().collect();
+
+    let (mut exact, mut fallback): (Vec<PathBuf>, Vec<(DirId, PathBuf)>) =
+        if paths_saturated || changed_paths.is_empty() {
+            (Vec::new(), dirty)
+        } else {
+            let exact = changed_paths
+                .into_iter()
+                .filter_map(|(parent, path)| {
+                    (!parent.is_some_and(|parent| dense_parents.contains(&parent))).then_some(path)
+                })
+                .collect();
+            let fallback = dirty
+                .into_iter()
+                .filter(|(id, _)| dense_parents.contains(id) || !grouped_parents.contains(id))
+                .collect();
+            (exact, fallback)
+        };
+    let exact_paths = exact.len();
+    let fallback_dirs = fallback.len();
+
+    if !exact.is_empty() {
+        exact.sort_unstable_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        let mut indexed_subtrees = HashSet::new();
+        for path in exact {
+            if path
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| indexed_subtrees.contains(ancestor))
+            {
+                continue;
+            }
+            let mut index = shared.write().expect("name index lock poisoned");
+            let stats = apply_fs_event_with_junk_policy(&mut index, &path, junk, false);
+            if stats.indexed_subtree {
+                indexed_subtrees.insert(path);
+            }
+        }
+    }
+
     // A parent reconcile can remove, replace, or create a child directory. Visit parents
     // first, then verify the captured identity before touching each descendant.
-    dirty.sort_unstable_by(|left, right| {
+    fallback.sort_unstable_by(|left, right| {
         left.1
             .components()
             .count()
             .cmp(&right.1.components().count())
             .then_with(|| left.1.cmp(&right.1))
     });
-    let dirty_dirs = dirty.len();
-    for (id, path) in dirty {
+    for (id, path) in fallback {
         let still_same_directory = {
             let index = shared.read().expect("name index lock poisoned");
             index.node(id).is_some() && index.full_path(id) == path
@@ -662,6 +770,9 @@ pub fn drain_junk_dirty(
     }
     JunkDrainOutcome {
         dirty_dirs,
+        retained_paths,
+        exact_paths,
+        fallback_dirs,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
 }

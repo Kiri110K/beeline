@@ -509,6 +509,8 @@ pub struct IndexData {
     live: usize,
     dirty: bool,
     pub junk_dirty: HashSet<DirId>,
+    pub junk_changed_paths: HashSet<PathBuf>,
+    pub junk_paths_saturated: bool,
     pub revision: u64,
 }
 
@@ -536,6 +538,8 @@ impl IndexData {
             live: 0,
             dirty: true,
             junk_dirty: HashSet::new(),
+            junk_changed_paths: HashSet::new(),
+            junk_paths_saturated: false,
             revision: 0,
         }
     }
@@ -570,6 +574,8 @@ impl IndexData {
             live: entry_count,
             dirty: false,
             junk_dirty: HashSet::new(),
+            junk_changed_paths: HashSet::new(),
+            junk_paths_saturated: false,
             revision: 0,
         }
     }

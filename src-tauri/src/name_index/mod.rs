@@ -2290,6 +2290,8 @@ mod tests {
         let outcome = crawl::drain_junk_dirty(&shared, root, &patterns);
         let index = shared.read().unwrap();
         assert_eq!(outcome.dirty_dirs, 2);
+        assert_eq!(outcome.exact_paths, 1);
+        assert_eq!(outcome.fallback_dirs, 1);
         assert_eq!(index.resolve_item_slot(&stable), Some(stable_slot));
         assert!(index.resolve_item_slot(&new_file).is_some());
         assert!(index.junk_dirty.is_empty());
@@ -2306,6 +2308,34 @@ mod tests {
         let index = shared.read().unwrap();
         let replacement = index.resolve_dir(&stable).unwrap();
         assert!(index.has_child(replacement, "nested.txt"));
+    }
+
+    #[test]
+    fn dense_junk_burst_reconciles_the_parent_once() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        let junk_dir = root.join("target/deps");
+        let paths = (0..300)
+            .map(|index| junk_dir.join(format!("artifact-{index}.rlib")))
+            .collect::<Vec<_>>();
+        for path in &paths {
+            touch(path);
+        }
+        let patterns = JunkPatterns::default();
+        let shared = new_index(root);
+        crawl::initial_crawl(&shared, root.to_path_buf(), &patterns, None);
+        {
+            let mut index = shared.write().unwrap();
+            for path in &paths {
+                crawl::apply_fs_event(&mut index, path, &patterns);
+            }
+        }
+
+        let outcome = crawl::drain_junk_dirty(&shared, root, &patterns);
+        assert_eq!(outcome.retained_paths, 300);
+        assert_eq!(outcome.exact_paths, 0);
+        assert_eq!(outcome.fallback_dirs, 1);
+        assert!(shared.read().unwrap().junk_dirty.is_empty());
     }
 
     // FSEvents delivery is environment- and timing-dependent, so the real watcher is
@@ -2648,6 +2678,107 @@ mod tests {
         );
         assert_eq!(outcome.dirty_dirs, 1);
         assert!(shared.read().unwrap().junk_dirty.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_junk_exact_path_drain_timing() {
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let target_dir = std::env::var_os("BEELINE_LIVE_JUNK_DIR")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_JUNK_DIR to an indexed Junk directory");
+        let changed_path = fs::read_dir(&target_dir)
+            .expect("read live Junk directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("live Junk directory needs one direct file");
+        let patterns = JunkPatterns::default();
+        let index = persist::load(&index_path, &root).expect("load live persisted index");
+        assert!(index.resolve_item_slot(&changed_path).is_some());
+        let shared = Arc::new(RwLock::new(index));
+        crawl::apply_fs_event(&mut shared.write().unwrap(), &changed_path, &patterns);
+
+        let started = Instant::now();
+        let outcome = crawl::drain_junk_dirty(&shared, &root, &patterns);
+        println!(
+            "live Junk exact path drain: {} path in {:.3} ms, fallback dirs {}",
+            outcome.exact_paths,
+            started.elapsed().as_secs_f64() * 1000.0,
+            outcome.fallback_dirs
+        );
+        assert_eq!(outcome.exact_paths, 1);
+        assert_eq!(outcome.fallback_dirs, 0);
+        assert!(shared.read().unwrap().junk_dirty.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_junk_journal_drain_matrix() {
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let app_data = index_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("index path must be under app data/name_index");
+        let journal = OverlayJournal::load(app_data, &root).expect("load overlay journal");
+        let patterns = JunkPatterns::default();
+        let paths = journal
+            .replay_paths()
+            .expect("read overlay journal")
+            .into_iter()
+            .filter(|path| {
+                path.strip_prefix(&root)
+                    .is_ok_and(|relative| patterns.classify(relative) == model::Tier::Junk)
+            })
+            .collect::<Vec<_>>();
+
+        for directory_fallback in [true, false] {
+            let index = persist::load(&index_path, &root).expect("load live persisted index");
+            let shared = Arc::new(RwLock::new(index));
+            {
+                let mut index = shared.write().unwrap();
+                for path in &paths {
+                    crawl::apply_fs_event(&mut index, path, &patterns);
+                }
+                if directory_fallback {
+                    index.junk_changed_paths.clear();
+                    index.junk_paths_saturated = true;
+                }
+            }
+            let outcome = crawl::drain_junk_dirty(&shared, &root, &patterns);
+            let mismatch_count = {
+                let index = shared.read().unwrap();
+                paths
+                    .iter()
+                    .filter(|path| {
+                        let exists = fs::symlink_metadata(path).is_ok();
+                        let indexed = index.resolve_item_slot(path).is_some();
+                        exists != indexed
+                    })
+                    .count()
+            };
+            println!(
+                "live Junk journal drain: mode={} source_paths={} retained={} exact={} fallback_dirs={} duration_ms={} live_items={} path_mismatches={}",
+                if directory_fallback { "directory" } else { "hybrid" },
+                paths.len(),
+                outcome.retained_paths,
+                outcome.exact_paths,
+                outcome.fallback_dirs,
+                outcome.duration_ms,
+                shared.read().unwrap().len(),
+                mismatch_count,
+            );
+        }
     }
 
     #[test]
