@@ -5,10 +5,11 @@ Claude Code на этом Маке, без доступа к прошлой.
 
 ## Задача словами Кирилла
 
-Довести реализацию Beeline alpha «до конца, чтобы всё было сделано» по спеке
-`/Users/kiri110k/lab/beeline/docs/SPEC.md`. Кодит Опус, приоритетно версия 4.8
-(`claude --model claude-opus-4-8 -p`, codex с имплементации снят — Кирилл
-считает его код некрасивым). Fable решает, ревьюит и проверяет живьём.
+Ночной goal от 05.09: без участия Кирилла закончить определённые части Search v2
+и performance/energy fixes, проверять установленное приложение и сохранять
+checkpoints в git/GitHub. Когда основной backlog закончится, исследовать в
+отдельных ветках альтернативы производительности и энергопотребления. Не брать
+отложенные продуктовые решения, которым нужен Кирилл.
 
 ## Источник правды по прогрессу
 
@@ -139,6 +140,19 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   не алгоритмом или шириной. `diff_rescan` теперь держит ровно на время проверки
   `NSProcessInfo` activity `UserInitiatedAllowingIdleSystemSleep`: она снимает Nap,
   но не запрещает system sleep, и завершается RAII-drop после diff.
+- #40 закрыта коммитом `0a8e27f`. Обычный startup больше не делает 128k `stat`:
+  после регистрации live watcher нативный FSEvents cursor возвращает изменения
+  с прошлого durable checkpoint, они fsync-ятся в bounded journal и replay-ятся.
+  Dropped/wrapped history, отсутствие cursor и journal saturation fail closed к
+  full diff с атомарной base compaction; compaction начинается при 80k путей до
+  hard limit 100k. Первый migration-pass: diff 1819 мс, compaction 2220 мс,
+  peak main/WebContent около 81/36 MiB. Два обычных guarded restart: catch-up
+  74/15 мс, replay 19/32 мс, full diff пропущен, process-tree peak 93/94 MiB.
+  Переписанная production base структурно загрузилась за 216 мс; q-gram на обоих
+  рестартах открылся без helper. Signed `0a8e27f` стоит в
+  `/Applications/Beeline.app`, PID последнего скрытого запуска — 58924. Backup:
+  `/private/tmp/Beeline-before-fsevents-20260905.app`. GitHub verdict:
+  https://github.com/Kiri110K/beeline/issues/40#issuecomment-5544038900
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
