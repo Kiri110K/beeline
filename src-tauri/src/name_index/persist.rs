@@ -404,6 +404,12 @@ pub fn save(shared: &Arc<RwLock<IndexData>>, path: &Path) -> std::io::Result<()>
         shape.arena_len,
     )?;
     fs::rename(&temp_path, path)?;
+    if let Some(parent) = path.parent() {
+        // The journal and FSEvents cursor may advance immediately after this returns. Make
+        // the directory entry durable first so a power loss cannot resurrect the old base
+        // while preserving the newer cursor.
+        File::open(parent)?.sync_all()?;
+    }
     // The file was checksummed while writing, synced, and structurally produced from a
     // live IndexData. Bind that validation to the final inode for the next launch.
     if let Ok(identity) = FileIdentity::read(path) {

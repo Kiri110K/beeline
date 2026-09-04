@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 const SCHEMA_VERSION: u32 = 1;
 const LOG_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNIQUE_PATHS: usize = 100_000;
+const COMPACTION_PATHS: usize = 80_000;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,6 +42,14 @@ struct State {
 #[derive(Clone)]
 pub struct OverlayJournal {
     inner: Arc<Inner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordOutcome {
+    /// False means the bounded journal could not retain every new unique path. Callers
+    /// that need a complete filesystem checkpoint must fall back to a full diff.
+    pub all_recorded: bool,
+    pub appended_paths: usize,
 }
 
 impl OverlayJournal {
@@ -66,7 +75,10 @@ impl OverlayJournal {
 
     /// Append before applying the matching in-memory mutations. A crash may therefore
     /// replay one event twice, but can never lose an acknowledged watcher batch.
-    pub fn record_paths<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> io::Result<()> {
+    pub fn record_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> io::Result<RecordOutcome> {
         let mut relative = BTreeSet::new();
         for path in paths {
             let Ok(path) = path.strip_prefix(&self.inner.root) else {
@@ -77,7 +89,10 @@ impl OverlayJournal {
             }
         }
         if relative.is_empty() {
-            return Ok(());
+            return Ok(RecordOutcome {
+                all_recorded: true,
+                appended_paths: 0,
+            });
         }
         let mut state = self
             .inner
@@ -85,13 +100,17 @@ impl OverlayJournal {
             .lock()
             .map_err(|_| io::Error::other("overlay journal lock is poisoned"))?;
         let remaining = MAX_UNIQUE_PATHS.saturating_sub(state.seen.len());
-        let new_paths = relative
+        let mut new_paths = relative
             .into_iter()
             .filter(|path| !state.seen.contains(path))
-            .take(remaining)
             .collect::<Vec<_>>();
+        let all_recorded = new_paths.len() <= remaining;
+        new_paths.truncate(remaining);
         if new_paths.is_empty() {
-            return Ok(());
+            return Ok(RecordOutcome {
+                all_recorded,
+                appended_paths: 0,
+            });
         }
         for path in &new_paths {
             serde_json::to_writer(
@@ -105,11 +124,15 @@ impl OverlayJournal {
             state.file.write_all(b"\n")?;
         }
         state.file.flush()?;
+        let appended_paths = new_paths.len();
         state.seen.extend(new_paths);
         if state.file.metadata()?.len() > LOG_BUDGET_BYTES {
             self.compact_locked(&mut state)?;
         }
-        Ok(())
+        Ok(RecordOutcome {
+            all_recorded,
+            appended_paths,
+        })
     }
 
     pub fn replay_paths(&self) -> io::Result<Vec<PathBuf>> {
@@ -131,6 +154,23 @@ impl OverlayJournal {
             .lock()
             .map(|state| state.seen.len())
             .unwrap_or(MAX_UNIQUE_PATHS)
+    }
+
+    pub fn needs_base_compaction(&self) -> bool {
+        self.retained_paths() >= COMPACTION_PATHS
+    }
+
+    /// Make every appended path durable before a newer FSEvents cursor is committed.
+    /// Ordinary live watcher batches only need `flush`: their event IDs are newer than the
+    /// saved cursor and CoreServices can replay them after a process or machine crash.
+    pub fn sync(&self) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overlay journal lock is poisoned"))?;
+        state.file.flush()?;
+        state.file.sync_data()
     }
 
     /// A newly written full base already contains every earlier delta. Ordinary mapped-base

@@ -241,6 +241,7 @@ name = "beeline"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "fsevent-sys",
  "memchr",
  "notify",
  "objc2",

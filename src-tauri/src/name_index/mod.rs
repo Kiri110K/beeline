@@ -10,6 +10,7 @@
 mod alias;
 mod benchmark;
 mod crawl;
+mod fsevent_history;
 mod junk;
 mod junk_refresh;
 mod model;
@@ -227,16 +228,97 @@ impl NameIndex {
             let qgram_file = qgram_file.clone();
             let qgrams = qgrams.clone();
             let overlay_journal = overlay_journal.clone();
+            let app_data_dir = app_data_dir.clone();
             thread::spawn(move || {
                 crawl::set_crawl_qos();
                 // The watcher is registered before the crawl begins, so changes made during
                 // the crawl are queued. Applying them waits until compaction finishes below.
-                let _ = watcher_ready.recv();
+                let watcher_registered = watcher_ready.recv().is_ok();
+                let startup_cursor = watcher_registered
+                    .then(fsevent_history::current_event_id)
+                    .flatten();
                 if had_persisted {
                     let entries = data.read().expect("name index lock poisoned").len();
                     record(&app, "index_loaded", json!({ "entries": entries }));
+
+                    let previous_cursor = fsevent_history::load_checkpoint(&app_data_dir);
+                    let mut catch_up_complete = false;
+                    let mut next_cursor = startup_cursor;
+                    if watcher_registered {
+                        if let Some(since) = previous_cursor {
+                            let started = Instant::now();
+                            let mut catch_up = fsevent_history::catch_up(&root, since);
+                            next_cursor = Some(catch_up.checkpoint);
+                            catch_up.paths.retain(|path| {
+                                path.starts_with(&root) && !path.starts_with(&app_data_dir)
+                            });
+                            let paths = catch_up.paths.len();
+                            let mut appended_paths = 0usize;
+                            let mut all_recorded = false;
+                            if catch_up.complete {
+                                match overlay_journal
+                                    .record_paths(catch_up.paths.iter().map(PathBuf::as_path))
+                                {
+                                    Ok(outcome) => {
+                                        appended_paths = outcome.appended_paths;
+                                        all_recorded = outcome.all_recorded;
+                                    }
+                                    Err(error) => {
+                                        catch_up.reason =
+                                            Some(format!("cannot checkpoint catch-up: {error}"));
+                                        record(
+                                            &app,
+                                            "index_overlay_journal_failed",
+                                            json!({
+                                                "phase": "fsevent_catch_up_append",
+                                                "error": error.to_string(),
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                            catch_up_complete = catch_up.complete && all_recorded;
+                            if catch_up.complete && !all_recorded && catch_up.reason.is_none() {
+                                catch_up.reason =
+                                    Some("bounded overlay journal is full".to_owned());
+                            }
+                            record(
+                                &app,
+                                "index_fsevent_catch_up",
+                                json!({
+                                    "since": since,
+                                    "checkpoint": catch_up.checkpoint,
+                                    "paths": paths,
+                                    "appended_paths": appended_paths,
+                                    "complete": catch_up_complete,
+                                    "reason": catch_up.reason,
+                                    "duration_ms": u64::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                }),
+                            );
+                        } else {
+                            record(
+                                &app,
+                                "index_fsevent_catch_up",
+                                json!({
+                                    "complete": false,
+                                    "reason": "no saved FSEvent cursor",
+                                }),
+                            );
+                        }
+                    } else {
+                        record(
+                            &app,
+                            "index_fsevent_catch_up",
+                            json!({
+                                "complete": false,
+                                "reason": "live filesystem watcher did not register",
+                            }),
+                        );
+                    }
+
                     let replay_started = Instant::now();
-                    match overlay_journal.replay_paths() {
+                    let replay_succeeded = match overlay_journal.replay_paths() {
                         Ok(paths) => {
                             let queued_paths = paths.len();
                             let (applied_paths, added, removed) =
@@ -253,18 +335,102 @@ impl NameIndex {
                                         .unwrap_or(u64::MAX),
                                 }),
                             );
+                            true
                         }
-                        Err(error) => record(
+                        Err(error) => {
+                            record(
+                                &app,
+                                "index_overlay_journal_failed",
+                                json!({ "phase": "replay", "error": error.to_string() }),
+                            );
+                            false
+                        }
+                    };
+
+                    let needs_full_diff = !catch_up_complete || !replay_succeeded;
+                    if needs_full_diff {
+                        crawl::diff_rescan(&data, root.clone(), &crawl_junk, Some(&app));
+                    } else {
+                        record(
                             &app,
-                            "index_overlay_journal_failed",
-                            json!({ "phase": "replay", "error": error.to_string() }),
-                        ),
+                            "index_diff_rescan_skipped",
+                            json!({ "reason": "complete FSEvents catch-up" }),
+                        );
                     }
-                    crawl::diff_rescan(&data, root.clone(), &crawl_junk, Some(&app));
+
+                    // A full diff can discover changes absent from the path journal. Fold it
+                    // into a new mmap base before advancing the cursor. The same bounded
+                    // compaction handles a journal nearing its fixed 100k-path ceiling.
+                    let needs_base_compaction = watcher_registered
+                        && (needs_full_diff || overlay_journal.needs_base_compaction());
+                    let mut checkpoint_safe = catch_up_complete && replay_succeeded;
+                    if needs_base_compaction {
+                        let compact_started = Instant::now();
+                        let base_was_dirty =
+                            data.read().expect("name index lock poisoned").is_dirty();
+                        match persist::save(&data, &index_file) {
+                            Ok(()) => {
+                                if let Err(error) = overlay_journal.reset() {
+                                    checkpoint_safe = false;
+                                    record(
+                                        &app,
+                                        "index_overlay_journal_failed",
+                                        json!({ "phase": "reset", "error": error.to_string() }),
+                                    );
+                                } else {
+                                    checkpoint_safe = true;
+                                }
+                                record(
+                                    &app,
+                                    "index_base_compacted",
+                                    json!({
+                                        "duration_ms": u64::try_from(
+                                            compact_started.elapsed().as_millis()
+                                        )
+                                        .unwrap_or(u64::MAX),
+                                        "base_changed": base_was_dirty,
+                                    }),
+                                );
+                                if base_was_dirty {
+                                    *qgrams.write().expect("q-gram lock poisoned") = None;
+                                    load_or_build_qgrams(
+                                        data.clone(),
+                                        index_file.clone(),
+                                        root.clone(),
+                                        qgram_file.clone(),
+                                        qgrams.clone(),
+                                        app.clone(),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                checkpoint_safe = false;
+                                record(
+                                    &app,
+                                    "index_base_compaction_failed",
+                                    json!({ "error": error.to_string() }),
+                                );
+                            }
+                        }
+                    }
+
+                    if checkpoint_safe {
+                        if let Some(cursor) = next_cursor {
+                            let checkpoint_result = overlay_journal.sync().and_then(|()| {
+                                fsevent_history::save_checkpoint(&app_data_dir, cursor)
+                            });
+                            if let Err(error) = checkpoint_result {
+                                record(
+                                    &app,
+                                    "index_fsevent_checkpoint_failed",
+                                    json!({ "error": error.to_string() }),
+                                );
+                            }
+                        }
+                    }
                     let index = data.read().expect("name index lock poisoned");
-                    // The immutable base remains mapped; the append-only path journal is
-                    // the persistent overlay checkpoint. A full 5M-entry rewrite would make
-                    // the old mmap and growing temp file resident together.
+                    // Between bounded base compactions, the mmap remains immutable and the
+                    // durable path journal is its restartable overlay checkpoint.
                     record(
                         &app,
                         "index_overlay_checkpointed",
@@ -277,17 +443,20 @@ impl NameIndex {
                 } else {
                     crawl::initial_crawl(&data, root.clone(), &crawl_junk, Some(&app));
                     let persist_started = Instant::now();
-                    match persist::save(&data, &index_file) {
-                        Ok(()) => record(
-                            &app,
-                            "index_persist_finished",
-                            json!({
-                                "duration_ms": u64::try_from(
-                                    persist_started.elapsed().as_millis()
-                                )
-                                .unwrap_or(u64::MAX),
-                            }),
-                        ),
+                    let persisted = match persist::save(&data, &index_file) {
+                        Ok(()) => {
+                            record(
+                                &app,
+                                "index_persist_finished",
+                                json!({
+                                    "duration_ms": u64::try_from(
+                                        persist_started.elapsed().as_millis()
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                }),
+                            );
+                            true
+                        }
                         Err(error) => {
                             record(
                                 &app,
@@ -295,22 +464,35 @@ impl NameIndex {
                                 json!({ "error": error.to_string() }),
                             );
                             eprintln!("name index persist after crawl failed: {error}");
+                            false
                         }
-                    }
-                    load_or_build_qgrams(
-                        data.clone(),
-                        index_file,
-                        root,
-                        qgram_file,
-                        qgrams,
-                        app.clone(),
-                    );
-                    if let Err(error) = overlay_journal.reset() {
-                        record(
-                            &app,
-                            "index_overlay_journal_failed",
-                            json!({ "phase": "reset", "error": error.to_string() }),
+                    };
+                    if persisted {
+                        load_or_build_qgrams(
+                            data.clone(),
+                            index_file.clone(),
+                            root.clone(),
+                            qgram_file.clone(),
+                            qgrams.clone(),
+                            app.clone(),
                         );
+                        if let Err(error) = overlay_journal.reset() {
+                            record(
+                                &app,
+                                "index_overlay_journal_failed",
+                                json!({ "phase": "reset", "error": error.to_string() }),
+                            );
+                        } else if let Some(cursor) = startup_cursor {
+                            if let Err(error) =
+                                fsevent_history::save_checkpoint(&app_data_dir, cursor)
+                            {
+                                record(
+                                    &app,
+                                    "index_fsevent_checkpoint_failed",
+                                    json!({ "error": error.to_string() }),
+                                );
+                            }
+                        }
                     }
                 }
                 // Applying FSEvents concurrently with the first crawl can discover the same
