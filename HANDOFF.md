@@ -133,6 +133,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   правилу самого crawl module). Workers переключены на utility QoS. Telemetry
   дополнена отдельными `snapshot_ms`, `metadata_ms`, `apply_ms` для следующего
   измерения; total остаётся источником acceptance.
+- Headless release matrix на production base: 1/2/4/8/12 workers дали первый
+  проход 400/139/93/82/82 ms metadata; повторные 8/4/2/1 — 94/86/122/205 ms.
+  Значит 4 workers достаточно, а многосекундный GUI tail вызван process App Nap,
+  не алгоритмом или шириной. `diff_rescan` теперь держит ровно на время проверки
+  `NSProcessInfo` activity `UserInitiatedAllowingIdleSystemSleep`: она снимает Nap,
+  но не запрещает system sleep, и завершается RAII-drop после diff.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

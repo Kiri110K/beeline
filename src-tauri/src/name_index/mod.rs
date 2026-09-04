@@ -2365,6 +2365,41 @@ mod tests {
     // depth, and tier distribution (#31).
     #[test]
     #[ignore]
+    fn live_diff_worker_matrix() {
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let app_data = index_path
+            .parent()
+            .and_then(Path::parent)
+            .expect("index path must be under app data/name_index");
+        let journal = OverlayJournal::load(app_data, &root).expect("load overlay journal");
+        let replay = journal.replay_paths().expect("read overlay journal");
+        let junk = JunkPatterns::default();
+
+        for workers in [1, 2, 4, 8, 12, 8, 4, 2, 1] {
+            let index = persist::load(&index_path, &root).expect("load live persisted index");
+            let shared = Arc::new(RwLock::new(index));
+            watcher::replay_paths(&shared, &root, &junk, replay.clone());
+            let started = Instant::now();
+            let stats = crawl::diff_rescan_tree_with_workers(&shared, root.clone(), &junk, workers);
+            println!(
+                "workers={workers} total_ms={} snapshot_ms={} metadata_ms={} apply_ms={} visited={} reconciled={}",
+                started.elapsed().as_millis(),
+                stats.snapshot_ms,
+                stats.metadata_ms,
+                stats.apply_ms,
+                stats.visited,
+                stats.reconciled,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn live_mapped_subtree_removal_timing() {
         let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
             .map(PathBuf::from)

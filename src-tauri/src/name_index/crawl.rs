@@ -480,6 +480,7 @@ pub fn diff_rescan(
     junk: &JunkPatterns,
     app: Option<&AppHandle>,
 ) {
+    let _activity = crate::qos::begin_bounded_startup_activity("Beeline startup index diff");
     let started = Instant::now();
     let stats = diff_rescan_tree(shared, root, junk);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -502,20 +503,33 @@ pub fn diff_rescan(
 }
 
 #[derive(Default)]
-struct DiffStats {
-    visited: usize,
-    reconciled: usize,
-    missing: usize,
-    junk: usize,
-    snapshot_ms: u64,
-    metadata_ms: u64,
-    apply_ms: u64,
+pub(crate) struct DiffStats {
+    pub(crate) visited: usize,
+    pub(crate) reconciled: usize,
+    pub(crate) missing: usize,
+    pub(crate) junk: usize,
+    pub(crate) snapshot_ms: u64,
+    pub(crate) metadata_ms: u64,
+    pub(crate) apply_ms: u64,
 }
 
 fn diff_rescan_tree(
     shared: &Arc<RwLock<IndexData>>,
     root: PathBuf,
     junk: &JunkPatterns,
+) -> DiffStats {
+    let workers = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .clamp(1, 4);
+    diff_rescan_tree_with_workers(shared, root, junk, workers)
+}
+
+pub(crate) fn diff_rescan_tree_with_workers(
+    shared: &Arc<RwLock<IndexData>>,
+    root: PathBuf,
+    junk: &JunkPatterns,
+    workers: usize,
 ) -> DiffStats {
     struct DirectorySnapshot {
         id: DirId,
@@ -554,10 +568,7 @@ fn diff_rescan_tree(
     // Metadata probes dominate a warm startup. The index snapshot is immutable until the
     // watcher gate opens, so four bounded workers can stat disjoint slices without locks.
     let mut disk_mtimes = vec![None; snapshots.len()];
-    let workers = thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .clamp(1, 4);
+    let workers = workers.clamp(1, snapshots.len().max(1));
     let chunk_size = snapshots.len().div_ceil(workers).max(1);
     let metadata_started = Instant::now();
     thread::scope(|scope| {
