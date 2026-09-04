@@ -186,21 +186,38 @@ impl QGramIndex {
             fs::create_dir_all(parent)?;
         }
 
-        // The on-disk format keeps 64-bit offsets, but one build cannot create more than
-        // u32::MAX postings without exceeding the current sidecar and addressable-slot
-        // contracts. Keeping all three build tables at u32 saves 12 MiB of anonymous memory.
+        // One build cannot create more than u32::MAX postings without exceeding the current
+        // sidecar and addressable-slot contracts. Keep build counts and offsets at u32.
+        // Partition `(bucket, slot)` records by the bucket's high bits while counting them, so
+        // every Item name is normalized and hashed only once. Each part is written in ascending
+        // slot order, then counting-sorted in memory and appended to the final sidecar.
+        let parts = BuildParts::create(path)?;
+        let mut part_writers = (0..BUILD_SHARDS)
+            .map(|shard| BuildShardWriter::create(&parts.shard(shard)))
+            .collect::<std::io::Result<Vec<_>>>()?;
         let mut counts = vec![0u32; BUCKETS];
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
                 continue;
             };
+            let slot = u32::try_from(slot)
+                .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
             for bucket in gram_buckets(entry.name) {
-                let count = &mut counts[bucket as usize];
+                let bucket = bucket as usize;
+                let count = &mut counts[bucket];
                 *count = count
                     .checked_add(1)
                     .ok_or_else(|| std::io::Error::other("q-gram bucket exceeds u32 postings"))?;
+                let shard = bucket / BUILD_SHARD_BUCKETS;
+                let local_bucket = u16::try_from(bucket % BUILD_SHARD_BUCKETS)
+                    .expect("q-gram build shard bucket fits u16");
+                part_writers[shard].write(local_bucket, slot)?;
             }
         }
+        for writer in &mut part_writers {
+            writer.flush()?;
+        }
+        drop(part_writers);
 
         let mut offsets = Vec::with_capacity(BUCKETS + 1);
         offsets.push(0u32);
@@ -214,31 +231,6 @@ impl QGramIndex {
             offsets.push(offset);
         }
         let posting_count = *offsets.last().expect("final q-gram offset") as usize;
-        // Partition `(bucket, slot)` records by the bucket's high bits. Each part is written in
-        // ascending slot order, then counting-sorted in memory and appended to the final sidecar.
-        // This replaces the 520-MiB global postings vector with one roughly 8-MiB shard.
-        let parts = BuildParts::create(path)?;
-        let mut part_writers = (0..BUILD_SHARDS)
-            .map(|shard| BuildShardWriter::create(&parts.shard(shard)))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        for slot in 0..source_entries {
-            let Some(entry) = index.entry(slot) else {
-                continue;
-            };
-            let slot = u32::try_from(slot)
-                .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
-            for bucket in gram_buckets(entry.name) {
-                let bucket = bucket as usize;
-                let shard = bucket / BUILD_SHARD_BUCKETS;
-                let local_bucket = u16::try_from(bucket % BUILD_SHARD_BUCKETS)
-                    .expect("q-gram build shard bucket fits u16");
-                part_writers[shard].write(local_bucket, slot)?;
-            }
-        }
-        for writer in &mut part_writers {
-            writer.flush()?;
-        }
-        drop(part_writers);
 
         let temporary = path.with_extension("qgram.tmp");
         let file = File::create(&temporary)?;
