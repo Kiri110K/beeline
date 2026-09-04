@@ -1147,6 +1147,24 @@ pub async fn reset_learned_ranking(state: State<'_, NameIndex>) -> Result<(), St
         .map_err(|error| format!("failed to reset learned ranking: {error}"))
 }
 
+/// Follow a rename or same-volume move performed by Beeline. Directory rebinds also move
+/// every retained descendant association, preserving the user-visible Item continuity.
+#[tauri::command]
+pub async fn rebind_search_memory(
+    previous_path: String,
+    next_path: String,
+    state: State<'_, NameIndex>,
+) -> Result<(), String> {
+    let memory = state.search_memory.clone();
+    let timestamp = now_ms();
+    tauri::async_runtime::spawn_blocking(move || {
+        memory.rebind(&previous_path, &next_path, timestamp)
+    })
+    .await
+    .map_err(|_| "Search Memory rebind task failed".to_owned())?
+    .map_err(|error| format!("failed to rebind Search Memory: {error}"))
+}
+
 /// Strictly load and atomically activate `ranker.json`. Missing means embedded default;
 /// invalid input leaves the previous active snapshot untouched. The event makes the
 /// frontend rerun the unchanged active query with a new request sequence.

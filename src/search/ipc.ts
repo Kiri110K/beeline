@@ -139,6 +139,15 @@ export function resetLearnedRanking(): ResultAsync<null, ShellError> {
   );
 }
 
+export function rebindSearchMemory(
+  previousPath: string,
+  nextPath: string,
+): ResultAsync<null, ShellError> {
+  return fromTauri("rebind_search_memory", unitSchema, () =>
+    invoke("rebind_search_memory", { previousPath, nextPath }),
+  );
+}
+
 export function reloadRankerConfig(): ResultAsync<RankerReloadOutcome, ShellError> {
   return fromTauri("reload_ranker_config", rankerReloadOutcomeSchema, () =>
     invoke("reload_ranker_config"),

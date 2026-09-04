@@ -64,6 +64,8 @@ enum Interpretation {
 struct LearnedRecord {
     schema_version: u32,
     path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_path: Option<String>,
     query: Option<String>,
     interpretation: Option<Interpretation>,
     points: u32,
@@ -115,6 +117,10 @@ struct Aggregate {
 
 impl Aggregate {
     fn apply(&mut self, record: &LearnedRecord) {
+        if let Some(previous) = &record.previous_path {
+            self.rebind(previous, &record.path);
+            return;
+        }
         match (&record.query, record.interpretation) {
             (Some(query), Some(interpretation)) if !query.is_empty() => {
                 self.associations
@@ -132,6 +138,40 @@ impl Aggregate {
                 .or_default()
                 .apply(record.points, record.timestamp_ms),
             _ => {}
+        }
+    }
+
+    fn rebind(&mut self, previous: &str, next: &str) {
+        let usage = self
+            .usage
+            .keys()
+            .filter_map(|path| rebind_path(path, previous, next).map(|next| (path.clone(), next)))
+            .collect::<Vec<_>>();
+        for (old_path, new_path) in usage {
+            if let Some(stats) = self.usage.remove(&old_path) {
+                merge_stats(self.usage.entry(new_path).or_default(), stats);
+            }
+        }
+        let associations = self
+            .associations
+            .keys()
+            .filter_map(|key| {
+                rebind_path(&key.path, previous, next).map(|path| {
+                    (
+                        key.clone(),
+                        AssociationKey {
+                            query: key.query.clone(),
+                            interpretation: key.interpretation,
+                            path,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (old_key, new_key) in associations {
+            if let Some(stats) = self.associations.remove(&old_key) {
+                merge_stats(self.associations.entry(new_key).or_default(), stats);
+            }
         }
     }
 
@@ -294,6 +334,7 @@ impl SearchMemory {
         let mut records = vec![LearnedRecord {
             schema_version: SCHEMA_VERSION,
             path: path.to_owned(),
+            previous_path: None,
             query: None,
             interpretation: None,
             points: signal.points(),
@@ -303,6 +344,7 @@ impl SearchMemory {
             records.push(LearnedRecord {
                 schema_version: SCHEMA_VERSION,
                 path: path.to_owned(),
+                previous_path: None,
                 query: Some(query.clone()),
                 interpretation: Some(Interpretation::Ordinary),
                 points: signal.points(),
@@ -312,6 +354,7 @@ impl SearchMemory {
                 records.push(LearnedRecord {
                     schema_version: SCHEMA_VERSION,
                     path: path.to_owned(),
+                    previous_path: None,
                     query: Some(query),
                     interpretation: Some(Interpretation::Path),
                     points: signal.points(),
@@ -343,6 +386,29 @@ impl SearchMemory {
             self.compact_locked(&mut file)?;
         }
         Ok(())
+    }
+
+    pub fn rebind(&self, previous: &str, next: &str, timestamp_ms: i64) -> io::Result<()> {
+        let record = LearnedRecord {
+            schema_version: SCHEMA_VERSION,
+            path: next.to_owned(),
+            previous_path: Some(previous.to_owned()),
+            query: None,
+            interpretation: None,
+            points: 0,
+            timestamp_ms,
+        };
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("search memory file lock is poisoned"))?;
+        self.aggregate
+            .write()
+            .map_err(|_| io::Error::other("search memory aggregate lock is poisoned"))?
+            .apply(&record);
+        serde_json::to_writer(&mut *file, &record).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()
     }
 
     pub fn evidence(&self, query: &str, now_ms: i64) -> MemoryEvidence {
@@ -407,6 +473,7 @@ impl SearchMemory {
                 &LearnedRecord {
                     schema_version: SCHEMA_VERSION,
                     path: path.clone(),
+                    previous_path: None,
                     query: None,
                     interpretation: None,
                     points: u32::try_from(stats.points).unwrap_or(u32::MAX),
@@ -420,6 +487,7 @@ impl SearchMemory {
                 &LearnedRecord {
                     schema_version: SCHEMA_VERSION,
                     path: key.path.clone(),
+                    previous_path: None,
                     query: Some(key.query.clone()),
                     interpretation: Some(key.interpretation),
                     points: u32::try_from(stats.points).unwrap_or(u32::MAX),
@@ -434,6 +502,19 @@ impl SearchMemory {
         *active = replacement;
         Ok(())
     }
+}
+
+fn merge_stats(target: &mut Stats, incoming: Stats) {
+    target.points = target.points.saturating_add(incoming.points);
+    target.last_ms = target.last_ms.max(incoming.last_ms);
+}
+
+fn rebind_path(path: &str, previous: &str, next: &str) -> Option<String> {
+    if path == previous {
+        return Some(next.to_owned());
+    }
+    let suffix = path.strip_prefix(previous)?.strip_prefix('/')?;
+    Some(format!("{next}/{suffix}"))
 }
 
 fn write_record(output: &mut File, record: &LearnedRecord) -> io::Result<()> {
@@ -730,5 +811,45 @@ mod tests {
             .evidence("report", 3_000 + 2 * HALF_LIFE_DAYS * DAY_MS)
             .boost(path, &config);
         assert!(aged < strong);
+    }
+
+    #[test]
+    fn rebind_moves_item_and_descendant_evidence_and_survives_reload() {
+        let dir = TempDir::new();
+        let old = "/tmp/project";
+        let old_child = "/tmp/project/docs/report.md";
+        let next = "/tmp/project-renamed";
+        {
+            let memory = SearchMemory::load(&dir.0).expect("load");
+            memory
+                .record(
+                    old_child,
+                    Some("report"),
+                    false,
+                    SignalKind::CompletedAction,
+                    1_000,
+                )
+                .expect("record");
+            memory.rebind(old, next, 2_000).expect("rebind");
+            assert_eq!(
+                memory
+                    .evidence("report", 2_000)
+                    .boost(old_child, &RankerConfig::default()),
+                0
+            );
+            assert!(
+                memory.evidence("report", 2_000).boost(
+                    "/tmp/project-renamed/docs/report.md",
+                    &RankerConfig::default()
+                ) > 0
+            );
+        }
+        let reloaded = SearchMemory::load(&dir.0).expect("reload");
+        assert!(
+            reloaded.evidence("report", 2_000).boost(
+                "/tmp/project-renamed/docs/report.md",
+                &RankerConfig::default()
+            ) > 0
+        );
     }
 }

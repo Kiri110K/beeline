@@ -52,6 +52,11 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   конфиг сохраняет прежний порядок; отдельный тест доказывает изменение порядка
   одним weight без изменения retrieval. Зелёные: 120 Rust passed / 9 ignored,
   clippy `-D warnings`, frontend contracts, lint, typecheck и production build.
+- Learned identity теперь переносится при Rename внутри Beeline: rebind меняет
+  сам Item и все retained descendant paths, сливает уже существующую статистику
+  нового пути и воспроизводится из NDJSON после restart. Copy File/Path, Open in
+  Terminal/Editor, Reveal in Finder и Open in New Tab также дают strong signal
+  только после успешного dispatch; Trash/Delete/failed actions не обучают.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.

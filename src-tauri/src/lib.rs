@@ -35,8 +35,8 @@ use listing::{
     list_location_window, validate_directory, ListingSessions,
 };
 use name_index::{
-    record_search_signal, record_visit, reload_ranker_config, reset_learned_ranking,
-    search_name_index_v2, NameIndex,
+    rebind_search_memory, record_search_signal, record_visit, reload_ranker_config,
+    reset_learned_ranking, search_name_index_v2, NameIndex,
 };
 use operations::{
     cancel_operation, create_folder, delete_items_permanently, open_in_app, paste_copy, paste_move,
@@ -650,6 +650,7 @@ pub fn run() {
             quick_look_show,
             quick_look_update,
             quit_app,
+            rebind_search_memory,
             record_search_signal,
             record_visit,
             reload_ranker_config,

@@ -71,6 +71,7 @@ import type {
   ListLocationWindowResponse,
 } from "../location/schema";
 import {
+  rebindSearchMemory,
   recordSearchSignal,
   recordVisit,
   searchNameIndex,
@@ -1927,11 +1928,15 @@ export function useTabs(
         return;
       }
       opsDispatch({ type: "setClipboard", paths });
-      void copyToClipboard(paths.join("\n")).match(() => undefined, reportShellError);
-      fireTelemetry("clipboard_copied", { count: paths.length });
-      afterAction("copy_file");
+      void copyToClipboard(paths.join("\n")).match(() => {
+        for (const path of paths) {
+          recordLearnedSignal(path, "completed_action");
+        }
+        fireTelemetry("clipboard_copied", { count: paths.length });
+        afterAction("copy_file");
+      }, reportShellError);
     });
-  }, [afterAction, withSelectedPaths]);
+  }, [afterAction, withSelectedPaths, recordLearnedSignal]);
 
   // Copy Path: textual only (§8) — the path(s) to the system clipboard, newline-separated.
   // Does not touch the in-app file-reference clipboard. Copy Path hides the window (§12).
@@ -1945,10 +1950,13 @@ export function useTabs(
         return;
       }
       void copyToClipboard(paths.join("\n")).match(() => {
+        for (const path of paths) {
+          recordLearnedSignal(path, "completed_action");
+        }
         afterAction("copy_path");
       }, reportShellError);
     });
-  }, [afterAction, withSelectedPaths]);
+  }, [afterAction, withSelectedPaths, recordLearnedSignal]);
 
   // Cmd+V / Paste: paste-copy the clipboard file references into the current Location; a
   // same-Location paste duplicates (the engine suffixes). No-op without a clipboard or a
@@ -2119,6 +2127,11 @@ export function useTabs(
       const location = tabById(stateRef.current, activeId)?.browse.location;
       void renameItem(rename.path, trimmed).match(
         (newPath) => {
+          void rebindSearchMemory(rename.path, newPath).match(
+            () => undefined,
+            reportShellError,
+          );
+          recordLearnedSignal(newPath, "completed_action");
           opsDispatch({ type: "cancelRename" });
           if (location !== undefined) {
             navigate(activeId, location, "replace", newPath);
@@ -2141,7 +2154,7 @@ export function useTabs(
         },
       );
     },
-    [navigate, afterAction],
+    [navigate, afterAction, recordLearnedSignal],
   );
 
   // New Folder (§8): create in the current Location, then enter inline rename on the new
@@ -2238,6 +2251,7 @@ export function useTabs(
       }
       void openInApp(target, bundle).match(
         () => {
+          recordLearnedSignal(item.path, "completed_action");
           afterAction("open_terminal");
         },
         (error) => {
@@ -2249,7 +2263,7 @@ export function useTabs(
         },
       );
     })();
-  }, [afterAction, resolveSlot, openSettings]);
+  }, [afterAction, resolveSlot, openSettings, recordLearnedSignal]);
 
   // Open in Editor (§8): a file opens as a file; a directory opens as a project. `open -b`
   // hands the path to the editor, which treats a directory argument as a project root.
@@ -2272,6 +2286,7 @@ export function useTabs(
       }
       void openInApp(target, bundle).match(
         () => {
+          recordLearnedSignal(item.path, "completed_action");
           afterAction("open_editor");
         },
         (error) => {
@@ -2283,7 +2298,7 @@ export function useTabs(
         },
       );
     })();
-  }, [afterAction, resolveSlot, openSettings]);
+  }, [afterAction, resolveSlot, openSettings, recordLearnedSignal]);
 
   const revealSelection = useCallback((): void => {
     const active = tabById(stateRef.current, stateRef.current.activeId);
@@ -2296,6 +2311,7 @@ export function useTabs(
     }
     void revealInFinder(item.path).match(
       () => {
+        recordLearnedSignal(item.path, "completed_action");
         afterAction("reveal");
       },
       (error) => {
@@ -2306,7 +2322,7 @@ export function useTabs(
         });
       },
     );
-  }, [afterAction]);
+  }, [afterAction, recordLearnedSignal]);
 
   // Menu Open: run the Focused Item's primary action (a file opens and hides; a directory
   // is entered). Reuses the double-click / Enter path so behavior stays identical.
@@ -2351,9 +2367,10 @@ export function useTabs(
     });
     scrollTopRef.current = 0;
     navigate(id, directoryLocation(target), "replace", focusPath, true);
+    recordLearnedSignal(item.path, "completed_action");
     fireTelemetry("tab_created", { kind: "temporary" });
     afterAction("open_in_new_tab");
-  }, [navigate, afterAction]);
+  }, [navigate, afterAction, recordLearnedSignal]);
 
   // App-scope Refresh: re-list the active Tab in place. Keep the window open (§12).
   const refresh = useCallback((): void => {
