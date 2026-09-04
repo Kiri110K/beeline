@@ -1,11 +1,11 @@
-# HANDOFF — реализация Beeline v1
+# HANDOFF — реализация Beeline alpha
 
 Обновляется после каждого закрытого куска работы. Читатель — новая сессия
 Claude Code на этом Маке, без доступа к прошлой.
 
 ## Задача словами Кирилла
 
-Довести реализацию Beeline v1 «до конца, чтобы всё было сделано» по спеке
+Довести реализацию Beeline alpha «до конца, чтобы всё было сделано» по спеке
 `/Users/kiri110k/lab/beeline/docs/SPEC.md`. Кодит Опус, приоритетно версия 4.8
 (`claude --model claude-opus-4-8 -p`, codex с имплементации снят — Кирилл
 считает его код некрасивым). Fable решает, ревьюит и проверяет живьём.
@@ -17,6 +17,20 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
 Открытый с assignee = был в работе; смотри его комментарии и `git log`.
 
 ## Search v2 wayfinder начат — 27.08
+
+- Карта решений завершена 05.09. Канонический контракт перенесён в §6, §10–12,
+  §14 и §16–17 `docs/SPEC.md`; термины Stable Item Identity и Ranked Result
+  Stream добавлены в `CONTEXT.md`. Search v2 теперь специфицирован независимо от
+  нынешнего overlay и будущей Gen2-панели.
+- Финальные alpha-бюджеты: first useful end-to-end p95 ≤50 мс, UI response ≤8 мс,
+  warm complete top-50 p95 ≤500 мс, hidden settled footprint <200 MiB, startup
+  peak <400 MiB, persisted q-gram sidecar ≤600 MiB. Learned state по умолчанию
+  ограничен 64 MiB; Ranking Traces — 30 дней или 256 MiB. Cold/rebuild остаётся
+  progressive и cancellable, но не задерживает полный Working Set.
+- Следующая реализация без нового продуктового решения: Search Memory и learned
+  usage, затем единый configurable ranker, `ranker.json`, Ranking Traces, CLI,
+  manual reload и Reset Learned Ranking. Старый ranking/persistence path удалять
+  в том же изменении; compatibility с экспериментальными данными не сохранять.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.
@@ -188,8 +202,8 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   groups полностью настраиваются: сценарии первой сборки — гипотезы, не вечные
   гарантии. Числа выбираются при integrated implementation и затем тюнингуются
   по Ranking Traces и использованию Кирилла; отдельный ranker prototype не нужен.
-- Следующий открытый frontier —
-  [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46).
+- [Prototype staged result-stream behavior](https://github.com/Kiri110K/beeline/issues/46)
+  закрыт и интегрирован в production Search v2.
   Progressive merge сохраняет по stable identity только Focused Item после
   явной result navigation; auto-focused первый Item до навигации не sticky.
   Остальной список свободно rerank; hover и scroll ничего не закрепляют и не
@@ -197,13 +211,10 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   global-running и complete; до 150 мс индикатора нет, после — Status Strip.
   Действующие бюджеты: UI response на keystroke ≤8 мс, first Search Results
   end-to-end ≤50 мс. Прототип #54 подтвердил три backend-волны и отсутствие
-  индикатора на тёплом пути. Теперь #46 должен проверить progressive merge в
-  настоящем UI: q-gram first-global p95 оставляет около 10 мс на IPC/render в
-  худшем запросе. Отдельный global-completion budget, cold/post-reboot и
-  окончательные memory/disk пределы решает #47 после integrated pass.
-- В рамках карты production-код не менять. Каждая HITL-сессия использует
-  `grilling` и `domain-modeling`; карта хранит указатели, ответы живут в resolution
-  comments соответствующих decision tickets.
+  индикатора на тёплом пути. Integrated UI проверен: `метолология` дала first
+  useful paint 17 мс и complete 51 мс; `ьуерщвщдпн` — first global 36 мс и
+  complete 288 мс во время startup diff-rescan; `work wip` — first useful 17 мс
+  и правильный ordered path rank 1.
 
 ## Performance pass #31 завершён — 27.08
 

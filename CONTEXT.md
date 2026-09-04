@@ -36,6 +36,10 @@ _Avoid_: Tab, Place, workspace
 A file-system entry presented for inspection or action, either a file or a directory.
 _Avoid_: Result, document
 
+**Stable Item Identity**:
+The application-owned identity used to recognize the same Item across rename and same-volume move. A copy, replacement at the same path, or cross-volume copy has a different identity. Identity is evidence for continuity, never a promise that an absent Item still exists.
+_Avoid_: Path, filename, bookmark
+
 **Recents**:
 A system-derived collection of recently used Items. Recents is a collection, not a directory or navigation history.
 _Avoid_: History, recent folder
@@ -104,8 +108,12 @@ _Avoid_: Search settings, ranking code, weights file
 The local, replayable record of a Search Query, its Candidate Evidence, the active Ranker Configuration, calculated score contributions, final order, and subsequent eligible Item actions.
 _Avoid_: Telemetry, debug log, Search Memory
 
+**Ranked Result Stream**:
+The progressively updated, deterministically ordered sequence produced for a Search Query. It begins with complete Working Set results, may widen through exact and approximate global retrieval, and ends with one complete snapshot. It is independent of whether the current interface presents a separate overlay or an always-results panel.
+_Avoid_: Search overlay, candidate source, Browse Mode
+
 **Search Results**:
-A transient ranked list of Items and Locations matching a Search Query. Search Results do not change the current Location until the user Reveals one.
+A presented snapshot of the Ranked Result Stream. Merely presenting, scrolling, hovering, focusing, or selecting Search Results does not train Search Memory.
 _Avoid_: Folder contents, Recents
 
 **Reveal**:

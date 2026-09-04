@@ -1,4 +1,4 @@
-# Beeline — implementation-ready specification, version 1
+# Beeline — implementation-ready alpha specification
 
 Beeline is a personal, shortcut-driven macOS file browser that replaces Finder for everyday file access: open a copied path, use Recents, browse and preview, copy paths, delete, and open files or directories in the right application — all keyboard-first with complete mouse support. Primary user: Kirill; the reference machine is his Apple Silicon MacBook.
 
@@ -49,17 +49,47 @@ Implement the full ticket-#8 contract. Load-bearing rules:
 - The Action Menu (`Cmd+K`, `…` control, context click — one menu) shows applicable file actions with Selected Items, application actions (New Tab, Paste Path, Refresh, Settings, Quit) without. Quick Look and the Action Menu never coexist.
 - Deletion shortcut `Cmd+Delete` (configurable later); plain Delete never deletes files.
 
-## 6. Search (#21, #19, #10)
+## 6. Search v2 (#42, #43–#51, #54)
 
-- All Navigation Input text is a Search Query through one ranker; there are no input modes. Path-shaped input is a ranking signal: an existing absolute path ranks its target first, deterministically; matches under a typed path prefix get scope priority and no hidden penalty. `/`, `~`, `./`, `../` prefixes and mid-string slashes all just shape ranking; slashes in any query match path segments (#19 amendment).
-- Engine: the application's own Name Index — names and paths only, no content search in v1. Scope: the home directory plus mounted local volumes. Spotlight's only role is sourcing the Recents collection; any future Spotlight use is a new ticket (#21). Evidence constraint: Spotlight cannot serve dot-directory search at all.
-- Everything in scope is indexed — visible, hidden, and Junk. Nothing is excluded; tiers differ only in ranking penalty and refresh priority. Junk is classified by a built-in, user-editable path-pattern list (`node_modules`, `.git`, `target`, `.build`, tool caches, agent session stores). The non-Junk tier updates in real time from filesystem events; Junk refreshes lazily (idle, or a query targeting it) and may be minutes stale (#21).
-- Index lifecycle: one full background crawl on first launch (search works on partial data meanwhile); afterwards incremental via filesystem events; process start diff-rescans. A mounted local external volume is crawled on mount, leaves the index on unmount, and persists keyed by volume identity so remount only diff-rescans. Network volumes are never indexed — reachable by browsing, paths, and as Known Places (#21). Sizing evidence: 3.2 M files on the reference machine; in-memory index feasible (#21).
-- Ranking guarantees (weights are tuning, not contract): exact name match beats any penalty; RU/EN layout correction, no phonetic transliteration (#8); Visit Journal and Known Places boost; the Alias Dictionary (Settings; e.g. «загрузки» → `~/Downloads`) recommends and never filters; hidden light penalty, Junk heavy penalty; path-shaped scope priority per above. Duplicate worktrees get no structural handling; the Visit Journal lifts the active tree (#21).
-- The Visit Journal records Locations entered and files opened through the app, timestamped, local, never user-facing. Record liberally in v1; pruning the schema is prototype work (#21).
-- Search Results combine exact paths, visited Locations, current-Location matches, and global Name Index hits; results arrive progressively; reordering stops once keyboard navigation starts (#8). Empty: one "nothing found" line. Slow: one "searching" line. Failures are row states — never a banner, never the Status Strip; the current Location, selection, and scroll always survive; raw backend errors (e.g. `ENOENT`) never reach the UI (#19).
-- An inaccessible path shows "no access" as its row state; Enter still attempts entry and on failure follows the #11 policy (System Settings hint). Enter on a file path performs Reveal, never an external open (#19).
-- Hidden entries are always visible in directory listings — no toggle; their sort placement is production UX (#10).
+### 6.1 Query interpretation
+
+- Every non-empty Navigation Input value is one Search Query. Retrieval may evaluate literal name/path, exact existing path, Alias Dictionary, Keyboard Layout Correction, Typo Correction, ordinary token, and Path Interpretation evidence, but all candidates enter one ranker. There are no mutually exclusive input modes.
+- Normalize query identity with NFC, full case folding, trimmed surrounding whitespace, and collapsed internal whitespace. Preserve punctuation. An ordinary Query Family contains the same distinct tokens regardless of order or repetition.
+- Path Interpretation preserves component order, treats spaces and slashes as equivalent separators, permits omitted intermediate components, and retains the meaning of `~`, `./`, and `../`. Thus `work wip` may identify `~/work/.../wip`, but reversed components are different evidence.
+- Keyboard Layout Correction maps physical keys between supported layouts; it is not transliteration. Typo Correction supports insertion, deletion, substitution, and adjacent transposition. One interpretation may use at most one correction; corrections never compose transitively.
+
+### 6.2 Staged retrieval
+
+- Every query searches the complete Working Set first. Its current-Location component has no Item limit; each historical source is bounded independently. The Working Set is a retrieval pool, not a ranking bonus.
+- Global Name Index retrieval begins at five significant characters, inclusive. Significant characters are Unicode letters and digits after NFC; punctuation, spaces, and path separators contribute zero, and token lengths sum. An exact existing path or exact Alias Dictionary match bypasses the threshold. This value is a hot-reloadable Ranker Configuration input; changing it reruns the active query.
+- Global retrieval merges production literal/layout candidates with a persisted q-gram fuzzy supplement. The q-gram layer only retrieves candidates; exact code-defined verification produces Candidate Evidence before ranking. Full mmap fuzzy scan is a retained benchmark, not a production fallback. FST is not planned unless measured IPC/render latency or sidecar size establishes a need.
+- The Name Index covers names and paths, not file contents. Visible, hidden, and Junk Items remain searchable. Hidden and Junk affect ranking, not eligibility. Non-Junk content follows filesystem events. Junk refresh waits for five seconds of actual quiet or an explicit targeting query and reconciles only changed directory boundaries; continuous activity must not force a subtree rebuild.
+- Search works against a partial initial index. Mounted-volume indexing remains deferred to #33; network volumes are browseable but not indexed.
+
+### 6.3 Search Memory and personal evidence
+
+- Eligible interactions accumulate direct evidence. Opening an Action Menu is weak, Quick Look is medium, and a completed non-destructive Item action or entering a directory is strong. An interaction made with a query updates both Search Memory and query-independent learned usage; one without a query updates only learned usage.
+- Visibility, scroll, hover, focus, selection, cancellation, failure, Trash, and permanent deletion provide no positive evidence. Repeated events accumulate directly through a monotone saturating curve; there is no special repeat-session heuristic in this version.
+- Search Memory always records the exact normalized query and its supported interpretation. Ordinary evidence transfers at full strength within its Query Family. Path evidence remains ordered and allows omitted components. A proven layout correction may transfer. Prefix and one-token add/remove transfer are asymmetric and penalized. Edit transfer allows none for a changed token of 1–4 characters, one edit for 5–8, and up to two edits within 20% for 9+ characters. Only one transformation is applied; transfers are not transitive.
+- An Item retrieved solely through Search Memory reinforces only the exact query association when acted on. Stable Item Identity follows rename and same-volume move. Copies, replacements, and cross-volume copies start new identities. Missing or unmounted Items retain dormant evidence but never appear as ghosts; `No Access` applies only to an Item known to exist but currently blocked by permissions.
+- Learned evidence ages continuously without a TTL. The shared learned-state budget defaults to 64 MiB; when full, the weakest decayed associations are evicted. Reset Learned Ranking deletes Search Memory and query-independent learned usage, but preserves Recents, Visit Journal, Pinned Tabs, aliases, and the Name Index.
+
+### 6.4 One deterministic ranker
+
+- Retrieval returns Candidate Evidence, including sources and match explanations. One deterministic ranker alone decides order; retrieval source and Working Set membership have zero score by themselves.
+- The score is the sum of capped named groups — Text Match, Search Memory, General Usage, Context, Alias, and Item Kind — minus capped Penalties. Item Kind starts neutral. Current Location applies only to direct Items. Hidden and Junk each apply once, share a cap, and remain recoverable by strong direct query evidence.
+- Text Match chooses one best complete explanation: one interpretation, no more than one correction, the best hit per token, and material weight for the weakest token. Exact filename is strongest, near-exact stem follows, and extension is weak unless the query contains a dot. Search Memory uses its strongest applicable association. General Usage keeps Recents, Visit Journal, and learned usage contributions separate under one group cap.
+- Equal total scores resolve by normalized display name, normalized full path, then Stable Item Identity. With unchanged candidates and configuration, order is repeatable. Increasing a positive raw fact cannot lower its contribution; stronger penalties cannot improve a result.
+- `ranker.json` is the sole editable Ranker Configuration. The alpha file is a complete effective config, not a delta. It contains only code-known features, non-negative weights/caps/penalty magnitudes, and validated monotone simple curves. Missing, unknown, non-finite, or semantically invalid values reject the whole file.
+- At launch, an absent file uses the embedded default. An invalid file is preserved for diagnosis while the embedded default becomes active. Explicit reload is atomic: invalid input keeps the previous active config; valid input reranks the active Candidate Evidence, and a wave produced with an older config fingerprint cannot overwrite it. There is no file watcher.
+
+### 6.5 Ranked Result Stream and diagnostics
+
+- Each query produces one Ranked Result Stream: complete Working Set, cumulative global waves, then one complete snapshot. A newer query or configuration fingerprint cancels and invalidates older work.
+- The first row may be auto-focused, but is not sticky. After deliberate keyboard result navigation, progressive waves preserve only that Focused Item by Stable Item Identity; the remaining order may change. Passive hover and scroll preserve nothing. Any query change resets this preservation.
+- Stream state is `local-ready`, `global-running`, or `complete`. No progress UI appears before 150 ms; beyond it the existing Status Strip may report continued global work. Empty and inaccessible Items follow the existing row-state and failure rules.
+- Ranking Traces are local and replayable. Every query update records a compact trace; after 300 ms idle or any eligible action, record Candidate Evidence and contributions for the top 256, always including the acted-on Item. Retain traces for 30 days or 256 MiB, whichever limit is reached first. Store each effective config snapshot once by fingerprint while retained traces reference it.
+- The ranking CLI validates, explains, replays, compares, and applies configs. `apply` atomically replaces the authoritative file and asks a running app to reload; if it cannot confirm reload, it reports the split state and leaves the new file authoritative for next launch.
 
 ## 7. Recents (#10, research #3)
 
@@ -98,12 +128,15 @@ Three classes: **Instant** ≤50 ms (indicators forbidden), **Fast** ≤150 ms (
 | Large directory: first screen | ≤150 ms, remainder streams |
 | Recents background refresh | ≤150 ms |
 | Keystroke response (focus, selection, character) | one 120 Hz frame, ≤8 ms |
-| First Search results per keystroke | ≤50 ms |
+| First useful Search Results per keystroke, end to end | p95 ≤50 ms |
+| Warm complete ranked top 50 | p95 ≤500 ms |
 | Quick Look dispatch | ≤50 ms |
 
-- Below 150 ms nothing is indicated; no blocking overlays or modal waits exist. Any navigation or keystroke cancels in-flight work of the previous state; a stale result never overwrites newer state. One caching pattern: show cached instantly, revalidate in background, update in place without moving the focused row.
+- Below 150 ms nothing is indicated; no blocking overlays or modal waits exist. Any navigation or keystroke cancels in-flight work of the previous state; a stale result never overwrites newer state. Search may remain incomplete beyond 500 ms on a cold, rebuilding, or unusually broad path, but it stays progressive and cancellable and must not delay the Working Set wave.
 - Slow storage (network volumes, undownloaded iCloud) is exempt from the numbers, not the rules: never block, in-place loading past 150 ms, leaving cancels, no hard timeouts.
-- Energy: the hidden resident does no periodic work (filesystem events only; idle CPU 0% is a requirement; Activity Monitor energy impact negligible). Heavy work runs at background QoS. On battery, lazy Junk rescans defer until power or a targeting query; the one-time initial crawl runs regardless.
+- The settled hidden process must stay below 200 MiB physical footprint and startup peak below 400 MiB on the reference machine. The persisted q-gram sidecar may use up to 600 MiB on disk in alpha. A sidecar rebuild is background work and may peak at 700 MiB; the previous usable index remains searchable until atomic replacement.
+- Energy: the hidden resident does no periodic polling (filesystem events only; idle CPU rounds to 0%; Activity Monitor energy impact negligible). Continuous filesystem activity may batch bounded incremental work but must not force periodic Junk maintenance. Heavy work runs at background QoS. On battery, lazy Junk rescans and optional index compaction defer until power or a targeting query; the one-time initial crawl runs regardless.
+- Search recall is exact for the supported literal, path, layout, and verified typo interpretations over candidates retrieved by the current algorithms. Approximate global retrieval is best-effort outside the committed regression corpus; q-gram hits are always verified, so broad retrieval may omit an unsupported fuzzy candidate but may not fabricate a match.
 - Verification: production carries local NDJSON telemetry (same shape as the demo). Budgets are checked on the reference machine; no CI perf rig. Before acceptance, measure what #7 could not: large-list render, sustained scroll, activation across Spaces and full-screen, per-show focus confirmation, icon and preview costs, post-reboot start. Framework parity evidence: `prototypes/framework-bench/` at git tag `planning-end` (ADR-0002).
 
 ## 11. Persistence inventory
@@ -113,23 +146,30 @@ Three classes: **Instant** ≤50 ms (indicators forbidden), **Fast** ≤150 ms (
 | Pinned Tabs: Anchor, custom name, order | yes, promptly persisted | #9 |
 | Temporary Tabs, Excursions, selection, history | no | #9 |
 | Name Index (+ per-volume indexes keyed by volume identity) | yes | #21 |
+| q-gram fuzzy sidecar | yes, atomically replaceable | rebuildable from Name Index; no compatibility promise |
 | Visit Journal | yes, local only | #21 |
 | Recents last-success cache | yes | #10, #12 |
+| Search Memory and learned usage | yes, local only | 64 MiB shared default; aging and weakest-first eviction |
+| `ranker.json` | yes | one authoritative full alpha config; embedded default fallback |
+| Ranker config snapshots | while referenced | content-addressed by fingerprint |
+| Ranking Traces | yes, local only | 30 days or 256 MiB |
 | Settings (below) | yes | |
 | NDJSON telemetry log | yes, local only | #12 |
 
-## 12. Settings inventory (complete for v1)
+Learned events and traces are buffered off the interaction path; no eligible action waits for a synchronous disk flush. Graceful quit checkpoints pending learned state. A crash may lose the most recent buffer but must not corrupt the previous checkpoint. Indexes, configs, checkpoints, and compacted logs are written to a sibling temporary file and atomically replaced. Search, ranking, learned-state, and trace schema versions are discard boundaries, not migration promises: an incompatible alpha build may preserve the unreadable file for diagnosis, start clean, and continue.
 
-Global shortcut (default `Ctrl+Opt+Cmd+F`) · Default Entry Point (default Recents) · Temporary Tab lifetime (default 3 h) · primary action per Item kind (#8 defaults) · After Action table — Hide Window / Keep Open per action; defaults: Hide for Open File, Open in Terminal/Editor, Copy Path, Copy File; Keep Open for Trash, Quick Look, Enter Directory, navigation (#8) · Preview Panel on/off (default on) · Terminal slot, Editor slot (auto-seeded) · Alias Dictionary (editable word → Location) · Junk pattern list (editable) · Pinned Tab management implied by Tab UI. Nothing else is a v1 setting; do not add settings the spec does not name.
+## 12. Settings inventory
+
+Global shortcut (default `Ctrl+Opt+Cmd+F`) · Default Entry Point (default Recents) · Temporary Tab lifetime (default 3 h) · primary action per Item kind (#8 defaults) · After Action table — Hide Window / Keep Open per action; defaults: Hide for Open File, Open in Terminal/Editor, Copy Path, Copy File; Keep Open for Trash, Quick Look, Enter Directory, navigation (#8) · Preview Panel on/off (default on) · Terminal slot, Editor slot (auto-seeded) · Alias Dictionary (editable word → Location) · Junk pattern list (editable) · Pinned Tab management implied by Tab UI · Reload Ranker Configuration · Reset Learned Ranking. Detailed ranking values are edited in `ranker.json`, not duplicated as individual Settings controls.
 
 ## 13. Permissions and platform
 
 - Expect near-complete disk access: first-run guidance requests Full Disk Access and Login Item enrollment; degraded operation without them must still not crash — inaccessible content follows the failure policy (#10, #11).
 - TCC grants are app-wide; discover capability per operation, never advertise a root as permanently readable/writable (research #4). Spotlight health only affects Recents (§7). SIP paths and other users' homes simply fail with the concrete cause.
 
-## 14. Non-goals of version 1
+## 14. Non-goals of the current alpha
 
-No content search · no Spotlight beyond Recents · no sidebar · no undo (`Cmd+Z`) · no Duplicate action · no per-type open overrides · no T3 Code action · no network-volume indexing · no mount management or eject · no rich cloud placeholder states · no toasts · no multi-window, detached Tabs, or per-display memory · no MRU Tab cycling · no Vim keys, type-to-filter, or query history · no CI perf rig · no localization (post-v1 desired) · no marketplace/onboarding/monetization · final visual styling deferred to the first post-v1 update.
+No content search · no Spotlight beyond Recents · no sidebar · no undo (`Cmd+Z`) · no Duplicate action · no per-type open overrides · no T3 Code action · no network-volume indexing · no mount management or eject · no rich cloud placeholder states · no toasts · no multi-window, detached Tabs, or per-display memory · no MRU Tab cycling · no Vim keys, type-to-filter, or query history · no CI perf rig · no localization yet · no marketplace/onboarding/monetization · no compatibility layer for prior search/ranking APIs, weights, index sidecars, traces, or learned state · no final Gen2 interaction shell in this iteration.
 
 ## 15. Deliberately unspecified (production-UX freedom)
 
@@ -137,17 +177,18 @@ Exact spacing, typography, colors, and dimensions (with the 300 px Preview Panel
 
 ## 16. Acceptance
 
-Each cited issue's resolution carries its own acceptance scenarios (#8 §implied, #9, #10, #11, #12, #19, #21); they are all binding. End-to-end smoke on top: from a fresh login, press the shortcut, paste a copied absolute path, Reveal the file, Quick Look it, copy its path, open its directory in the terminal, Trash a scratch file, find a dotfile config by wrong-layout query, pin the directory, hide, wait six minutes, invoke — the Pinned Tab is at its Anchor and everything above met its speed class.
+Each cited issue's resolution carries its own acceptance scenarios; they are binding unless this document explicitly supersedes them. End-to-end smoke on top: from a fresh login, press the shortcut, paste a copied absolute path, Reveal the file, Quick Look it, copy its path, open its directory in the terminal, Trash a scratch file, find a dotfile config by wrong-layout query, find `methodology` from `метолология`, find an omitted-component path such as `work wip`, perform an eligible action, repeat the query and observe a traceable Search Memory boost, reload a changed ranker config without restart, reset learned ranking, pin the directory, hide, wait six minutes, invoke — the Pinned Tab is at its Anchor and everything above met its speed class.
 
 ## 17. Suggested implementation sequence
 
 1. Shell: window, activation policy, global shortcut toggle, Login Item, telemetry log — validate warm-entry and prewarm budgets first.
 2. Listing and navigation: dense table, virtualization, Browse Mode keys, history, Tabs with lifecycle and persistence.
-3. Name Index: crawl, FSEvents incremental updates, persistence, tiers; then the ranker with its guarantees; wire the Navigation Input and Search Results overlay.
+3. Name Index: crawl, FSEvents incremental updates, persistence, tiers, q-gram sidecar; staged retrieval and Ranked Result Stream.
 4. Recents collection with cache-first paint and degraded states.
 5. Operations, clipboard, routing, Status Strip, failure policy.
 6. Native bridges: `QLPreviewPanel`, activation polish. Preview Panel.
-7. Settings surface, first-run flow (FDA, Login Item, slot seeding).
-8. Performance validation pass on the reference machine, including everything #7 left unmeasured.
+7. Search Memory, learned usage, Stable Item Identity, one ranker, `ranker.json`, Ranking Traces, CLI, reload and reset controls. Remove the superseded ranking and persistence paths in the same change; do not retain a v1 fallback.
+8. Settings surface, first-run flow (FDA, Login Item, slot seeding).
+9. Performance validation pass on the reference machine, including everything #7 left unmeasured.
 
-Steps 1–2 make a usable browser; 3 makes it Beeline. Keep telemetry on from step 1.
+Steps 1–2 make a usable browser; 3 and 7 make its personal retrieval loop. Keep telemetry on from step 1. Implementation order documents dependencies, not compatibility phases: only one search/ranking path remains active after each replacement.
