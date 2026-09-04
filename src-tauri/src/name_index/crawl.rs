@@ -435,19 +435,17 @@ fn reconcile_dir(
     let mut new_subdirs: Vec<(DirId, PathBuf)> = Vec::new();
     {
         let mut index = shared.write().expect("name index lock poisoned");
-        for (name, is_directory) in &index_children {
+        let mut known = HashSet::with_capacity(index_children.len());
+        for (name, is_directory) in index_children {
             if disk
-                .get(name)
-                .is_none_or(|child| child.is_dir != *is_directory)
+                .get(&name)
+                .is_some_and(|child| child.is_dir == is_directory)
             {
-                index.remove_child(dir_id, name);
+                known.insert(name);
+            } else {
+                index.remove_child(dir_id, &name);
             }
         }
-        let known: HashSet<String> = index
-            .direct_children(dir_id)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
         for child in disk.values() {
             if known.contains(&child.name) {
                 continue;
