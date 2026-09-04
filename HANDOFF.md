@@ -89,6 +89,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   frontend событие для rerank. CLI сверяет подтверждённый fingerprint; если app
   не запущена или ответ не совпал, файл всё равно остаётся источником правды для
   следующего запуска, а `reloadConfirmed` честно остаётся false.
+- Живой restart нашёл цикл: startup намеренно держал малую diff-rescan дельту в
+  overlay, но graceful exit всё равно переписывал 5.6M-Item base. Уже построенный
+  q-gram оставался привязан к предыдущему base hash, поэтому следующий запуск
+  снова тратил около 19–21 с CPU и записывал ~554 MB. Shutdown rewrite удалён как
+  противоречащий deferred-persistence пути. Initial crawl по-прежнему сохраняет
+  base и затем строит sidecar; последующие session deltas восстанавливаются
+  быстрым diff-rescan до появления bounded incremental compaction.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

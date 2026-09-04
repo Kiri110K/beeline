@@ -101,7 +101,6 @@ pub struct NameIndex {
     data: Arc<RwLock<IndexData>>,
     junk: SharedJunk,
     root: PathBuf,
-    index_file: PathBuf,
     /// Local, ranking-only record of visits (SPEC §6, §11).
     journal: Arc<VisitJournal>,
     /// Persistent explicit-interaction evidence and query-independent learned usage.
@@ -319,7 +318,6 @@ impl NameIndex {
             data,
             junk,
             root,
-            index_file,
             journal,
             search_memory,
             ranker: Arc::new(RwLock::new(Arc::new(ranker))),
@@ -372,14 +370,6 @@ impl NameIndex {
         let next_aliases = Arc::new(AliasDictionary::from_pairs(aliases, &self.root));
         *self.junk.write().expect("junk lock poisoned") = next_junk;
         *self.aliases.write().expect("aliases lock poisoned") = next_aliases;
-    }
-
-    /// Persist the current index atomically. Called on graceful shutdown (never
-    /// periodically), in addition to the post-crawl write.
-    pub fn persist(&self) {
-        if let Err(error) = persist::save(&self.data, &self.index_file) {
-            eprintln!("name index persist on shutdown failed: {error}");
-        }
     }
 }
 

@@ -774,22 +774,13 @@ pub fn run() {
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
     app.run(|app_handle, event| {
-        match event {
-            // Persist the Name Index on graceful shutdown (never periodically, §11).
-            tauri::RunEvent::Exit => {
-                if let Some(name_index) = app_handle.try_state::<NameIndex>() {
-                    name_index.persist();
-                }
+        // Opening the app again (Finder, `open`, Dock) reopens the hidden resident:
+        // show and focus the single window (§2).
+        if let tauri::RunEvent::Reopen { .. } = event {
+            let state = app_handle.state::<ShellState>();
+            if let Err(error) = show_and_focus(app_handle, &state, ShowOrigin::Launch) {
+                eprintln!("reopen show failed: {error}");
             }
-            // Opening the app again (Finder, `open`, Dock) reopens the hidden
-            // resident: show and focus the single window (§2).
-            tauri::RunEvent::Reopen { .. } => {
-                let state = app_handle.state::<ShellState>();
-                if let Err(error) = show_and_focus(app_handle, &state, ShowOrigin::Launch) {
-                    eprintln!("reopen show failed: {error}");
-                }
-            }
-            _ => {}
         }
     });
 }
