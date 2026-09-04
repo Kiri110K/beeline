@@ -198,6 +198,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   ignored, fmt и clippy зелёные. Артефакты лежат в `/private/tmp` под stems
   `beeline-fuzzy-lowercase-reuse-20260905` и
   `beeline-fuzzy-lowercase-reuse-repeat-20260905` (`.json` + `.time`).
+- PR #61 влит в main как `3c209b7`. Каждый fuzzy verifier worker теперь
+  переиспользует DirId-вектор и String-capacity ancestor chain между кандидатами.
+  Same-seed suite: 35.70 → 33.20 с (-7.0% wall, -10.4% user CPU, -7.8%
+  instructions, -10.3% cycles); paired-seed: 35.50 → 33.60 с. Path-heavy p95
+  улучшился на 3.8–9.4% в обоих прогонах. Hits/fingerprints совпали, misses нет;
+  134 Rust passed / 11 ignored, fmt и clippy зелёные. Артефакты в `/private/tmp`
+  под stems `beeline-fuzzy-ancestor-scratch-20260905` и
+  `beeline-fuzzy-ancestor-scratch-repeat-20260905` (`.json` + `.time`).
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
