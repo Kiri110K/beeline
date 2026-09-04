@@ -384,6 +384,22 @@ zero target misses. Peak physical footprint was 63.83 MiB in the same-seed proce
 the repeat, versus 67.56 and 64.17 MiB for their respective baselines; there is no stable memory
 change.
 
+## Retained fuzzy ancestor scratch — 2026-09-05
+
+Ancestor traversal still allocated a fresh vector and one string per directory component for each
+candidate. The measured version gives each verifier worker a reusable directory-ID vector and a
+string slot per observed depth. Later candidates overwrite those strings in place; a shallower path
+keeps the unused capacity for the next candidate.
+
+The same-seed suite fell from 35.70 to 33.20 seconds, 7.0% less wall time. User CPU fell 10.4%,
+retired instructions 7.8%, and cycles 10.3%. Path-heavy final-stage p95 improved by 6.2% to 9.4%; a
+single-token transposition p95 regressed 4.7% in that process. The paired-seed repeat finished in
+33.60 seconds versus its 35.50-second baseline, with path-heavy p95 3.8% to 8.8% lower. Its small
+single-token movements ran in both directions, which confirms scheduler noise rather than a change
+to that code path. Both runs preserved every final hit and top-10 fingerprint with zero target
+misses. Peak physical footprint stayed within noise: 64.25 MiB versus 63.83 MiB in the same-seed
+pair and 67.83 MiB versus 68.58 MiB in the repeat pair.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
