@@ -341,6 +341,19 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   logical entries за 617 мс против 973 мс предыдущего старта с меньшим catch-up.
   Q-gram loaded без rebuild, prewarm 16 мс, full diff skipped. PID 75911 hidden,
   0 windows/not frontmost; после Junk drain physical footprint 124 MiB, CPU 0%.
+- PR #69 влит в main как `a96303f`. Path-aware fuzzy verification использует
+  существующий bounded worker pool уже от 20k candidates; дешёвый name-only путь
+  сохраняет порог 50k. Два paired 11-case suite: 19.55 → 16.00 с и 19.65 →
+  15.86 с. `work wip` p95 45.99 → 11.97 мс и 46.11 → 11.60 мс; user CPU
+  +2.2%/+0.9%, instructions +0.2%, все per-observation fingerprints совпали.
+  139 Rust passed / 12 ignored, fmt и clippy зелёные.
+- Signed bundle `a96303f` установлен, backup:
+  `/private/tmp/Beeline-before-path-parallel-20260905.app`. Независимый GUI-pass
+  `work wip` подтвердил `/Users/kiri110k/work/wip` rank 1 и стабильные 50 rows
+  без дублей; PID 79444 после Escape hidden/0 windows/not frontmost. На живом
+  overlay сейчас 59,997 candidates: working-set paint 19 мс, complete backend
+  25 мс, complete paint 44 мс. Footprint после UI 94 MiB; отчёт и скриншот:
+  `/private/tmp/beeline-path-parallel-ui.uq63ZW/`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
