@@ -415,6 +415,13 @@ every final hit and top-10 fingerprint with zero target misses. Peak physical fo
 noise-bound: 66.81 MiB versus 64.25 MiB in the same-seed pair and 67.74 MiB versus 67.83 MiB in the
 repeat pair.
 
+An isolated follow-up cached per-token Item-name qualities for reuse between ordinary multi-token
+matching and Path Interpretation. It was rejected. Paired suites moved 30.60 to 31.20 seconds and
+31.30 to 30.60 seconds, while retired instructions changed by only -0.16% in both runs. Per-case
+p95 changes were mixed and included regressions. The extra vector writes replace only one repeated
+final-token comparison, so they do not reduce real work. Code and the full verdict remain on remote
+branch `experiment/fuzzy-name-quality-reuse`; `main` keeps the simpler verifier.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive

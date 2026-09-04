@@ -215,6 +215,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   clippy зелёные. Артефакты в `/private/tmp` под stems
   `beeline-fuzzy-parent-ancestor-cache-20260905` и
   `beeline-fuzzy-parent-ancestor-cache-repeat-20260905` (`.json` + `.time`).
+- `experiment/fuzzy-name-quality-reuse` (`2962245`) отклонён и не вливался.
+  Кэш `Option<MatchQuality>` для переиспользования между ordinary multi-token и
+  Path Interpretation дал paired suites 30.60 → 31.20 с и 31.30 → 30.60 с, при
+  одинаковом -0.16% retired instructions. p95 смешанные, есть регрессии; запись
+  вектора заменяет всего одно повторное сравнение final token и не уменьшает
+  реальную работу. Код, verdict и raw-artifact stems сохранены в remote-ветке.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
