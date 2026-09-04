@@ -1251,11 +1251,16 @@ fn score_fuzzy_entry(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
 ) -> Option<(i64, String, TextMatchEvidence)> {
+    // The direct query, its ordered Path Interpretation, and every layout variant all
+    // inspect the same directory chain. Lowercase that chain once per Item.
+    let ancestors = (prep.path_shaped || prep.tokens.len() > 1)
+        .then(|| ancestor_names(index, item.entry.parent));
+    let ancestors = ancestors.as_deref().unwrap_or_default();
     let (quality, corrected, path_scope) = if prep.path_shaped {
         let quality = fuzzy_path_interpretation(
-            index,
             item,
             &prep.segments,
+            ancestors,
             short_fuzzy,
             edit_scratch,
             &prep.text,
@@ -1263,29 +1268,35 @@ fn score_fuzzy_entry(
         (quality, false, true)
     } else if prep.tokens.len() > 1 {
         let mut best = fuzzy_token_set(
-            index,
             item,
             &prep.tokens,
+            ancestors,
             short_fuzzy,
             edit_scratch,
             &prep.text,
         );
         best = best.max(fuzzy_path_interpretation(
-            index,
             item,
             &prep.tokens,
+            ancestors,
             short_fuzzy,
             edit_scratch,
             &prep.text,
         ));
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
-            let mut candidate =
-                fuzzy_token_set(index, item, tokens, short_fuzzy, edit_scratch, &prep.text);
-            candidate = candidate.max(fuzzy_path_interpretation(
-                index,
+            let mut candidate = fuzzy_token_set(
                 item,
                 tokens,
+                ancestors,
+                short_fuzzy,
+                edit_scratch,
+                &prep.text,
+            );
+            candidate = candidate.max(fuzzy_path_interpretation(
+                item,
+                tokens,
+                ancestors,
                 short_fuzzy,
                 edit_scratch,
                 &prep.text,
@@ -1342,14 +1353,13 @@ fn score_fuzzy_entry(
 }
 
 fn fuzzy_token_set(
-    index: &IndexData,
     item: SearchItem<'_>,
     tokens: &[String],
+    ancestors: &[String],
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
 ) -> Option<MatchQuality> {
-    let ancestors = ancestor_names(index, item.entry.parent);
     let mut weakest: Option<MatchQuality> = None;
     let mut name_match = false;
     for token in tokens {
@@ -1377,9 +1387,9 @@ fn fuzzy_token_set(
 }
 
 fn fuzzy_path_interpretation(
-    index: &IndexData,
     item: SearchItem<'_>,
     tokens: &[String],
+    ancestors: &[String],
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
@@ -1387,7 +1397,6 @@ fn fuzzy_path_interpretation(
     let (last, parents) = tokens.split_last()?;
     let final_quality =
         fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch, weights)?;
-    let ancestors = ancestor_names(index, item.entry.parent);
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
     for token in parents.iter().rev() {

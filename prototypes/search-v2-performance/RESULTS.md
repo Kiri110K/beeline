@@ -351,6 +351,23 @@ produced a byte-identical 554,313,828-byte file. Wall time changed from 18.21 to
 peak physical footprint from 543.88 to 536.09 MiB, a 7.78 MiB reduction. This is a small safe win;
 the raw 520-MiB postings vector remains the builder's dominant memory cost.
 
+## Reused fuzzy ancestor paths — 2026-09-05
+
+Multi-token fuzzy matching uses the same lowercase directory chain for the direct token-set match,
+the ordered Path Interpretation, and every corrected keyboard-layout variant. The old path rebuilt
+that owned string vector for every interpretation. The replacement builds it once per candidate
+and shares the immutable slice across all interpretations.
+
+A same-seed 100-sample-per-case A/B run measured the complete suite at 51.60 seconds before and
+44.07 seconds after the change: a 1.17x speedup and 14.6% less wall time. User CPU time fell 16.5%,
+retired instructions fell 12.0%, and CPU cycles fell 16.4%. The largest final-stage p95 changes
+were on queries that inspect directory chains: implicit path improved from 169.15 to 145.74 ms,
+gapped path from 100.72 to 81.28 ms, and direct multi-token from 211.42 to 173.58 ms. Two typo cases
+regressed by less than 1.5%, within run noise. A different-seed repeat finished in 44.12 seconds and
+kept the three path-heavy p95 values at 145.77, 89.82, and 184.87 ms. Both runs returned identical
+final hits and fingerprints with zero target misses. Peak physical footprint was effectively flat:
+67.78 MiB before, 67.56 MiB after, and 64.17 MiB in the repeat process.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
