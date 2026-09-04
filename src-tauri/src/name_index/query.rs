@@ -1212,7 +1212,15 @@ fn scan_fuzzy_slots(
         scanned += 1;
         if let Some((mut score, path, text_evidence)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch).or_else(|| {
-                score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut edit_scratch)
+                score_fuzzy_entry(
+                    index,
+                    item,
+                    prep,
+                    ctx,
+                    short_fuzzy,
+                    &mut scratch,
+                    &mut edit_scratch,
+                )
             })
         {
             score += ctx.retrieval.boost(slot, ctx.config);
@@ -1249,8 +1257,13 @@ fn score_fuzzy_entry(
     prep: &Prepared,
     ctx: &RankContext,
     short_fuzzy: bool,
+    name_lower: &mut String,
     edit_scratch: &mut EditScratch,
 ) -> Option<(i64, String, TextMatchEvidence)> {
+    // Every direct, path, and corrected-layout interpretation inspects the same Item name.
+    // Keep its lowercase form in the worker's reusable buffer instead of allocating once per
+    // interpretation.
+    lower_into(item.entry.name, name_lower);
     // The direct query, its ordered Path Interpretation, and every layout variant all
     // inspect the same directory chain. Lowercase that chain once per Item.
     let ancestors = (prep.path_shaped || prep.tokens.len() > 1)
@@ -1258,7 +1271,7 @@ fn score_fuzzy_entry(
     let ancestors = ancestors.as_deref().unwrap_or_default();
     let (quality, corrected, path_scope) = if prep.path_shaped {
         let quality = fuzzy_path_interpretation(
-            item,
+            name_lower,
             &prep.segments,
             ancestors,
             short_fuzzy,
@@ -1268,7 +1281,7 @@ fn score_fuzzy_entry(
         (quality, false, true)
     } else if prep.tokens.len() > 1 {
         let mut best = fuzzy_token_set(
-            item,
+            name_lower,
             &prep.tokens,
             ancestors,
             short_fuzzy,
@@ -1276,7 +1289,7 @@ fn score_fuzzy_entry(
             &prep.text,
         );
         best = best.max(fuzzy_path_interpretation(
-            item,
+            name_lower,
             &prep.tokens,
             ancestors,
             short_fuzzy,
@@ -1286,7 +1299,7 @@ fn score_fuzzy_entry(
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
             let mut candidate = fuzzy_token_set(
-                item,
+                name_lower,
                 tokens,
                 ancestors,
                 short_fuzzy,
@@ -1294,7 +1307,7 @@ fn score_fuzzy_entry(
                 &prep.text,
             );
             candidate = candidate.max(fuzzy_path_interpretation(
-                item,
+                name_lower,
                 tokens,
                 ancestors,
                 short_fuzzy,
@@ -1309,19 +1322,13 @@ fn score_fuzzy_entry(
         (best?, corrected, false)
     } else {
         let direct = prep.tokens.first().and_then(|token| {
-            fuzzy_name_quality(
-                item.entry.name,
-                token,
-                short_fuzzy,
-                edit_scratch,
-                &prep.text,
-            )
+            fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, &prep.text)
         });
         let mut best = direct;
         let mut corrected = false;
         for variant in &prep.corrected {
-            let candidate = fuzzy_name_quality(
-                item.entry.name,
+            let candidate = fuzzy_lower_name_quality(
+                name_lower,
                 variant,
                 short_fuzzy,
                 edit_scratch,
@@ -1353,7 +1360,7 @@ fn score_fuzzy_entry(
 }
 
 fn fuzzy_token_set(
-    item: SearchItem<'_>,
+    name_lower: &str,
     tokens: &[String],
     ancestors: &[String],
     short_fuzzy: bool,
@@ -1364,7 +1371,7 @@ fn fuzzy_token_set(
     let mut name_match = false;
     for token in tokens {
         if let Some(quality) =
-            fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch, weights)
+            fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, weights)
         {
             weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
             name_match = true;
@@ -1373,7 +1380,7 @@ fn fuzzy_token_set(
         let quality = ancestors
             .iter()
             .filter_map(|component| {
-                fuzzy_component_quality(component, token, short_fuzzy, edit_scratch, weights)
+                fuzzy_lower_component_quality(component, token, short_fuzzy, edit_scratch, weights)
             })
             .max()?;
         let quality = quality.cap_as_path(weights);
@@ -1387,7 +1394,7 @@ fn fuzzy_token_set(
 }
 
 fn fuzzy_path_interpretation(
-    item: SearchItem<'_>,
+    name_lower: &str,
     tokens: &[String],
     ancestors: &[String],
     short_fuzzy: bool,
@@ -1396,14 +1403,14 @@ fn fuzzy_path_interpretation(
 ) -> Option<MatchQuality> {
     let (last, parents) = tokens.split_last()?;
     let final_quality =
-        fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch, weights)?;
+        fuzzy_lower_name_quality(name_lower, last, short_fuzzy, edit_scratch, weights)?;
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
     for token in parents.iter().rev() {
         let mut found = None;
         while cursor > 0 {
             cursor -= 1;
-            if let Some(quality) = fuzzy_component_quality(
+            if let Some(quality) = fuzzy_lower_component_quality(
                 &ancestors[cursor],
                 token,
                 short_fuzzy,
@@ -1419,30 +1426,36 @@ fn fuzzy_path_interpretation(
     Some(weakest)
 }
 
-fn fuzzy_name_quality(
-    name: &str,
+fn fuzzy_lower_name_quality(
+    lower: &str,
     query: &str,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
 ) -> Option<MatchQuality> {
-    let lower = name.to_lowercase();
     let stem = lower
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
-        .map_or(lower.as_str(), |(stem, _)| stem);
-    fuzzy_targets(&lower, stem, query, short_fuzzy, edit_scratch, weights)
+        .map_or(lower, |(stem, _)| stem);
+    fuzzy_targets(lower, stem, query, short_fuzzy, edit_scratch, weights)
 }
 
-fn fuzzy_component_quality(
+fn fuzzy_lower_component_quality(
     component: &str,
     query: &str,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
 ) -> Option<MatchQuality> {
-    let lower = component.to_lowercase();
-    fuzzy_targets(&lower, &lower, query, short_fuzzy, edit_scratch, weights)
+    // `ancestor_names` already lowercases every component once per candidate.
+    fuzzy_targets(
+        component,
+        component,
+        query,
+        short_fuzzy,
+        edit_scratch,
+        weights,
+    )
 }
 
 fn fuzzy_targets(

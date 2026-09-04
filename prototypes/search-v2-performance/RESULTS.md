@@ -368,6 +368,22 @@ kept the three path-heavy p95 values at 145.77, 89.82, and 184.87 ms. Both runs 
 final hits and fingerprints with zero target misses. Peak physical footprint was effectively flat:
 67.78 MiB before, 67.56 MiB after, and 64.17 MiB in the repeat process.
 
+## Reused fuzzy lowercase buffers — 2026-09-05
+
+The next verifier pass removed two more repetitions. Each candidate Item name is now lowercased
+into the worker's existing reusable string buffer, then shared by direct, path, and corrected-layout
+interpretations. Directory components produced by `ancestor_names` are already lowercase, so the
+component verifier no longer allocates and lowercases a second copy for every token comparison.
+
+Against the ancestor-reuse result above, the same-seed suite fell from 44.07 to 35.70 seconds: a
+1.23x speedup and 19.0% less wall time. User CPU fell 21.5%, retired instructions 19.9%, and cycles
+21.5%. Every case improved. Final-stage p95 fell 19.0% for implicit path, 21.8% for gapped path,
+and 25.4% for direct multi-token; the seven other cases improved by 3.0% to 10.8%. A different-seed
+repeat finished in 35.50 seconds. Both runs preserved every final hit and top-10 fingerprint with
+zero target misses. Peak physical footprint was 63.83 MiB in the same-seed process and 68.58 MiB in
+the repeat, versus 67.56 and 64.17 MiB for their respective baselines; there is no stable memory
+change.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
