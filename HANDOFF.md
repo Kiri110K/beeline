@@ -425,6 +425,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   query instructions снизились на 0.36–0.37%. Полный checkpoint: 144 Rust
   passed / 12 ignored, clippy `-D warnings`, frontend contracts, typecheck,
   build и lint зелёные. Подробности: `prototypes/qgram-streaming-grams/RESULTS.md`.
+- Signed bundle main `5126d39` установлен в `/Applications/Beeline.app`, binary
+  SHA build/install совпал: `bbbb4dac2685011550dab835a143048b1f6927d3aab5ebf285dd5cc85c2001ba`.
+  PID 28176 запущен hidden; q-gram loaded без rebuild, prewarm 18 мс, catch-up
+  132 мс, overlay replay 724 мс, footprint 56 MiB / peak 58 MiB. Независимый
+  UI-pass подтвердил: `метолология` даёт methodology results, `ьуерщвщдщпн`
+  ставит `/Users/kiri110k/work/vault/graphify-out/obsidian/methodology.md` rank 1,
+  `work wip` ставит `/Users/kiri110k/work/wip` rank 1. Stale rows, duplicate exact
+  paths, freeze/crash/focus loss не обнаружены; финально PID жив, 0 on-screen
+  windows, Beeline not frontmost. Отчёт и снимки:
+  `/private/tmp/beeline-streaming-ui.C8oNLf/`. Rollback bundle:
+  `/private/tmp/Beeline-before-streaming-qgram-20260905.app`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
