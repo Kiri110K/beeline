@@ -221,6 +221,16 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   одинаковом -0.16% retired instructions. p95 смешанные, есть регрессии; запись
   вектора заменяет всего одно повторное сравнение final token и не уменьшает
   реальную работу. Код, verdict и raw-artifact stems сохранены в remote-ветке.
+- PR #63 влит в main как `ca125b2`. Для slash-shaped query verifier сначала
+  проверяет final path segment против Item name, и только после успеха строит
+  ancestor chain; готовое качество передаётся в ordered path matcher. На 500
+  samples `work/wip`: total p95 16.26 → 11.65 мс (-28.3%), verify/rank 15.03 →
+  10.42 мс, user CPU -28.7%, instructions -23.2%, cycles -29.0%. Repeat дал
+  11.75/10.48 мс. Hits/fingerprint совпали, misses нет. `explicit-path` добавлен
+  в стандартный `queries.tsv`; новый 11-case suite занял 32.5 с и нашёл все
+  targets. 134 Rust passed / 11 ignored, fmt и clippy зелёные. Артефакты в
+  `/private/tmp` имеют prefix `beeline-path-final-first-`; это baseline,
+  candidate, candidate-repeat и standard JSON/time pairs.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
