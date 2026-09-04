@@ -286,6 +286,24 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   одноразовых 529 MiB sidecar удалены после SHA-сверки, `.time`/stdout сохранены
   в `/private/tmp` под prefix `beeline-qgram-sharded-`. Полный checkpoint: 134
   Rust passed / 11 ignored, fmt и clippy зелёные.
+- PR #66 влит в main как `be5c803`. Формат `BLQGM002` delta-кодирует sorted
+  posting slots unsigned varint и добавляет checkpoint каждые 64 записи для
+  bounded literal lookup. Production sidecar уменьшился 554,313,828 →
+  194,351,859 bytes (-64.9%). Независимый streaming verifier подтвердил все
+  136,481,293 postings и все checkpoints во всех 1,048,576 bucket. Две парные
+  11-case A/B серии дали 19.55 → 20.01 с и 19.81 → 19.79 с; zero misses,
+  одинаковые top-10 fingerprints и posting visits. Retrieval p95 подорожал лишь
+  на 0.03–0.17 мс. Rebuild: 19.37 с, 95.94 MiB physical peak; временные shards
+  очищены. Полный checkpoint: 135 Rust passed / 11 ignored, fmt, clippy,
+  typecheck, lint и frontend contracts зелёные. Подробности и artifacts:
+  `prototypes/qgram-delta-varint/RESULTS.md`.
+- Signed bundle `be5c803` установлен в `/Applications/Beeline.app` вместе с уже
+  проверенным v2 sidecar, SHA build/install совпадают. PID 53884 запущен hidden,
+  0 windows/not frontmost; sidecar загрузился без rebuild. Первый cold prewarm
+  занял 171 мс, FSEvents catch-up 193 мс, overlay replay 1,165 мс, full diff
+  skipped. Через 19 секунд process physical footprint 42 MiB, peak 74 MiB.
+  Rollback: `/private/tmp/Beeline-before-qgram-varint-20260905.app` и
+  `/private/tmp/beeline-home-qgram-v1-20260905.qgram`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
