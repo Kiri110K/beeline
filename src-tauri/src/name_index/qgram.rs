@@ -120,52 +120,51 @@ impl QGramIndex {
     }
 
     pub fn candidates(&self, query_text: &str, cancel: &Cancel<'_>) -> CandidateSet {
-        let normalized = normalize(query_text);
-        let mut variants = vec![normalized.clone()];
-        variants.extend(query::layout_variants(&normalized));
         let mut candidates = BTreeSet::new();
         let mut posting_visits = 0usize;
-        for variant in variants {
+        for variant in query_variants(query_text) {
             for token in query_tokens(&variant) {
-                let buckets = gram_buckets(token);
-                if buckets.is_empty() {
-                    continue;
+                if self.collect_token_candidates(
+                    token,
+                    cancel,
+                    &mut candidates,
+                    &mut posting_visits,
+                ) {
+                    return aborted(posting_visits);
                 }
-                let minimum = buckets
-                    .len()
-                    .saturating_sub(4 * allowed_edits(token.chars().count()))
-                    .max(1);
-                let mut overlaps = HashMap::<u32, u8>::new();
-                for bucket in buckets {
-                    let (start, end) = self.posting_range(bucket as usize);
-                    for position in start..end {
-                        if posting_visits.is_multiple_of(4096) && cancel.superseded() {
-                            return CandidateSet {
-                                slots: Vec::new(),
-                                posting_visits,
-                                aborted: true,
-                            };
-                        }
-                        posting_visits += 1;
-                        let slot =
-                            read_u32(self.mapping.bytes(), self.postings_offset + position * 4)
-                                .expect("validated q-gram posting");
-                        let count = overlaps.entry(slot).or_default();
-                        *count = count.saturating_add(1);
-                    }
-                }
-                candidates.extend(
-                    overlaps
-                        .into_iter()
-                        .filter_map(|(slot, count)| (count as usize >= minimum).then_some(slot)),
-                );
             }
         }
-        CandidateSet {
-            slots: candidates.into_iter().collect(),
-            posting_visits,
-            aborted: false,
+        collected(candidates, posting_visits)
+    }
+
+    /// Literal candidate pool for the final token of an ordered multi-token interpretation.
+    /// Every trigram must occur, so this is much narrower than the typo-safe global pool.
+    /// Search v2 fully verifies these Items first, then runs the unchanged complete retrieval;
+    /// this method changes arrival time, not final recall or ranking.
+    pub fn ordered_tail_literal_candidates(
+        &self,
+        query_text: &str,
+        cancel: &Cancel<'_>,
+    ) -> Option<CandidateSet> {
+        let mut candidates = BTreeSet::new();
+        let mut posting_visits = 0usize;
+        let mut found_multi = false;
+        for variant in query_variants(query_text) {
+            let tokens = query_tokens(&variant).collect::<Vec<_>>();
+            let Some(token) = (tokens.len() > 1).then(|| tokens[tokens.len() - 1]) else {
+                continue;
+            };
+            found_multi = true;
+            if self.collect_literal_token_candidates(
+                token,
+                cancel,
+                &mut candidates,
+                &mut posting_visits,
+            ) {
+                return Some(aborted(posting_visits));
+            }
         }
+        found_multi.then(|| collected(candidates, posting_visits))
     }
 
     pub fn source_entries(&self) -> usize {
@@ -184,6 +183,147 @@ impl QGramIndex {
             as usize;
         debug_assert!(end <= self.postings);
         (start, end)
+    }
+
+    /// Add one token's complete typo-safe q-gram candidates. Returns `true` when a newer
+    /// query cancelled the posting walk.
+    fn collect_token_candidates(
+        &self,
+        token: &str,
+        cancel: &Cancel<'_>,
+        candidates: &mut BTreeSet<u32>,
+        posting_visits: &mut usize,
+    ) -> bool {
+        let buckets = gram_buckets(token);
+        if buckets.is_empty() {
+            return false;
+        }
+        let minimum = buckets
+            .len()
+            .saturating_sub(4 * allowed_edits(token.chars().count()))
+            .max(1);
+        let mut overlaps = HashMap::<u32, u8>::new();
+        for bucket in buckets {
+            let (start, end) = self.posting_range(bucket as usize);
+            for position in start..end {
+                if posting_visits.is_multiple_of(4096) && cancel.superseded() {
+                    return true;
+                }
+                *posting_visits += 1;
+                let slot = read_u32(self.mapping.bytes(), self.postings_offset + position * 4)
+                    .expect("validated q-gram posting");
+                let count = overlaps.entry(slot).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        candidates.extend(
+            overlaps
+                .into_iter()
+                .filter_map(|(slot, count)| (count as usize >= minimum).then_some(slot)),
+        );
+        false
+    }
+
+    /// Intersect the token's sorted posting lists. A literal substring contains every token
+    /// trigram, so the intersection cannot drop a valid literal name match. Hash collisions
+    /// may add false positives; the production ranker verifies them before emitting a row.
+    fn collect_literal_token_candidates(
+        &self,
+        token: &str,
+        cancel: &Cancel<'_>,
+        candidates: &mut BTreeSet<u32>,
+        posting_visits: &mut usize,
+    ) -> bool {
+        let buckets = gram_buckets(token);
+        if buckets.is_empty() {
+            return false;
+        }
+        let mut ranges = buckets
+            .into_iter()
+            .map(|bucket| self.posting_range(bucket as usize))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|(start, end)| end - start);
+        let (start, end) = ranges[0];
+        let bytes = self.mapping.bytes();
+        for position in start..end {
+            if posting_visits.is_multiple_of(4096) && cancel.superseded() {
+                return true;
+            }
+            *posting_visits += 1;
+            let slot = read_u32(bytes, self.postings_offset + position * 4)
+                .expect("validated q-gram posting");
+            let mut present = true;
+            for &(other_start, other_end) in &ranges[1..] {
+                let Some(found) = posting_contains(
+                    bytes,
+                    self.postings_offset,
+                    other_start,
+                    other_end,
+                    slot,
+                    posting_visits,
+                    cancel,
+                ) else {
+                    return true;
+                };
+                if !found {
+                    present = false;
+                    break;
+                }
+            }
+            if present {
+                candidates.insert(slot);
+            }
+        }
+        false
+    }
+}
+
+fn posting_contains(
+    bytes: &[u8],
+    postings_offset: usize,
+    mut lo: usize,
+    mut hi: usize,
+    slot: u32,
+    posting_visits: &mut usize,
+    cancel: &Cancel<'_>,
+) -> Option<bool> {
+    while lo < hi {
+        if posting_visits.is_multiple_of(4096) && cancel.superseded() {
+            return None;
+        }
+        let mid = lo + (hi - lo) / 2;
+        *posting_visits += 1;
+        let candidate =
+            read_u32(bytes, postings_offset + mid * 4).expect("validated q-gram posting");
+        match candidate.cmp(&slot) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(true),
+        }
+    }
+    Some(false)
+}
+
+fn query_variants(query_text: &str) -> Vec<String> {
+    let normalized = normalize(query_text);
+    let mut variants = vec![normalized.clone()];
+    variants.extend(query::layout_variants(&normalized));
+    variants
+}
+
+fn collected(candidates: BTreeSet<u32>, posting_visits: usize) -> CandidateSet {
+    CandidateSet {
+        slots: candidates.into_iter().collect(),
+        posting_visits,
+        aborted: false,
+    }
+}
+
+fn aborted(posting_visits: usize) -> CandidateSet {
+    CandidateSet {
+        slots: Vec::new(),
+        posting_visits,
+        aborted: true,
     }
 }
 
@@ -265,6 +405,33 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::name_index::{
+        model::{IndexData, Tier},
+        persist,
+    };
+    use std::sync::{atomic::AtomicU64, Arc, RwLock};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "beeline_qgram_test_{}_{}",
+                std::process::id(),
+                unique
+            ));
+            std::fs::create_dir_all(&path).expect("create q-gram test dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn qgrams_share_normalization_with_queries() {
@@ -280,5 +447,55 @@ mod tests {
         assert!(supports_query("метолология"));
         assert!(!supports_query("ab cd"));
         assert!(!supports_query("work x"));
+    }
+
+    #[test]
+    fn ordered_literal_tail_is_a_safe_subset_of_whole_query_candidates() {
+        let dir = TempDir::new();
+        let root = dir.0.join("home");
+        std::fs::create_dir_all(&root).expect("create index root");
+        let shared = Arc::new(RwLock::new(IndexData::new(root.clone())));
+        {
+            let mut index = shared.write().expect("index lock");
+            let vault = index.add_dir(0, "vault", Tier::Normal, 0);
+            index.add_file(vault, "methodology.md", Tier::Normal);
+            index.add_file(0, "vault-notes.md", Tier::Normal);
+            index.add_file(0, "methodology-draft.md", Tier::Normal);
+            index.add_file(0, "unrelated.txt", Tier::Normal);
+        }
+        let index_path = dir.0.join("index.idx");
+        persist::save(&shared, &index_path).expect("persist test index");
+        let index = persist::load(&index_path, &root).expect("load mapped test index");
+        let qgram_path = dir.0.join("index.qgram");
+        QGramIndex::build(&index, &qgram_path).expect("build test q-gram");
+        let qgram = QGramIndex::open(
+            &qgram_path,
+            index.base_content_hash().expect("base hash"),
+            index.base_entry_count(),
+        )
+        .expect("open test q-gram");
+        let generation = AtomicU64::new(1);
+        let cancel = Cancel::new(&generation, 1);
+
+        let whole = qgram.candidates("vault methodology", &cancel);
+        let tail = qgram
+            .ordered_tail_literal_candidates("vault methodology", &cancel)
+            .expect("multi-token tail");
+
+        assert!(!whole.aborted && !tail.aborted);
+        assert!(!tail.slots.is_empty());
+        assert!(tail
+            .slots
+            .iter()
+            .all(|slot| whole.slots.binary_search(slot).is_ok()));
+
+        let cancelled_generation = AtomicU64::new(2);
+        let cancelled = Cancel::new(&cancelled_generation, 1);
+        assert!(
+            qgram
+                .ordered_tail_literal_candidates("vault methodology", &cancelled)
+                .expect("multi-token tail")
+                .aborted
+        );
     }
 }

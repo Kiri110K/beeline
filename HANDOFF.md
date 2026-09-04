@@ -88,6 +88,20 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Архитектура первой интеграции: полный Working Set, production exact/layout
   волна, затем q-gram fuzzy supplement. Полный отчёт и воспроизводимый harness:
   `/Users/kiri110k/lab/beeline/prototypes/search-v2-performance/RESULTS.md`.
+- Follow-up после живого paint-прогона устранил два интеграционных дефекта.
+  Для составного запроса с пустой Working Set production сначала пересекает
+  literal postings последнего token и полностью проверяет узкий ordered-tail
+  pool; полный typo-safe q-gram retrieval затем всё равно выполняется и сохраняет
+  recall. На reconciled индексе `vault methodology` теперь даёт целевой Item за
+  3,40 мс p95 вместо 191,78 мс. Источники Working Set доходят до единого ranker
+  раздельными Candidate Evidence, а прямой all-tokens-in-name match больше не
+  проигрывает случайной смеси filename + ancestor. В 20 randomized samples все
+  десять целей остались в final top-50, `skills-drafts` был rank 1, датированный
+  `status-report` — rank 8; worst first-useful p95 32,33 мс, worst final p95
+  372,91 мс, peak physical footprint 89 048 264 bytes. Eager shared dense path
+  masks отдельно проверены и отвергнуты как регрессия; остаются lazy shard-local.
+  Exact-build foreground visual recheck поставлен на паузу по просьбе Кирилла;
+  hidden/non-frontmost WKWebView нельзя использовать для paint timing.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/

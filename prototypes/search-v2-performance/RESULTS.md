@@ -198,6 +198,63 @@ Working Set but fall outside the final global top 50. That is a ranking/merge-qu
 Search Memory tuning, not a retrieval failure. The benchmark records both the early target and
 the final miss rather than hiding the distinction.
 
+## Visible paint and follow-up tuning — 2026-09-04
+
+A visible pass through the installed signed bundle closed the IPC → React → paint boundary on
+the optimized implementation. The first non-empty/final painted waves were 9/60 ms for
+`метолология`, 37/344 ms for `ьуерщвщдпн`, 12/333 ms for `work wip`, 225/258 ms for
+`vault methodology`, and 17/453 ms for `status report`. The physical footprint stayed at
+75 MiB across a ten-second idle sample and fell to 73 MiB after the hidden app sat idle for
+several minutes; the observed peak was 88 MiB. No settled stale rows, duplicates, focus jumps,
+or freezes appeared.
+
+The pass exposed two concrete defects rather than a general React or IPC cost:
+
+- `vault methodology` painted an empty Working Set quickly, then waited for a 141,178-candidate
+  typo-safe final-token pool before it could show a valid ordered-path result;
+- Working Set membership selected candidates early but did not reach final scoring as retrieval
+  evidence, and all-name multi-token matches could rank below a name-plus-ancestor Path
+  Interpretation. `skills-drafts` and the dated `status-report` workbook therefore disappeared
+  from the final top 50.
+
+The production path now intersects every literal q-gram posting for the ordered final token and
+fully verifies that narrow pool before global typo retrieval. The mutable overlay gets the same
+literal-tail scan because it is not in the sidecar. Working Set sources remain separate
+Candidate Evidence for the ranker (`current Location`, `Pinned Anchor`, and `Recents`), and a
+direct all-tokens-in-name interpretation has its own score contribution. None of these paths
+forces a fixed row position; one deterministic ranker still produces every wave.
+
+A 20-sample randomized run over all ten cases after a 7.22-second reconciliation added 302,714
+overlay slots. Results:
+
+- `vault methodology` narrowed the early pool to 80 Items; priority retrieval/verification p95
+  was 1.87/0.67 ms and the labeled target arrived at 3.40 ms p95 instead of 191.78 ms;
+- `skills-drafts` remained rank 1 in every final result instead of missing every final top 50;
+- the dated `status-report` workbook remained in every final result at rank 8 instead of missing
+  every final top 50;
+- every case had one deterministic top-10 fingerprint across the run, every labeled target was
+  present in every final result, and first-useful p95 was at most 32.33 ms;
+- the slowest final p95 was 372.91 ms for `status report`; broad completion remains a quiet,
+  cancellable progressive phase rather than part of the 50 ms first-result contract;
+- peak physical footprint was 89,048,264 bytes.
+
+The benchmark report schema is now version 2. It adds priority-retrieval duration, priority
+verification duration, priority candidate count, and priority result count, so later agent-led
+tuning can distinguish the early ordered-tail path from global candidate retrieval.
+
+An adaptive shared-directory-mask follow-up was also measured and rejected. Building one dense
+mask table before broad q-gram verification reduced duplicated shard state, but moved too much
+directory work onto one thread. In back-to-back 10-sample loaded sessions, `vault methodology`
+final p95 regressed from 212.86 to 304.95 ms and `status report` from 545.04 to 758.03 ms; only
+`work wip` improved, from 309.15 to 283.35 ms. Production therefore keeps lazy shard-local path
+masks. This does not rule out a later concurrent sparse/shared design, but an eager dense table
+is not the next optimization.
+
+A later automation pass that deliberately avoided taking foreground focus is not a valid paint
+benchmark: WKWebView deferred its `requestAnimationFrame` callbacks until several minutes after
+the searches. It did confirm final visible rows and a 60 MiB settled physical footprint, but its
+paint timings are discarded. Foreground visual revalidation of this exact build remains pending.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive

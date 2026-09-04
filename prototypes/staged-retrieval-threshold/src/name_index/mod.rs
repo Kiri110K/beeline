@@ -111,6 +111,7 @@ impl LiveIndex {
         let context = RankContext {
             journal: &self.aggregate,
             aliases: &self.aliases,
+            retrieval: query::RetrievalSignals::default(),
         };
         let shards = if slots.is_some() {
             1

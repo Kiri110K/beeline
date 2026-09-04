@@ -32,8 +32,9 @@ application's index. The report contains every observation plus p50/p90/p95/p99/
 target ranks, top-10 fingerprints, candidate counts, and phase timings. `/usr/bin/time -lp`
 supplies process memory and page-fault counters on macOS.
 
-The only missing boundary is Tauri IPC → React commit → paint. Measure that in a separately
-scheduled visible-app pass; a hidden WebView can be throttled and is not a valid paint benchmark.
+The headless mode deliberately excludes Tauri IPC → React commit → paint. The separately
+labelled visible-app measurements and the follow-up production-core tuning are recorded in
+`RESULTS.md`; a hidden WebView is still not accepted as a paint benchmark.
 
 ## Historical prototype
 

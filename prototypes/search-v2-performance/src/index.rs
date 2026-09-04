@@ -119,6 +119,7 @@ impl LiveIndex {
         let context = RankContext {
             journal: &self.aggregate,
             aliases: &self.aliases,
+            retrieval: query::RetrievalSignals::default(),
         };
         let cancel = query::Cancel::new(generation, mine);
         let outcome = query::run_impl(

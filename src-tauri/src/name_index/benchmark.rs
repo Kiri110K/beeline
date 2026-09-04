@@ -26,11 +26,11 @@ use super::{
     qgram::QGramIndex,
     query::{self, RankContext, SearchHit},
     visit_journal::VisitJournal,
-    working_set_slots,
+    working_set, WorkingSet,
 };
 
 const RESULT_LIMIT: usize = 50;
-const REPORT_SCHEMA: u32 = 1;
+const REPORT_SCHEMA: u32 = 2;
 
 #[derive(Clone)]
 struct Case {
@@ -85,6 +85,10 @@ struct Observation {
     order: usize,
     repetition: usize,
     working_set_ms: f64,
+    priority_retrieval_ms: Option<f64>,
+    priority_verify_ms: Option<f64>,
+    priority_candidates: usize,
+    priority_results: usize,
     first_useful_ms: Option<f64>,
     target_first_ms: Option<f64>,
     candidate_retrieval_ms: f64,
@@ -126,6 +130,10 @@ struct CaseReport {
     target_rank_max: Option<usize>,
     top_ten_variants: usize,
     working_set: Distribution,
+    priority_retrieval: Option<Distribution>,
+    priority_verify: Option<Distribution>,
+    priority_candidates: Distribution,
+    priority_results: Distribution,
     first_useful: Option<Distribution>,
     target_first: Option<Distribution>,
     candidate_retrieval: Distribution,
@@ -208,7 +216,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
     let pinned_paths = read_pinned(&config.app_data.join("pinned_tabs.json"));
     let aggregate = journal.aggregate();
 
-    let (source_hash, base_items, live_items, base_slots, live_slots, working_slots) = {
+    let (source_hash, base_items, live_items, base_slots, live_slots, working) = {
         let index = data.read().expect("name index lock poisoned");
         let base_slots = index.base_entry_count();
         (
@@ -219,7 +227,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
             index.len(),
             base_slots,
             index.slot_len(),
-            working_set_slots(
+            working_set(
                 &index,
                 config.current.as_deref(),
                 &pinned_paths,
@@ -228,6 +236,10 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
             ),
         )
     };
+    let WorkingSet {
+        slots: working_slots,
+        retrieval,
+    } = working;
     let qgram = QGramIndex::open(&config.qgram, source_hash, base_slots).ok_or_else(|| {
         "q-gram sidecar is missing, invalid, or belongs to another Name Index generation".to_owned()
     })?;
@@ -256,6 +268,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
     let context = RankContext {
         journal: &aggregate,
         aliases: &aliases,
+        retrieval,
     };
     for case in &cases {
         for _ in 0..config.warmups {
@@ -382,10 +395,63 @@ fn measure(
         .iter()
         .position(|hit| hit.path == target)
         .map(|position| position + 1);
-    let first_useful_ms = (!working.hits.is_empty()).then_some(working_set_ms);
+    let mut first_useful_ms = (!working.hits.is_empty()).then_some(working_set_ms);
     let mut target_first_ms = working_target_rank.map(|_| working_set_ms);
 
     let retrieval_started = Instant::now();
+    let mut priority_retrieval_ms = None;
+    let mut priority_verify_ms = None;
+    let mut priority_candidates = 0usize;
+    let mut priority_results = 0usize;
+    let mut first_global_wave_ms = None;
+    let mut partial_waves = 0usize;
+    if working.hits.is_empty() {
+        let priority_started = Instant::now();
+        if let Some(seed) = qgram.ordered_tail_literal_candidates(&case.query, &cancel) {
+            if seed.aborted {
+                return Err(format!("priority retrieval aborted for {}", case.id));
+            }
+            let mut priority_slots = seed.slots;
+            let overlay = query::ordered_tail_literal_slots(
+                index,
+                &case.query,
+                qgram.source_entries(),
+                Some(&cancel),
+            );
+            if overlay.aborted {
+                return Err(format!("priority overlay scan aborted for {}", case.id));
+            }
+            priority_slots.extend(overlay.slots);
+            priority_slots.sort_unstable();
+            priority_slots.dedup();
+            priority_candidates = priority_slots.len();
+            priority_retrieval_ms = Some(elapsed_ms(priority_started));
+            let verify_started = Instant::now();
+            let priority = query::run_fuzzy(
+                index,
+                context,
+                &case.query,
+                RESULT_LIMIT,
+                &priority_slots,
+                Some(&cancel),
+                false,
+            );
+            priority_verify_ms = Some(elapsed_ms(verify_started));
+            if priority.aborted {
+                return Err(format!("priority verification aborted for {}", case.id));
+            }
+            priority_results = priority.hits.len();
+            if !priority.hits.is_empty() {
+                partial_waves += 1;
+                let elapsed = elapsed_ms(started);
+                first_global_wave_ms = Some(elapsed);
+                first_useful_ms = Some(elapsed);
+                if target_first_ms.is_none() && priority.hits.iter().any(|hit| hit.path == target) {
+                    target_first_ms = Some(elapsed);
+                }
+            }
+        }
+    }
     let candidate_set = qgram.candidates(&case.query, &cancel);
     let candidate_retrieval_ms = elapsed_ms(retrieval_started);
     if candidate_set.aborted {
@@ -400,11 +466,9 @@ fn measure(
     candidate_slots.dedup();
     let candidate_prepare_ms = elapsed_ms(prepare_started);
 
-    let mut first_global_wave_ms = None;
-    let mut partial_waves = 0usize;
     let verify_started = Instant::now();
     let mut on_partial = |hits: Vec<SearchHit>, _scanned: usize| {
-        if hits.is_empty() {
+        if priority_results > 0 || hits.is_empty() {
             return;
         }
         partial_waves += 1;
@@ -431,7 +495,7 @@ fn measure(
     if first_global_wave_ms.is_none() && !global.hits.is_empty() {
         first_global_wave_ms = Some(elapsed_ms(started));
     }
-    let first_useful_ms = first_useful_ms.or(first_global_wave_ms);
+    first_useful_ms = first_useful_ms.or(first_global_wave_ms);
     let total_ms = elapsed_ms(started);
     let target_rank = global
         .hits
@@ -447,6 +511,10 @@ fn measure(
             order,
             repetition,
             working_set_ms,
+            priority_retrieval_ms,
+            priority_verify_ms,
+            priority_candidates,
+            priority_results,
             first_useful_ms,
             target_first_ms,
             candidate_retrieval_ms,
@@ -500,6 +568,26 @@ fn case_report(case: Case, samples: Vec<SampleResult>) -> CaseReport {
         target_rank_max: target_ranks.iter().copied().max(),
         top_ten_variants,
         working_set: distribution(observations.iter().map(|sample| sample.working_set_ms)),
+        priority_retrieval: optional_distribution(
+            observations
+                .iter()
+                .filter_map(|sample| sample.priority_retrieval_ms),
+        ),
+        priority_verify: optional_distribution(
+            observations
+                .iter()
+                .filter_map(|sample| sample.priority_verify_ms),
+        ),
+        priority_candidates: distribution(
+            observations
+                .iter()
+                .map(|sample| sample.priority_candidates as f64),
+        ),
+        priority_results: distribution(
+            observations
+                .iter()
+                .map(|sample| sample.priority_results as f64),
+        ),
         first_useful: optional_distribution(
             observations
                 .iter()

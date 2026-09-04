@@ -41,7 +41,7 @@ use junk::JunkPatterns;
 use junk_refresh::JunkRefresh;
 use model::{IndexData, Tier};
 use qgram::QGramIndex;
-use query::{RankContext, SearchHit};
+use query::{RankContext, RetrievalSignals, RetrievalSource, SearchHit};
 use visit_journal::{VisitJournal, VisitKind};
 
 /// The volume key for the home root. Mounted volumes get their own keys later.
@@ -533,6 +533,7 @@ fn execute_search(
     limit: usize,
     reuse: Option<&ReuseCache>,
     cancel: Option<&query::Cancel>,
+    retrieval: RetrievalSignals,
 ) -> Executed {
     let query_lower = query.trim().to_lowercase();
     if junk.query_targets_junk(&query_lower) {
@@ -546,6 +547,7 @@ fn execute_search(
     let ctx = RankContext {
         journal: &aggregate,
         aliases,
+        retrieval,
     };
     let index = data.read().expect("name index lock poisoned");
     let revision = index.revision;
@@ -619,7 +621,17 @@ fn run_search(
 ) -> SearchResponse {
     let started = Instant::now();
     let executed = execute_search(
-        data, junk, root, journal, aliases, None, query, limit, None, None,
+        data,
+        junk,
+        root,
+        journal,
+        aliases,
+        None,
+        query,
+        limit,
+        None,
+        None,
+        RetrievalSignals::default(),
     );
     SearchResponse {
         revision: executed.revision,
@@ -630,30 +642,49 @@ fn run_search(
     }
 }
 
-fn working_set_slots(
+struct WorkingSet {
+    slots: Vec<u32>,
+    retrieval: RetrievalSignals,
+}
+
+fn working_set(
     index: &IndexData,
     current_location: Option<&Path>,
     pinned_paths: &[PathBuf],
     recent_paths: &[PathBuf],
     journal: &visit_journal::Aggregate,
-) -> Vec<u32> {
+) -> WorkingSet {
     let mut slots = BTreeSet::new();
+    let mut retrieval = RetrievalSignals::default();
     if let Some(location) = current_location {
         if let Some(directory) = index.resolve_dir(location) {
-            slots.extend(index.direct_entry_slots(directory));
+            for slot in index.direct_entry_slots(directory) {
+                slots.insert(slot);
+                retrieval.insert(slot, RetrievalSource::CurrentLocation);
+            }
         }
     }
-    for path in pinned_paths
-        .iter()
-        .chain(recent_paths)
-        .map(PathBuf::as_path)
-        .chain(journal.paths().map(Path::new))
-    {
+    for path in pinned_paths {
+        if let Some(slot) = index.resolve_item_slot(path) {
+            slots.insert(slot);
+            retrieval.insert(slot, RetrievalSource::PinnedAnchor);
+        }
+    }
+    for path in recent_paths {
+        if let Some(slot) = index.resolve_item_slot(path) {
+            slots.insert(slot);
+            retrieval.insert(slot, RetrievalSource::Recents);
+        }
+    }
+    for path in journal.paths().map(Path::new) {
         if let Some(slot) = index.resolve_item_slot(path) {
             slots.insert(slot);
         }
     }
-    slots.into_iter().collect()
+    WorkingSet {
+        slots: slots.into_iter().collect(),
+        retrieval,
+    }
 }
 
 fn send_wave(channel: &Channel<SearchWave>, wave: SearchWave) -> Result<(), String> {
@@ -717,20 +748,20 @@ pub async fn search_name_index_v2(
         let stream_started = Instant::now();
         let cancel = query::Cancel::new(&generation, my_gen);
         let aggregate = journal.aggregate();
-        let context = RankContext {
-            journal: &aggregate,
-            aliases: &aliases,
-        };
-
-        let (working, working_slots, revision) = {
+        let (working, working_slots, context, revision) = {
             let index = data.read().expect("name index lock poisoned");
-            let slots = working_set_slots(
+            let WorkingSet { slots, retrieval } = working_set(
                 &index,
                 current_location.as_deref(),
                 &pinned_paths,
                 &recent_paths,
                 &aggregate,
             );
+            let context = RankContext {
+                journal: &aggregate,
+                aliases: &aliases,
+                retrieval,
+            };
             let outcome = query::run_fuzzy(
                 &index,
                 &context,
@@ -740,11 +771,12 @@ pub async fn search_name_index_v2(
                 Some(&cancel),
                 true,
             );
-            (outcome, slots, index.revision)
+            (outcome, slots, context, index.revision)
         };
         if working.aborted {
             return Err("search superseded".to_owned());
         }
+        let working_empty = working.hits.is_empty();
         let global = qgram::significant_len(&query) >= 5;
         let qgram_ready = qgrams.read().expect("q-gram lock poisoned").is_some();
         send_wave(
@@ -769,6 +801,73 @@ pub async fn search_name_index_v2(
             if junk.query_targets_junk(&query.trim().to_lowercase()) {
                 junk_refresh.targeting_query();
             }
+            // When the complete Working Set has no match, verify the final token's q-gram
+            // pool first. This is the ordered Path Interpretation's likely name pool (for
+            // example `methodology` in `vault methodology`), and avoids making the first
+            // useful row wait for the much larger ordinary-search union.
+            let mut priority_candidates = 0usize;
+            let mut priority_results = 0usize;
+            let mut priority_posting_visits = 0usize;
+            let mut priority_sent = false;
+            if working_empty {
+                if let Some(seed) = qgram.ordered_tail_literal_candidates(&query, &cancel) {
+                    if seed.aborted {
+                        return Err("search superseded".to_owned());
+                    }
+                    priority_posting_visits = seed.posting_visits;
+                    let mut priority_slots = seed.slots;
+                    {
+                        let index = data.read().expect("name index lock poisoned");
+                        let overlay = query::ordered_tail_literal_slots(
+                            &index,
+                            &query,
+                            qgram.source_entries(),
+                            Some(&cancel),
+                        );
+                        if overlay.aborted {
+                            return Err("search superseded".to_owned());
+                        }
+                        priority_slots.extend(overlay.slots);
+                    }
+                    priority_slots.sort_unstable();
+                    priority_slots.dedup();
+                    priority_candidates = priority_slots.len();
+                    let priority = {
+                        let index = data.read().expect("name index lock poisoned");
+                        query::run_fuzzy(
+                            &index,
+                            &context,
+                            &query,
+                            limit as usize,
+                            &priority_slots,
+                            Some(&cancel),
+                            false,
+                        )
+                    };
+                    if priority.aborted {
+                        return Err("search superseded".to_owned());
+                    }
+                    priority_results = priority.hits.len();
+                    if !priority.hits.is_empty() {
+                        send_wave(
+                            &on_wave,
+                            SearchWave {
+                                stage: "fuzzy",
+                                revision,
+                                complete: false,
+                                qgram_ready: true,
+                                scanned: priority.scanned,
+                                backend_duration_ms: u64::try_from(
+                                    stream_started.elapsed().as_millis(),
+                                )
+                                .unwrap_or(u64::MAX),
+                                hits: priority.hits,
+                            },
+                        )?;
+                        priority_sent = true;
+                    }
+                }
+            }
             let candidate_set = qgram.candidates(&query, &cancel);
             if candidate_set.aborted {
                 return Err("search superseded".to_owned());
@@ -785,7 +884,10 @@ pub async fn search_name_index_v2(
 
             let mut partial_error = None;
             let mut send_partial = |hits: Vec<SearchHit>, scanned: usize| {
-                if hits.is_empty() || partial_error.is_some() {
+                // Keep the fast ordered-tail rows stable until the deterministic final wave.
+                // A partial from an arbitrary global shard can be less complete and would
+                // otherwise replace the useful early result with an unrelated subset.
+                if priority_sent || hits.is_empty() || partial_error.is_some() {
                     return;
                 }
                 if let Err(error) = send_wave(
@@ -847,6 +949,9 @@ pub async fn search_name_index_v2(
                         .unwrap_or(u64::MAX),
                     "candidates": candidate_slots.len(),
                     "posting_visits": candidate_set.posting_visits,
+                    "priority_candidates": priority_candidates,
+                    "priority_posting_visits": priority_posting_visits,
+                    "priority_results": priority_results,
                     "results": result_count,
                     "retrieval": "qgram",
                 }),
@@ -868,6 +973,7 @@ pub async fn search_name_index_v2(
             limit as usize,
             cached.as_ref(),
             Some(&cancel),
+            context.retrieval.clone(),
         );
         if exact.outcome.aborted {
             return Err("search superseded".to_owned());
@@ -1672,6 +1778,7 @@ mod tests {
             50,
             None,
             None,
+            RetrievalSignals::default(),
         );
         assert!(base.outcome.exhaustive);
         let cache = ReuseCache {
@@ -1693,6 +1800,7 @@ mod tests {
             50,
             None,
             None,
+            RetrievalSignals::default(),
         );
         let reused = execute_search(
             &shared,
@@ -1705,6 +1813,7 @@ mod tests {
             50,
             Some(&cache),
             None,
+            RetrievalSignals::default(),
         );
 
         assert!(!reused.reused, "single→multi must fall back to a full scan");

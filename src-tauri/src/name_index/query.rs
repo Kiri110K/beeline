@@ -2,11 +2,9 @@
 //!
 //! This is the whole ranker in one module: the scan, the score, and the deterministic
 //! order. §6 splits into *guarantees* (binding, in precedence order) and *weights*
-//! (tuning). The guarantees are encoded as score bands wide enough that no combination
-//! of tuning weights can cross a band — e.g. an exact match minus the heaviest penalty
-//! still outscores any fuzzy match plus every boost, so "exact beats any penalty" holds
-//! whatever the constants below become. All weights live in the `weights` block so the
-//! tuning surface is one place.
+//! (tuning). Base match tiers and structural interpretations occupy explicit quality bands;
+//! smaller personal weights order candidates inside those interpretations. All values live
+//! in the `weights` block so the tuning surface is one place.
 //!
 //! Guarantee → code map (each also has a focused test, see the `tests` module and
 //! `mod.rs`):
@@ -22,7 +20,7 @@
 //! query always yields the same order.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -66,11 +64,12 @@ const MAX_NAME_FUZZY_SHARDS: usize = 10;
 const ABORT_STRIDE: usize = 4096;
 
 // --- weights (the entire tuning surface, SPEC §6) --------------------------------------
-// `Q` is the match-quality unit. Quality bands are multiples of `Q`; every penalty and
-// boost is far below `Q`, so match quality always dominates and the guarantee bands never
-// cross. Injected bands (existing path, alias) sit far above any scanned score.
+// `Q` is the match-quality unit. Base match tiers, structural interpretations, personal
+// evidence, and penalties all contribute to one deterministic score. Existing-path and alias
+// injections sit far above any scanned score because those two guarantees are absolute.
 
-/// Match-quality unit; one full band. All penalties and boosts combined stay below it.
+/// Match-quality unit. Base match tiers, structural interpretations, and personal evidence
+/// are all expressed relative to this number in the one score.
 const Q: i64 = 1_000_000;
 /// Whole-name match (case-insensitive). Beats any penalty (guarantee b).
 const QUAL_EXACT: i64 = 5 * Q;
@@ -84,18 +83,21 @@ const QUAL_TYPO: i64 = Q + Q / 2;
 /// band below the weakest name match, so an all-tokens-in-name hit always outranks a hit
 /// where any token only appears in the path (SPEC §6 token contract, part 3).
 const QUAL_PATH: i64 = Q;
+/// Evidence that every token occurs in the Item name. This keeps a direct compound name such
+/// as `status-report...` above a result that only forms `status/report` across name and path,
+/// while an exact ordered tail such as `work/wip` can still win through scope priority.
+const QUAL_ALL_TOKENS_IN_NAME: i64 = 3 * Q;
 
 /// An existing absolute path typed as the query ranks its target first (guarantee a).
 const EXISTING_PATH: i64 = 100 * Q;
 /// A query matching an alias word recommends its target as a top result (guarantee g).
 const ALIAS_RECOMMEND: i64 = 50 * Q;
 
-/// Added when a path-shaped match falls under the typed prefix (guarantee c). Below a
-/// quality band but above every penalty and boost, so scoped matches win within a band.
+/// Added when a path-shaped match falls under the typed prefix (guarantee c). It is smaller
+/// than one base quality unit but large enough to separate otherwise similar scoped matches.
 const SCOPE_BONUS: i64 = 500_000;
-/// A layout-corrected match ranks just below a same-quality direct match (guarantee d):
-/// larger than every boost combined (boosts can't lift a corrected match past a direct
-/// one) yet smaller than a quality band.
+/// A layout-corrected match ranks just below the same direct match when their other evidence
+/// is equal (guarantee d).
 const CORRECTION_PENALTY: i64 = 100_000;
 
 /// Junk carries a heavy ranking penalty (guarantee h).
@@ -104,6 +106,13 @@ const JUNK_PENALTY: i64 = 40_000;
 const HIDDEN_PENALTY: i64 = 8_000;
 /// A Known Place (Home, Desktop, …) is lifted in the results (guarantee f).
 const KNOWN_PLACE_BOOST: i64 = 20_000;
+/// Working Set retrieval sources are ranking evidence, not a forced position. Current
+/// Location is strong enough to lift a prefix-matching direct child over unrelated global
+/// exact names; Pinned Anchors and Recents currently act as smaller tie-breakers. These values
+/// can later move into Ranker Configuration without changing Working Set construction.
+const CURRENT_LOCATION_BOOST: i64 = Q + Q / 2;
+const PINNED_ANCHOR_BOOST: i64 = 18_000;
+const RECENTS_BOOST: i64 = 24_000;
 
 /// The physical-key mapping between US QWERTY and РФ ЙЦУКЕН, used for layout correction
 /// (guarantee d). No phonetic transliteration — this is the keyboard geometry only.
@@ -149,6 +158,48 @@ const LAYOUT_PAIRS: &[(char, char)] = &[
 pub struct RankContext<'a> {
     pub journal: &'a Aggregate,
     pub aliases: &'a AliasDictionary,
+    pub retrieval: RetrievalSignals,
+}
+
+#[derive(Clone, Copy)]
+pub enum RetrievalSource {
+    CurrentLocation,
+    PinnedAnchor,
+    Recents,
+}
+
+/// Query-independent Candidate Evidence contributed by Working Set retrieval. Source bits
+/// stay distinct so the ranker can apply one weight per pool; an Item present in several
+/// pools receives every applicable contribution.
+#[derive(Clone, Default)]
+pub struct RetrievalSignals {
+    by_slot: HashMap<u32, u8>,
+}
+
+impl RetrievalSignals {
+    pub fn insert(&mut self, slot: u32, source: RetrievalSource) {
+        let bit = match source {
+            RetrievalSource::CurrentLocation => 1,
+            RetrievalSource::PinnedAnchor => 1 << 1,
+            RetrievalSource::Recents => 1 << 2,
+        };
+        *self.by_slot.entry(slot).or_default() |= bit;
+    }
+
+    fn boost(&self, slot: u32) -> i64 {
+        let sources = self.by_slot.get(&slot).copied().unwrap_or_default();
+        let mut boost = 0;
+        if sources & 1 != 0 {
+            boost += CURRENT_LOCATION_BOOST;
+        }
+        if sources & (1 << 1) != 0 {
+            boost += PINNED_ANCHOR_BOOST;
+        }
+        if sources & (1 << 2) != 0 {
+            boost += RECENTS_BOOST;
+        }
+        boost
+    }
 }
 
 impl RankContext<'static> {
@@ -161,6 +212,7 @@ impl RankContext<'static> {
         RankContext {
             journal: AGG.get_or_init(Aggregate::default),
             aliases: ALIASES.get_or_init(AliasDictionary::empty),
+            retrieval: RetrievalSignals::default(),
         }
     }
 }
@@ -233,6 +285,11 @@ pub struct SearchOutcome {
     /// Slot indices of the matched entries (only populated when `exhaustive`), cached so an
     /// extended query can rescan just this set instead of the whole index.
     pub candidate_entries: Vec<u32>,
+}
+
+pub struct SlotSelection {
+    pub slots: Vec<u32>,
+    pub aborted: bool,
 }
 
 /// Everything derived once from the query text, shared read-only across scan shards.
@@ -609,6 +666,72 @@ pub fn run_fuzzy(
     run_fuzzy_inner(index, ctx, query, limit, slots, cancel, short_fuzzy, None)
 }
 
+/// Find literal final-token names in the mutable overlay, which is not represented by the
+/// q-gram sidecar. This is the overlay half of the ordered-tail early wave; the returned
+/// slots still go through full-query verification before the UI sees them.
+pub fn ordered_tail_literal_slots(
+    index: &IndexData,
+    query: &str,
+    start: usize,
+    cancel: Option<&Cancel>,
+) -> SlotSelection {
+    let trimmed = query.trim();
+    let query_lower = trimmed.to_lowercase();
+    let prep = Prepared::new(index, trimmed, &query_lower);
+    let mut needles = Vec::new();
+    if prep.path_shaped {
+        if prep.segments.len() > 1 {
+            let last = prep.segments.len() - 1;
+            needles.push((
+                prep.segments[last].as_str(),
+                prep.segment_name_filters[last],
+            ));
+        }
+    } else if prep.tokens.len() > 1 {
+        let last = prep.tokens.len() - 1;
+        needles.push((
+            prep.tokens[last].as_str(),
+            prep.path_needle_name_filters[last],
+        ));
+        for (set, &offset) in prep.corrected_tokens.iter().zip(&prep.corrected_offsets) {
+            let last = set.len() - 1;
+            needles.push((
+                set[last].as_str(),
+                prep.path_needle_name_filters[offset + last],
+            ));
+        }
+    }
+    if needles.is_empty() {
+        return SlotSelection {
+            slots: Vec::new(),
+            aborted: false,
+        };
+    }
+
+    let mut slots = Vec::new();
+    let mut scratch = String::new();
+    for slot in start..index.slot_len() {
+        if (slot - start).is_multiple_of(ABORT_STRIDE) && cancel.is_some_and(Cancel::superseded) {
+            return SlotSelection {
+                slots: Vec::new(),
+                aborted: true,
+            };
+        }
+        let Some(entry) = index.entry(slot) else {
+            continue;
+        };
+        if needles.iter().any(|(needle, filter)| {
+            quality_match(entry.name, entry.filter, needle, *filter, &mut scratch).is_some()
+        }) {
+            slots.push(slot as u32);
+        }
+    }
+    SlotSelection {
+        slots,
+        aborted: false,
+    }
+}
+
 /// The global Search v2 variant: each completed shard can publish the best cumulative
 /// ranking collected so far, while the return value remains the deterministic final top K.
 #[allow(clippy::too_many_arguments)]
@@ -782,11 +905,12 @@ fn scan_fuzzy_slots(
             continue;
         }
         scanned += 1;
-        if let Some((score, path)) =
+        if let Some((mut score, path)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch).or_else(|| {
                 score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut edit_scratch)
             })
         {
+            score += ctx.retrieval.boost(slot);
             candidates.push(Candidate {
                 score,
                 path,
@@ -1326,9 +1450,10 @@ fn scan_range(
             entry,
             name_filter: item_filter,
         };
-        if let Some((score, path)) =
+        if let Some((mut score, path)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
+            score += ctx.retrieval.boost(slot as u32);
             local.push(Candidate {
                 score,
                 path,
@@ -1379,9 +1504,10 @@ fn scan_reuse(
             entry,
             name_filter: item_filter,
         };
-        if let Some((score, path)) =
+        if let Some((mut score, path)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
+            score += ctx.retrieval.boost(slot);
             local.push(Candidate {
                 score,
                 path,
@@ -1580,20 +1706,26 @@ fn match_token_set(
     scratch: &mut String,
 ) -> Option<i64> {
     let mut band = i64::MAX;
+    let mut all_in_name = true;
     for (j, token) in tokens.iter().enumerate() {
         // `offset + j` is this token's index in `Prepared::path_needles`, i.e. its bit in a
         // dir mask.
-        band = band.min(token_quality(
-            index,
-            item,
-            token,
-            offset + j,
-            prep,
-            dir_masks,
-            scratch,
-        )?);
+        let quality = token_quality(index, item, token, offset + j, prep, dir_masks, scratch)?;
+        band = band.min(quality.score);
+        all_in_name &= quality.in_name;
     }
-    (band != i64::MAX).then_some(band)
+    (band != i64::MAX).then_some(
+        band + if all_in_name {
+            QUAL_ALL_TOKENS_IN_NAME
+        } else {
+            0
+        },
+    )
+}
+
+struct TokenQuality {
+    score: i64,
+    in_name: bool,
 }
 
 /// The quality of one token against one entry: its name-match tier when the token occurs in
@@ -1616,7 +1748,7 @@ fn token_quality(
     prep: &Prepared,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<i64> {
+) -> Option<TokenQuality> {
     if let Some(quality) = quality_match(
         item.entry.name,
         item.name_filter,
@@ -1624,7 +1756,10 @@ fn token_quality(
         prep.path_needle_name_filters[flat_index],
         scratch,
     ) {
-        return Some(quality);
+        return Some(TokenQuality {
+            score: quality,
+            in_name: true,
+        });
     }
     let in_path = match dir_masks {
         Some(cache) => {
@@ -1639,7 +1774,10 @@ fn token_quality(
                     .any(|component| component.contains(token))
         }
     };
-    in_path.then_some(QUAL_PATH)
+    in_path.then_some(TokenQuality {
+        score: QUAL_PATH,
+        in_name: false,
+    })
 }
 
 /// Split a plain query on whitespace: runs of spaces collapse and leading/trailing space is
@@ -2153,9 +2291,56 @@ mod tests {
         let ctx = RankContext {
             journal: &aggregate,
             aliases: &AliasDictionary::empty(),
+            retrieval: RetrievalSignals::default(),
         };
         let boosted = search(&index, &ctx, "notes", 50);
         assert_eq!(boosted[0].path, "/home/tester/sub/notes"); // visited path lifted
+    }
+
+    #[test]
+    fn recents_source_lifts_within_quality_without_crossing_a_quality_band() {
+        let mut index = index();
+        index.add_file(0, "report", Tier::Normal);
+        let sub = index.add_dir(0, "sub", Tier::Normal, 0);
+        let recent_slot = index.slot_len() as u32;
+        index.add_file(sub, "report", Tier::Normal);
+        let weaker_slot = index.slot_len() as u32;
+        index.add_file(0, "report-draft", Tier::Normal);
+
+        let mut retrieval = RetrievalSignals::default();
+        retrieval.insert(recent_slot, RetrievalSource::Recents);
+        retrieval.insert(weaker_slot, RetrievalSource::Recents);
+        let ctx = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval,
+        };
+        let hits = search(&index, &ctx, "report", 50);
+
+        assert_eq!(hits[0].path, "/home/tester/sub/report");
+        assert_eq!(hits[1].path, "/home/tester/report");
+        assert_eq!(hits[2].path, "/home/tester/report-draft");
+    }
+
+    #[test]
+    fn current_location_can_lift_a_direct_child_prefix_over_global_exact_names() {
+        let mut index = index();
+        index.add_file(0, "skills", Tier::Normal);
+        let current = index.add_dir(0, "current", Tier::Normal, 0);
+        let local_slot = index.slot_len() as u32;
+        index.add_file(current, "skills-drafts", Tier::Normal);
+
+        let mut retrieval = RetrievalSignals::default();
+        retrieval.insert(local_slot, RetrievalSource::CurrentLocation);
+        let ctx = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval,
+        };
+
+        let hits = search(&index, &ctx, "skills", 50);
+        assert_eq!(hits[0].path, "/home/tester/current/skills-drafts");
+        assert_eq!(hits[1].path, "/home/tester/skills");
     }
 
     #[test]
@@ -2182,6 +2367,7 @@ mod tests {
         let ctx = RankContext {
             journal: &Aggregate::default(),
             aliases: &aliases,
+            retrieval: RetrievalSignals::default(),
         };
         let hits = search(&index, &ctx, "docs", 50);
         assert_eq!(hits[0].path, "/home/tester/Projects");
@@ -2332,6 +2518,42 @@ mod tests {
 
         let hits = run(&index, "work wip");
         assert_eq!(hits[0].path, "/home/tester/work/wip");
+    }
+
+    #[test]
+    fn all_name_tokens_beat_a_name_and_ancestor_path_interpretation() {
+        let mut index = index();
+        let status = index.add_dir(0, "status-all", Tier::Normal, 0);
+        index.add_file(status, "report-data.ts", Tier::Normal);
+        let downloads = index.add_dir(0, "Downloads", Tier::Normal, 0);
+        index.add_file(downloads, "status-report_2026.xlsx", Tier::Normal);
+
+        let hits = run(&index, "status report");
+        assert_eq!(
+            hits[0].path,
+            "/home/tester/Downloads/status-report_2026.xlsx"
+        );
+        assert_eq!(hits[1].path, "/home/tester/status-all/report-data.ts");
+    }
+
+    #[test]
+    fn ordered_tail_literal_overlay_scan_keeps_only_literal_name_candidates() {
+        let mut index = index();
+        let vault = index.add_dir(0, "vault", Tier::Normal, 0);
+        let target_slot = index.slot_len() as u32;
+        index.add_file(vault, "methodology.md", Tier::Normal);
+        index.add_file(0, "vault-notes.md", Tier::Normal);
+        index.add_file(0, "unrelated.txt", Tier::Normal);
+
+        let selected = ordered_tail_literal_slots(&index, "vault methodology", 0, None);
+        assert!(!selected.aborted);
+        assert_eq!(selected.slots, vec![target_slot]);
+
+        let generation = AtomicU64::new(2);
+        let cancelled = Cancel::new(&generation, 1);
+        assert!(
+            ordered_tail_literal_slots(&index, "vault methodology", 0, Some(&cancelled)).aborted
+        );
     }
 
     #[test]
