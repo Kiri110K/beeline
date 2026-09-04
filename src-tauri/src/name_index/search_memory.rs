@@ -243,17 +243,21 @@ impl MemoryEvidence {
     }
 
     pub fn boost(&self, path: &str, config: &RankerConfig) -> i64 {
+        let (memory, usage) = self.contributions(path, config);
+        memory.saturating_add(usage)
+    }
+
+    pub fn contributions(&self, path: &str, config: &RankerConfig) -> (i64, i64) {
         let strength = self.by_path.get(path).copied().unwrap_or_default();
-        strength
+        let memory = strength
             .memory_milli
             .saturating_mul(config.search_memory.max)
-            .saturating_div(1_000)
-            .saturating_add(
-                strength
-                    .usage_milli
-                    .saturating_mul(config.search_memory.usage_max)
-                    .saturating_div(1_000),
-            )
+            .saturating_div(1_000);
+        let usage = strength
+            .usage_milli
+            .saturating_mul(config.search_memory.usage_max)
+            .saturating_div(1_000);
+        (memory, usage)
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {

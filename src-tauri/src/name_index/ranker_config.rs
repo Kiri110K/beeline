@@ -305,10 +305,9 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<(), Stri
             );
         }
         "replay" => {
-            return Err(
-                "ranker replay requires Ranking Traces; that command is not available until the trace store is initialized"
-                    .to_owned(),
-            );
+            let path = next_path(&mut arguments)?;
+            no_more(&mut arguments)?;
+            println!("{}", super::ranking_trace::replay(&path)?);
         }
         _ => return Err(cli_usage()),
     }

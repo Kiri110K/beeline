@@ -14,9 +14,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::{query::SearchHit, ranker_config::RankerConfig};
+use super::{
+    query::{ScoreContributions, SearchHit},
+    ranker_config::RankerConfig,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const DETAIL_IDLE: Duration = Duration::from_millis(300);
@@ -30,7 +33,7 @@ pub struct RankingTraces {
     sender: Sender<Event>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record {
     Query {
@@ -71,13 +74,14 @@ impl Record {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RankedItem {
     rank: usize,
     path: String,
     name: String,
     score: i64,
+    contributions: ScoreContributions,
     tier: String,
     is_directory: bool,
 }
@@ -154,6 +158,7 @@ impl RankingTraces {
                 path: hit.path.clone(),
                 name: hit.name.clone(),
                 score: hit.score,
+                contributions: hit.contributions.clone(),
                 tier: hit.tier.to_owned(),
                 is_directory: hit.is_directory,
             })
@@ -196,6 +201,7 @@ fn run_writer(
 ) -> io::Result<()> {
     let mut last_maintenance_ms = wall_clock_ms();
     compact_if_needed(trace_path, last_maintenance_ms)?;
+    prune_snapshots(trace_path, snapshots)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -212,6 +218,7 @@ fn run_writer(
                         append(&mut file, &record)?;
                         compact_after_write(
                             trace_path,
+                            snapshots,
                             &mut file,
                             record.timestamp_ms(),
                             &mut last_maintenance_ms,
@@ -237,6 +244,7 @@ fn run_writer(
                 append(&mut file, &record)?;
                 compact_after_write(
                     trace_path,
+                    snapshots,
                     &mut file,
                     record.timestamp_ms(),
                     &mut last_maintenance_ms,
@@ -277,6 +285,7 @@ fn snapshot_config(directory: &Path, fingerprint: &str, formatted: &str) -> io::
 
 fn compact_after_write(
     path: &Path,
+    snapshots: &Path,
     file: &mut File,
     newest_ms: i64,
     last_maintenance_ms: &mut i64,
@@ -288,8 +297,39 @@ fn compact_after_write(
     }
     file.flush()?;
     compact_if_needed(path, newest_ms)?;
+    prune_snapshots(path, snapshots)?;
     *last_maintenance_ms = newest_ms;
     *file = OpenOptions::new().append(true).open(path)?;
+    Ok(())
+}
+
+fn prune_snapshots(trace_path: &Path, directory: &Path) -> io::Result<()> {
+    let mut referenced = std::collections::HashSet::new();
+    if let Ok(file) = File::open(trace_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(fingerprint) = value
+                    .get("config_fingerprint")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    referenced.insert(fingerprint.to_owned());
+                }
+            }
+        }
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !referenced.contains(stem) {
+            let _ = fs::remove_file(path);
+        }
+    }
     Ok(())
 }
 
@@ -339,6 +379,76 @@ fn wall_clock_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+pub fn replay(path: &Path) -> Result<serde_json::Value, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("cannot open Ranking Traces {}: {error}", path.display()))?;
+    let mut queries = 0usize;
+    let mut result_snapshots = 0usize;
+    let mut actions = 0usize;
+    let mut ranked_items = 0usize;
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!(
+                "cannot read Ranking Traces {} line {}: {error}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<Record>(&line).map_err(|error| {
+            format!(
+                "invalid Ranking Trace {} line {}: {error}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        match record {
+            Record::Query { .. } => queries += 1,
+            Record::Action { .. } => actions += 1,
+            Record::Results { results, .. } => {
+                result_snapshots += 1;
+                ranked_items += results.len();
+                let mut previous_score = i64::MAX;
+                for (index, result) in results.iter().enumerate() {
+                    if result.rank != index + 1 {
+                        return Err(format!(
+                            "Ranking Trace line {} has non-contiguous rank {}",
+                            line_number + 1,
+                            result.rank
+                        ));
+                    }
+                    if result.score != result.contributions.total() {
+                        return Err(format!(
+                            "Ranking Trace line {} rank {} score {} does not equal contribution total {}",
+                            line_number + 1,
+                            result.rank,
+                            result.score,
+                            result.contributions.total()
+                        ));
+                    }
+                    if result.score > previous_score {
+                        return Err(format!(
+                            "Ranking Trace line {} is not ordered at rank {}",
+                            line_number + 1,
+                            result.rank
+                        ));
+                    }
+                    previous_score = result.score;
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "valid": true,
+        "queries": queries,
+        "resultSnapshots": result_snapshots,
+        "actions": actions,
+        "rankedItems": ranked_items,
+    }))
 }
 
 #[cfg(test)]
@@ -396,6 +506,44 @@ mod tests {
             serde_json::from_str(fs::read_to_string(path).expect("read").trim()).expect("json");
         assert_eq!(value["kind"], "query");
         assert_eq!(value["query"], "methodology");
+        let summary = replay(&dir.join("trace.ndjson")).expect("replay");
+        assert_eq!(summary["queries"], 1);
+        assert_eq!(summary["resultSnapshots"], 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replay_rejects_a_score_that_disagrees_with_contributions() {
+        let dir = temp_dir();
+        let path = dir.join("trace.ndjson");
+        let mut file = File::create(&path).expect("create");
+        append(
+            &mut file,
+            &Record::Results {
+                schema_version: SCHEMA_VERSION,
+                timestamp_ms: 10,
+                query: "report".to_owned(),
+                config_fingerprint: "abc".to_owned(),
+                stage: "fuzzy".to_owned(),
+                backend_duration_ms: 5,
+                scanned: 1,
+                results: vec![RankedItem {
+                    rank: 1,
+                    path: "/tmp/report".to_owned(),
+                    name: "report".to_owned(),
+                    score: 7,
+                    contributions: ScoreContributions {
+                        text_match: 8,
+                        ..ScoreContributions::default()
+                    },
+                    tier: "normal".to_owned(),
+                    is_directory: false,
+                }],
+            },
+        )
+        .expect("append");
+        drop(file);
+        assert!(replay(&path).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }

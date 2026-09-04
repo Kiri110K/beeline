@@ -664,6 +664,10 @@ fn direct_existing_path_response(
             is_directory,
             tier: tier.as_str(),
             score: ranker.text_match.existing_path,
+            contributions: query::ScoreContributions {
+                text_match: ranker.text_match.existing_path,
+                ..query::ScoreContributions::default()
+            },
         }],
     })
 }

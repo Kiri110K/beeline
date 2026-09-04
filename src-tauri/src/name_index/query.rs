@@ -16,7 +16,7 @@ use std::{
 };
 
 use memchr::{memchr2_iter, memchr_iter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::name_index::{
     alias::AliasDictionary,
@@ -129,18 +129,24 @@ impl RetrievalSignals {
     }
 
     fn boost(&self, slot: u32, config: &RankerConfig) -> i64 {
+        let (context, general_usage) = self.contributions(slot, config);
+        context.saturating_add(general_usage)
+    }
+
+    fn contributions(&self, slot: u32, config: &RankerConfig) -> (i64, i64) {
         let sources = self.by_slot.get(&slot).copied().unwrap_or_default();
-        let mut boost = 0;
+        let mut context = 0i64;
+        let mut general_usage = 0i64;
         if sources & 1 != 0 {
-            boost += config.context.current_location;
+            context = context.saturating_add(config.context.current_location);
         }
         if sources & (1 << 1) != 0 {
-            boost += config.context.pinned_anchor;
+            context = context.saturating_add(config.context.pinned_anchor);
         }
         if sources & (1 << 2) != 0 {
-            boost += config.general_usage.recents;
+            general_usage = general_usage.saturating_add(config.general_usage.recents);
         }
-        boost
+        (context, general_usage)
     }
 }
 
@@ -175,6 +181,8 @@ pub struct SearchHit {
     /// Ranking Traces retain this score with the active config fingerprint.
     #[serde(skip)]
     pub score: i64,
+    #[serde(skip)]
+    pub contributions: ScoreContributions,
 }
 
 impl PartialEq for SearchHit {
@@ -188,9 +196,34 @@ impl PartialEq for SearchHit {
 
 impl Eq for SearchHit {}
 
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoreContributions {
+    pub text_match: i64,
+    pub search_memory: i64,
+    pub general_usage: i64,
+    pub context: i64,
+    pub alias: i64,
+    pub item_kind: i64,
+    pub penalties: i64,
+}
+
+impl ScoreContributions {
+    pub fn total(&self) -> i64 {
+        self.text_match
+            .saturating_add(self.search_memory)
+            .saturating_add(self.general_usage)
+            .saturating_add(self.context)
+            .saturating_add(self.alias)
+            .saturating_add(self.item_kind)
+            .saturating_sub(self.penalties)
+    }
+}
+
 #[derive(Clone)]
 struct Candidate {
     score: i64,
+    contributions: ScoreContributions,
     path: String,
     name: String,
     is_directory: bool,
@@ -795,7 +828,14 @@ fn run_fuzzy_inner(
         };
     }
     if let Some(target) = ctx.aliases.resolve(&query_lower) {
-        inject(&mut candidates, index, target, ctx.config.alias.exact, true);
+        inject(
+            &mut candidates,
+            index,
+            target,
+            ctx.config.alias.exact,
+            true,
+            InjectedGroup::Alias,
+        );
     }
     inject_memory_candidates(&mut candidates, index, ctx);
     rank_fuzzy_candidates(&mut candidates, limit);
@@ -844,6 +884,7 @@ fn fuzzy_hits(candidates: &[Candidate]) -> Vec<SearchHit> {
             is_directory: candidate.is_directory,
             tier: candidate.tier.as_str(),
             score: candidate.score,
+            contributions: candidate.contributions.clone(),
         })
         .collect()
 }
@@ -882,8 +923,20 @@ fn scan_fuzzy_slots(
             })
         {
             score += ctx.retrieval.boost(slot, ctx.config);
+            let contributions = score_contributions(
+                score,
+                slot,
+                &path,
+                entry.parent,
+                entry.is_directory,
+                entry.tier,
+                prep,
+                ctx,
+                index,
+            );
             candidates.push(Candidate {
                 score,
+                contributions,
                 path,
                 name: entry.name.to_owned(),
                 is_directory: entry.is_directory,
@@ -1285,6 +1338,7 @@ pub(crate) fn run_impl(
                 &target,
                 ctx.config.text_match.existing_path,
                 is_dir,
+                InjectedGroup::TextMatch,
             );
             let hits = candidates
                 .into_iter()
@@ -1294,6 +1348,7 @@ pub(crate) fn run_impl(
                     is_directory: candidate.is_directory,
                     tier: candidate.tier.as_str(),
                     score: candidate.score,
+                    contributions: candidate.contributions,
                 })
                 .collect();
             return SearchOutcome {
@@ -1343,6 +1398,7 @@ pub(crate) fn run_impl(
             &target,
             ctx.config.alias.exact,
             true,
+            InjectedGroup::Alias,
         );
     }
     inject_memory_candidates(&mut candidates, index, ctx);
@@ -1364,6 +1420,7 @@ pub(crate) fn run_impl(
             is_directory: candidate.is_directory,
             tier: candidate.tier.as_str(),
             score: candidate.score,
+            contributions: candidate.contributions,
         })
         .collect();
     SearchOutcome {
@@ -1481,8 +1538,20 @@ fn scan_range(
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             score += ctx.retrieval.boost(slot as u32, ctx.config);
+            let contributions = score_contributions(
+                score,
+                slot as u32,
+                &path,
+                item.entry.parent,
+                item.entry.is_directory,
+                item.entry.tier,
+                prep,
+                ctx,
+                index,
+            );
             local.push(Candidate {
                 score,
+                contributions,
                 path,
                 name: item.entry.name.to_string(),
                 is_directory: item.entry.is_directory,
@@ -1535,8 +1604,20 @@ fn scan_reuse(
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             score += ctx.retrieval.boost(slot, ctx.config);
+            let contributions = score_contributions(
+                score,
+                slot,
+                &path,
+                item.entry.parent,
+                item.entry.is_directory,
+                item.entry.tier,
+                prep,
+                ctx,
+                index,
+            );
             local.push(Candidate {
                 score,
+                contributions,
                 path,
                 name: item.entry.name.to_string(),
                 is_directory: item.entry.is_directory,
@@ -2052,6 +2133,62 @@ fn personal_boost(ctx: &RankContext, path: &str, is_directory: bool) -> i64 {
     visit.saturating_add(learned).saturating_add(kind)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn score_contributions(
+    total: i64,
+    slot: u32,
+    path: &str,
+    parent: DirId,
+    is_directory: bool,
+    tier: Tier,
+    prep: &Prepared,
+    ctx: &RankContext,
+    index: &IndexData,
+) -> ScoreContributions {
+    let (search_memory, learned_usage) = ctx.memory.contributions(path, ctx.config);
+    let visit = ctx
+        .journal
+        .strength_milli(path)
+        .saturating_mul(ctx.config.general_usage.visit_max)
+        / 1_000;
+    let (retrieval_context, recents) = ctx.retrieval.contributions(slot, ctx.config);
+    let known = i64::from(prep.known.contains(Path::new(path)))
+        .saturating_mul(ctx.config.context.known_place);
+    let context = retrieval_context.saturating_add(known);
+    let general_usage = learned_usage.saturating_add(visit).saturating_add(recents);
+    let item_kind = if is_directory {
+        ctx.config.item_kind.directory
+    } else {
+        ctx.config.item_kind.file
+    };
+    let scoped_hidden = tier == Tier::Hidden
+        && prep.path_shaped
+        && prep.segments.split_last().is_some_and(|(_, prefix)| {
+            !prefix.is_empty() && ancestors_match(index, parent, prefix)
+        });
+    let penalties = if scoped_hidden {
+        0
+    } else {
+        tier_penalty(tier, &ctx.config.penalties)
+    };
+    let accounted = search_memory
+        .saturating_add(general_usage)
+        .saturating_add(context)
+        .saturating_add(item_kind)
+        .saturating_sub(penalties);
+    let contributions = ScoreContributions {
+        text_match: total.saturating_sub(accounted),
+        search_memory,
+        general_usage,
+        context,
+        alias: 0,
+        item_kind,
+        penalties,
+    };
+    debug_assert_eq!(contributions.total(), total);
+    contributions
+}
+
 /// Lowercase `name` into the reused `scratch` buffer. The overwhelming majority of file
 /// names are ASCII, so a byte-wise fast path avoids the per-`char` Unicode `to_lowercase`
 /// iterator — that difference is what keeps the whole-index scan inside the §10 budget on
@@ -2164,16 +2301,36 @@ pub(crate) fn existing_typed_path(query: &str, root: &Path) -> Option<(PathBuf, 
 /// already among the scanned candidates, its score is only lifted, never duplicated. When
 /// the path is indexed its real kind and tier are used; otherwise `fallback_is_dir` and
 /// the Normal tier stand in.
+#[derive(Clone, Copy)]
+enum InjectedGroup {
+    TextMatch,
+    Alias,
+}
+
 fn inject(
     candidates: &mut Vec<Candidate>,
     index: &IndexData,
     target: &Path,
     score: i64,
     fallback_is_dir: bool,
+    group: InjectedGroup,
 ) {
+    let contributions = match group {
+        InjectedGroup::TextMatch => ScoreContributions {
+            text_match: score,
+            ..ScoreContributions::default()
+        },
+        InjectedGroup::Alias => ScoreContributions {
+            alias: score,
+            ..ScoreContributions::default()
+        },
+    };
     let path_str = target.to_string_lossy().into_owned();
     if let Some(existing) = candidates.iter_mut().find(|c| c.path == path_str) {
-        existing.score = existing.score.max(score);
+        if score > existing.score {
+            existing.score = score;
+            existing.contributions = contributions;
+        }
         return;
     }
     let (is_directory, tier) = find_entry(index, target).unwrap_or((fallback_is_dir, Tier::Normal));
@@ -2183,6 +2340,7 @@ fn inject(
         .unwrap_or_else(|| path_str.clone());
     candidates.push(Candidate {
         score,
+        contributions,
         path: path_str,
         name,
         is_directory,
@@ -2200,8 +2358,8 @@ fn inject(
 /// never turns the global Name Index scan into a path walk.
 fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, ctx: &RankContext) {
     for path in ctx.memory.paths() {
-        let mut score = ctx.memory.boost(path, ctx.config);
-        if score <= 0 {
+        let (search_memory, general_usage) = ctx.memory.contributions(path, ctx.config);
+        if search_memory <= 0 && general_usage <= 0 {
             continue;
         }
         if candidates.iter().any(|candidate| candidate.path == path) {
@@ -2214,17 +2372,28 @@ fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, 
             // Dormant deleted/unmounted evidence never creates a ghost result.
             continue;
         };
-        score = score.saturating_add(if is_directory {
+        let item_kind = if is_directory {
             ctx.config.item_kind.directory
         } else {
             ctx.config.item_kind.file
-        });
+        };
+        let contributions = ScoreContributions {
+            text_match: 0,
+            search_memory,
+            general_usage,
+            context: 0,
+            alias: 0,
+            item_kind,
+            penalties: tier_penalty(tier, &ctx.config.penalties),
+        };
+        let score = contributions.total();
         let name = target
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_owned());
         candidates.push(Candidate {
             score,
+            contributions,
             path: path.to_owned(),
             name,
             is_directory,
@@ -2405,6 +2574,41 @@ mod tests {
 
         let hits = search(&index, &ctx, "project alpha", 50);
         assert_eq!(paths(&hits), vec!["/home/tester/methodology-notes.md"]);
+        assert_eq!(hits[0].score, hits[0].contributions.total());
+        assert!(hits[0].contributions.search_memory > 0);
+        assert_eq!(hits[0].contributions.text_match, 0);
+    }
+
+    #[test]
+    fn memory_only_result_keeps_its_tier_penalty() {
+        let mut index = index();
+        index.add_file(0, ".private", Tier::Hidden);
+        let memory = MemoryEvidence::from_scores(&[("/home/tester/.private", 1_000)]);
+        let ctx = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval: RetrievalSignals::default(),
+            memory: &memory,
+            config: RankContext::empty().config,
+        };
+
+        let hits = search(&index, &ctx, "unrelated query", 50);
+        assert_eq!(hits[0].path, "/home/tester/.private");
+        assert_eq!(hits[0].contributions.penalties, ctx.config.penalties.hidden);
+        assert_eq!(hits[0].score, hits[0].contributions.total());
+    }
+
+    #[test]
+    fn every_ranked_score_equals_its_named_contributions() {
+        let mut index = index();
+        let docs = index.add_dir(0, "Documents", Tier::Normal, 0);
+        index.add_file(docs, "methodology-report.md", Tier::Normal);
+        index.add_file(0, "methodology.txt", Tier::Hidden);
+        let hits = run(&index, "methodology");
+        assert!(!hits.is_empty());
+        for hit in hits {
+            assert_eq!(hit.score, hit.contributions.total(), "{}", hit.path);
+        }
     }
 
     #[test]

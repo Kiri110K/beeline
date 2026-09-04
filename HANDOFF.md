@@ -65,6 +65,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   только на startup/новом событии. UI по-прежнему получает top-50; расширенный
   top-256 остаётся локально для анализа. Следующий шаг — named score contribution
   breakdown и полноценный CLI replay/diff.
+- Detailed trace теперь хранит для каждого top-256 Item точный final score и
+  named contributions: Text Match, Search Memory, General Usage, Context, Alias,
+  Item Kind и Penalties. Инвариант суммы покрыт тестами для literal, fuzzy,
+  memory-only и hidden результатов. Memory-only Hidden/Junk теперь корректно
+  получает penalty. CLI `replay` строго парсит NDJSON и проверяет contiguous rank,
+  невозрастающий score и совпадение score с contribution total. Config snapshots,
+  на которые больше не ссылаются retained traces, удаляются во время maintenance.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.
