@@ -7,13 +7,20 @@
 use std::{
     ffi::OsString,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
+const CONTROL_SOCKET: &str = "ranker-control.sock";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -358,13 +365,37 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<(), Stri
                     temp.display()
                 )
             })?;
+            let expected_fingerprint = config.fingerprint();
+            let live = request_live_reload(&app_data);
+            let (reload_confirmed, active_fingerprint, message) = match live {
+                Ok(active) if active == expected_fingerprint => (
+                    true,
+                    Some(active),
+                    "running Beeline confirmed the new Ranker Configuration".to_owned(),
+                ),
+                Ok(active) => (
+                    false,
+                    Some(active.clone()),
+                    format!(
+                        "running Beeline acknowledged reload but activated unexpected fingerprint {active}"
+                    ),
+                ),
+                Err(error) => (
+                    false,
+                    None,
+                    format!(
+                        "ranker.json is authoritative for next launch; live reload was not confirmed: {error}"
+                    ),
+                ),
+            };
             println!(
                 "{}",
                 serde_json::json!({
                     "applied": target,
-                    "fingerprint": config.fingerprint(),
-                    "reloadConfirmed": false,
-                    "message": "ranker.json is authoritative for next launch; use Reload Ranker Configuration in a running Beeline",
+                    "fingerprint": expected_fingerprint,
+                    "reloadConfirmed": reload_confirmed,
+                    "activeFingerprint": active_fingerprint,
+                    "message": message,
                 })
             );
         }
@@ -381,6 +412,91 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<(), Stri
         _ => return Err(cli_usage()),
     }
     Ok(())
+}
+
+pub fn start_control_server<F>(app_data_dir: &Path, reload: F) -> io::Result<()>
+where
+    F: Fn() -> Result<String, String> + Send + Sync + 'static,
+{
+    fs::create_dir_all(app_data_dir)?;
+    let socket_path = app_data_dir.join(CONTROL_SOCKET);
+    match fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    thread::Builder::new()
+        .name("beeline-ranker-control".to_owned())
+        .spawn(move || {
+            crate::qos::set_qos(0x11);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => respond_to_control(stream, &reload),
+                    Err(error) => eprintln!("ranker control listener failed: {error}"),
+                }
+            }
+        })?;
+    Ok(())
+}
+
+fn respond_to_control<F>(mut stream: UnixStream, reload: &F)
+where
+    F: Fn() -> Result<String, String>,
+{
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let request = {
+        let mut line = String::new();
+        let mut reader = BufReader::new(&stream);
+        reader.read_line(&mut line).map(|_| line)
+    };
+    let response = match request {
+        Ok(request) if request.trim() == "reload" => match reload() {
+            Ok(fingerprint) => serde_json::json!({
+                "ok": true,
+                "fingerprint": fingerprint,
+            }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error }),
+        },
+        Ok(_) => serde_json::json!({ "ok": false, "error": "unknown command" }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+    };
+    if serde_json::to_writer(&mut stream, &response).is_ok() {
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+    }
+}
+
+fn request_live_reload(app_data_dir: &Path) -> Result<String, String> {
+    let socket_path = app_data_dir.join(CONTROL_SOCKET);
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|error| format!("cannot connect to {}: {error}", socket_path.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("cannot set control timeout: {error}"))?;
+    stream
+        .write_all(b"reload\n")
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("cannot request live reload: {error}"))?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .map_err(|error| format!("cannot read live reload response: {error}"))?;
+    let response: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|error| format!("invalid live reload response: {error}"))?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("running Beeline rejected reload")
+            .to_owned());
+    }
+    response
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "live reload response omitted fingerprint".to_owned())
 }
 
 impl RankerConfig {
@@ -415,6 +531,20 @@ fn cli_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "beeline_ranker_control_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
 
     #[test]
     fn default_round_trips_and_has_a_stable_fingerprint() {
@@ -439,5 +569,16 @@ mod tests {
         assert!(RankerConfig::parse(&negative).is_err());
         let non_monotone = text.replacen("\"prefixName\": 4000000", "\"prefixName\": 6000000", 1);
         assert!(RankerConfig::parse(&non_monotone).is_err());
+    }
+
+    #[test]
+    fn live_control_returns_the_activated_fingerprint() {
+        let dir = temp_dir();
+        start_control_server(&dir, || Ok("active-config".to_owned())).expect("start control");
+        assert_eq!(
+            request_live_reload(&dir).expect("request reload"),
+            "active-config"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

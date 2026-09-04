@@ -755,6 +755,9 @@ pub fn run() {
             // and returns, so window show is never delayed (§10).
             match NameIndex::init(app.handle()) {
                 Ok(name_index) => {
+                    if let Err(error) = name_index.start_ranker_control(app.handle()) {
+                        eprintln!("{error}");
+                    }
                     app.manage(name_index);
                 }
                 Err(error) => eprintln!("name index init failed: {error}"),

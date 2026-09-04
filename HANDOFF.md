@@ -82,6 +82,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   весь top-256 без Name Index или filesystem, сообщает изменившиеся snapshots и
   до 1000 точных old/new rank+score deltas. Старые trace schema намеренно не
   поддерживаются.
+- `ranker-config apply` после атомарной записи теперь обращается к запущенной
+  Beeline через локальный Unix socket с mode 0600. Один блокирующий background-QoS
+  listener без polling загружает strict config, меняет active snapshot, отменяет
+  старую search wave, очищает reuse, пишет telemetry/config snapshot и отправляет
+  frontend событие для rerank. CLI сверяет подтверждённый fingerprint; если app
+  не запущена или ответ не совпал, файл всё равно остаётся источником правды для
+  следующего запуска, а `reloadConfirmed` честно остаётся false.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь

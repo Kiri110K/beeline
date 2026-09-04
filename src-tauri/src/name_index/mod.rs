@@ -346,6 +346,24 @@ impl NameIndex {
         self.ranker.read().expect("ranker lock poisoned").clone()
     }
 
+    pub fn start_ranker_control(&self, app: &AppHandle) -> Result<(), String> {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
+        let app = app.clone();
+        let ranker = self.ranker.clone();
+        let traces = self.traces.clone();
+        let generation = self.generation.clone();
+        let reuse = self.reuse.clone();
+        let reload_dir = app_data_dir.clone();
+        ranker_config::start_control_server(&app_data_dir, move || {
+            load_and_activate_ranker(&app, &reload_dir, &ranker, &traces, &generation, &reuse)
+                .map(|outcome| outcome.fingerprint)
+        })
+        .map_err(|error| format!("failed to start Ranker Configuration control: {error}"))
+    }
+
     /// Swap in Junk patterns and aliases from a Settings change (SPEC §12). Future
     /// classifications and searches read the new values immediately; already-indexed items
     /// keep their tier until the tree is next rescanned (Junk refreshes lazily, SPEC §6).
@@ -1269,20 +1287,45 @@ pub async fn reload_ranker_config(
         .path()
         .app_data_dir()
         .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
-    let loaded = tauri::async_runtime::spawn_blocking(move || RankerConfig::load(&app_data_dir))
-        .await
-        .map_err(|_| "ranker reload task failed".to_owned())??;
+    let app_for_reload = app.clone();
+    let ranker = state.ranker.clone();
+    let traces = state.traces.clone();
+    let generation = state.generation.clone();
+    let reuse = state.reuse.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_and_activate_ranker(
+            &app_for_reload,
+            &app_data_dir,
+            &ranker,
+            &traces,
+            &generation,
+            &reuse,
+        )
+    })
+    .await
+    .map_err(|_| "ranker reload task failed".to_owned())?
+}
+
+fn load_and_activate_ranker(
+    app: &AppHandle,
+    app_data_dir: &Path,
+    active: &Arc<RwLock<Arc<RankerConfig>>>,
+    traces: &RankingTraces,
+    generation: &Arc<AtomicU64>,
+    reuse: &Arc<Mutex<Option<ReuseCache>>>,
+) -> Result<RankerReloadOutcome, String> {
+    let loaded = RankerConfig::load(app_data_dir)?;
     let (config, source) = match loaded {
         Some(config) => (config, "file"),
         None => (RankerConfig::default(), "embedded_default"),
     };
     let fingerprint = config.fingerprint();
-    state.traces.snapshot_config(&config);
-    *state.ranker.write().expect("ranker lock poisoned") = Arc::new(config);
-    state.generation.fetch_add(1, Ordering::SeqCst);
-    *state.reuse.lock().expect("reuse cache lock poisoned") = None;
+    traces.snapshot_config(&config);
+    *active.write().expect("ranker lock poisoned") = Arc::new(config);
+    generation.fetch_add(1, Ordering::SeqCst);
+    *reuse.lock().expect("reuse cache lock poisoned") = None;
     record(
-        &app,
+        app,
         "ranker_config_reloaded",
         json!({ "fingerprint": fingerprint, "source": source }),
     );
