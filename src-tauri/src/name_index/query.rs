@@ -1258,7 +1258,7 @@ fn score_fuzzy_entry(
     let name_lower = fuzzy_scratch.name_lower.as_str();
     // The direct query, its ordered Path Interpretation, and every layout variant all
     // inspect the same directory chain. Lowercase that chain once per Item.
-    let ancestors = if prep.path_shaped || prep.tokens.len() > 1 {
+    let ancestors = if !prep.path_shaped && prep.tokens.len() > 1 {
         fuzzy_scratch
             .ancestors
             .lower_names(index, item.entry.parent)
@@ -1266,9 +1266,24 @@ fn score_fuzzy_entry(
         &[]
     };
     let (quality, corrected, path_scope) = if prep.path_shaped {
-        let quality = fuzzy_path_interpretation(
+        let (last, parents) = prep.segments.split_last()?;
+        let final_quality = fuzzy_lower_name_quality(
             name_lower,
-            &prep.segments,
+            last,
+            short_fuzzy,
+            &mut fuzzy_scratch.edit,
+            &prep.text,
+        )?;
+        let ancestors = if parents.is_empty() {
+            &[]
+        } else {
+            fuzzy_scratch
+                .ancestors
+                .lower_names(index, item.entry.parent)
+        };
+        let quality = fuzzy_path_from_final(
+            final_quality,
+            parents,
             ancestors,
             short_fuzzy,
             &mut fuzzy_scratch.edit,
@@ -1406,6 +1421,24 @@ fn fuzzy_path_interpretation(
     let (last, parents) = tokens.split_last()?;
     let final_quality =
         fuzzy_lower_name_quality(name_lower, last, short_fuzzy, edit_scratch, weights)?;
+    fuzzy_path_from_final(
+        final_quality,
+        parents,
+        ancestors,
+        short_fuzzy,
+        edit_scratch,
+        weights,
+    )
+}
+
+fn fuzzy_path_from_final(
+    final_quality: MatchQuality,
+    parents: &[String],
+    ancestors: &[String],
+    short_fuzzy: bool,
+    edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
+) -> Option<MatchQuality> {
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
     for token in parents.iter().rev() {

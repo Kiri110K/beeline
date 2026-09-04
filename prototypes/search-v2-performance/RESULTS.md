@@ -422,6 +422,20 @@ p95 changes were mixed and included regressions. The extra vector writes replace
 final-token comparison, so they do not reduce real work. Code and the full verdict remain on remote
 branch `experiment/fuzzy-name-quality-reuse`; `main` keeps the simpler verifier.
 
+## Final-name-first explicit paths — 2026-09-05
+
+For slash-shaped queries, the old verifier lowercased the full ancestor chain before checking
+whether the final path segment fuzzy-matched the Item name. The verifier now checks that final name
+first, returns immediately on a miss, and passes the already-computed quality into the ordered
+ancestor matcher. This removes work without changing candidate retrieval or ranking.
+
+A dedicated 500-sample `work/wip` run over 37,194 candidates, of which 27,271 reached verification,
+reduced total p95 from 16.26 to 11.65 ms and verify/rank p95 from 15.03 to 10.42 ms. User CPU fell
+28.7%, retired instructions 23.2%, and cycles 29.0%. A second 500-sample process measured 11.75 ms
+total p95, 10.48 ms verify/rank p95, and nearly identical instruction and cycle counts. Both runs
+kept `/Users/kiri110k/work/wip` first, one top-10 fingerprint, and zero target misses. The explicit
+path case is now part of `queries.tsv`, closing a gap in the standard suite.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
