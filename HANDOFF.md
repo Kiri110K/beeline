@@ -461,6 +461,19 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   обмен не принят. Код остался в remote-ветке; вернуться к нему можно при частых
   rebuild или отдельном parser без дублирования normalization. Verdict:
   `prototypes/qgram-dense-dedup/RESULTS.md`.
+- PR #76 влит в main как `4327559`. Каждый из 64 временных q-gram shard writers
+  теперь имеет 64-KiB buffer вместо default 8 KiB. В двух production-парах system
+  CPU снизился на 29–32%, retired instructions на 3.9–4.4%, cycles на 4.4–5.3%.
+  Цена — 2.3–3.6 MiB дополнительного physical peak только во время rebuild;
+  query path не менялся. Все четыре outputs побайтно совпали с live. Полный
+  checkpoint: 144 Rust passed / 12 ignored, clippy `-D warnings`, frontend
+  contracts, typecheck, build и lint зелёные. Подробности:
+  `prototypes/qgram-shard-buffer64/RESULTS.md`.
+- На утро 05.09 main содержит PR #75 и #76, но установленный signed bundle пока
+  остаётся на main `5126d39` после PR #74. Он функционально проверен, PID 28176
+  hidden/0 windows/not frontmost. Следующая сессия должна собрать и установить
+  свежий main; новый sidecar не нужен, потому что оба изменения сохраняют
+  `BLQGM003` побайтно.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
