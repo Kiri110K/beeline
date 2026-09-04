@@ -706,6 +706,7 @@ fn normalize(value: &str) -> String {
 fn gram_buckets(value: &str) -> Vec<u32> {
     let mut buckets = Vec::new();
     gram_buckets_into(value, &mut buckets);
+    buckets.sort_unstable();
     buckets
 }
 
@@ -725,15 +726,12 @@ fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
                 previous_len += 1;
                 continue;
             }
-            buckets.push(bucket(&[
-                previous[0] as char,
-                previous[1] as char,
-                byte as char,
-            ]));
+            push_unique_bucket(
+                buckets,
+                bucket(&[previous[0] as char, previous[1] as char, byte as char]),
+            );
             previous = [previous[1], byte];
         }
-        buckets.sort_unstable();
-        buckets.dedup();
         return;
     }
     let mut previous = [None, None];
@@ -746,13 +744,18 @@ fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
             [None, _] => previous[0] = Some(character),
             [Some(_), None] => previous[1] = Some(character),
             [Some(first), Some(second)] => {
-                buckets.push(bucket(&[first, second, character]));
+                push_unique_bucket(buckets, bucket(&[first, second, character]));
                 previous = [Some(second), Some(character)];
             }
         }
     }
-    buckets.sort_unstable();
-    buckets.dedup();
+}
+
+#[inline]
+fn push_unique_bucket(buckets: &mut Vec<u32>, bucket: u32) {
+    if !buckets.contains(&bucket) {
+        buckets.push(bucket);
+    }
 }
 
 fn bucket(gram: &[char]) -> u32 {
