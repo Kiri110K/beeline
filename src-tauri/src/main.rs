@@ -38,5 +38,12 @@ fn main() {
         }
         return;
     }
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--ranker-config")) {
+        if let Err(error) = beeline_lib::run_ranker_config_cli(arguments) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     beeline_lib::run();
 }

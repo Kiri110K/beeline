@@ -41,6 +41,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   saturation, 64 MiB log compaction, weakest-first association limit и двухшаговый
   Reset Learned Ranking в Settings. Полный suite: 117 Rust passed / 9 ignored,
   clippy `-D warnings`, frontend contracts, lint, typecheck и build зелёные.
+- Единый `ranker.json` срез завершён следом. Все production score bands, Search
+  Memory и usage caps, Visit/Recents, current Location/Pinned/Known Place, Alias,
+  Item Kind, Hidden/Junk и global threshold читаются из одного strict config.
+  Missing config использует embedded default; unknown/missing/negative/non-monotone
+  значения отвергают файл целиком. Manual reload атомарно меняет snapshot, отменяет
+  старую backend wave и перезапускает неизменённый активный запрос. Settings имеет
+  reload control; CLI умеет default, validate/explain, compare и atomic apply с
+  честным `reloadConfirmed: false`, если running app не подтверждён. Дефолтный
+  конфиг сохраняет прежний порядок; отдельный тест доказывает изменение порядка
+  одним weight без изменения retrieval. Зелёные: 120 Rust passed / 9 ignored,
+  clippy `-D warnings`, frontend contracts, lint, typecheck и production build.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.

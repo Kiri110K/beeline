@@ -1,23 +1,9 @@
 //! The ranking contract over the Name Index (SPEC §6).
 //!
-//! This is the whole ranker in one module: the scan, the score, and the deterministic
-//! order. §6 splits into *guarantees* (binding, in precedence order) and *weights*
-//! (tuning). Base match tiers and structural interpretations occupy explicit quality bands;
-//! smaller personal weights order candidates inside those interpretations. All values live
-//! in the `weights` block so the tuning surface is one place.
-//!
-//! Guarantee → code map (each also has a focused test, see the `tests` module and
-//! `mod.rs`):
-//!   a. existing typed path first  → [`existing_typed_path`] injects at [`EXISTING_PATH`]
-//!   b. exact beats any penalty    → [`QUAL_EXACT`] band gap > all penalties + boosts
-//!   c. path-shaped scope priority → [`score_path_shaped`] (+[`SCOPE_BONUS`], no hidden penalty)
-//!   d. RU/EN layout correction    → [`layout_variants`] (−[`CORRECTION_PENALTY`])
-//!   e. Visit Journal boost        → `ctx.journal.boost` (≤ `VISIT_CAP`)
-//!   f. Known Places boost         → [`known_places`] (+[`KNOWN_PLACE_BOOST`])
-//!   g. Alias Dictionary recommend → `ctx.aliases` injects at [`ALIAS_RECOMMEND`]
-//!   h. hidden light / junk heavy  → [`HIDDEN_PENALTY`] / [`JUNK_PENALTY`]
-//! Ties break by shorter path, then lexicographic path — so the same index + journal +
-//! query always yields the same order.
+//! Retrieval and scoring share this module, but every numeric ranking value comes from the
+//! one active [`RankerConfig`]. Algorithms produce code-defined evidence; the config maps it
+//! into Text Match, Search Memory, General Usage, Context, Alias, Item Kind, and Penalty
+//! contributions. The final order is deterministic for the same evidence and fingerprint.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -35,6 +21,7 @@ use serde::Serialize;
 use crate::name_index::{
     alias::AliasDictionary,
     model::{name_filter, DirId, EntryRef, IndexData, Tier},
+    ranker_config::{PenaltyWeights, RankerConfig, TextMatchWeights},
     search_memory::MemoryEvidence,
     visit_journal::Aggregate,
 };
@@ -64,56 +51,8 @@ const MAX_NAME_FUZZY_SHARDS: usize = 10;
 /// up in the scan cost.
 const ABORT_STRIDE: usize = 4096;
 
-// --- weights (the entire tuning surface, SPEC §6) --------------------------------------
-// `Q` is the match-quality unit. Base match tiers, structural interpretations, personal
-// evidence, and penalties all contribute to one deterministic score. Existing-path and alias
-// injections sit far above any scanned score because those two guarantees are absolute.
-
-/// Match-quality unit. Base match tiers, structural interpretations, and personal evidence
-/// are all expressed relative to this number in the one score.
-const Q: i64 = 1_000_000;
-/// Whole-name match (case-insensitive). Beats any penalty (guarantee b).
-const QUAL_EXACT: i64 = 5 * Q;
-/// The query is a prefix of the name.
-const QUAL_PREFIX: i64 = 4 * Q;
-/// The query occurs inside the name.
-const QUAL_SUBSTRING: i64 = 2 * Q;
-/// Bounded Typo Correction. Kept below a literal substring and above a path-only token.
-const QUAL_TYPO: i64 = Q + Q / 2;
-/// A token of a multi-token query found only in the entry's *path* (not its name). One full
-/// band below the weakest name match, so an all-tokens-in-name hit always outranks a hit
-/// where any token only appears in the path (SPEC §6 token contract, part 3).
-const QUAL_PATH: i64 = Q;
-/// Evidence that every token occurs in the Item name. This keeps a direct compound name such
-/// as `status-report...` above a result that only forms `status/report` across name and path,
-/// while an exact ordered tail such as `work/wip` can still win through scope priority.
-const QUAL_ALL_TOKENS_IN_NAME: i64 = 3 * Q;
-
-/// An existing absolute path typed as the query ranks its target first (guarantee a).
-const EXISTING_PATH: i64 = 100 * Q;
-/// A query matching an alias word recommends its target as a top result (guarantee g).
-const ALIAS_RECOMMEND: i64 = 50 * Q;
-
-/// Added when a path-shaped match falls under the typed prefix (guarantee c). It is smaller
-/// than one base quality unit but large enough to separate otherwise similar scoped matches.
-const SCOPE_BONUS: i64 = 500_000;
-/// A layout-corrected match ranks just below the same direct match when their other evidence
-/// is equal (guarantee d).
-const CORRECTION_PENALTY: i64 = 100_000;
-
-/// Junk carries a heavy ranking penalty (guarantee h).
-const JUNK_PENALTY: i64 = 40_000;
-/// Hidden content carries a light penalty (guarantee h).
-const HIDDEN_PENALTY: i64 = 8_000;
-/// A Known Place (Home, Desktop, …) is lifted in the results (guarantee f).
-const KNOWN_PLACE_BOOST: i64 = 20_000;
-/// Working Set retrieval sources are ranking evidence, not a forced position. Current
-/// Location is strong enough to lift a prefix-matching direct child over unrelated global
-/// exact names; Pinned Anchors and Recents currently act as smaller tie-breakers. These values
-/// can later move into Ranker Configuration without changing Working Set construction.
-const CURRENT_LOCATION_BOOST: i64 = Q + Q / 2;
-const PINNED_ANCHOR_BOOST: i64 = 18_000;
-const RECENTS_BOOST: i64 = 24_000;
+// Every numeric ranking value comes from the active Ranker Configuration. Matching
+// algorithms and named features remain code-defined; their relative strength is not.
 
 /// The physical-key mapping between US QWERTY and РФ ЙЦУКЕН, used for layout correction
 /// (guarantee d). No phonetic transliteration — this is the keyboard geometry only.
@@ -161,6 +100,7 @@ pub struct RankContext<'a> {
     pub aliases: &'a AliasDictionary,
     pub retrieval: RetrievalSignals,
     pub memory: &'a MemoryEvidence,
+    pub config: &'a RankerConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -188,17 +128,17 @@ impl RetrievalSignals {
         *self.by_slot.entry(slot).or_default() |= bit;
     }
 
-    fn boost(&self, slot: u32) -> i64 {
+    fn boost(&self, slot: u32, config: &RankerConfig) -> i64 {
         let sources = self.by_slot.get(&slot).copied().unwrap_or_default();
         let mut boost = 0;
         if sources & 1 != 0 {
-            boost += CURRENT_LOCATION_BOOST;
+            boost += config.context.current_location;
         }
         if sources & (1 << 1) != 0 {
-            boost += PINNED_ANCHOR_BOOST;
+            boost += config.context.pinned_anchor;
         }
         if sources & (1 << 2) != 0 {
-            boost += RECENTS_BOOST;
+            boost += config.general_usage.recents;
         }
         boost
     }
@@ -211,11 +151,13 @@ impl RankContext<'static> {
         use std::sync::OnceLock;
         static AGG: OnceLock<Aggregate> = OnceLock::new();
         static ALIASES: OnceLock<AliasDictionary> = OnceLock::new();
+        static CONFIG: OnceLock<RankerConfig> = OnceLock::new();
         RankContext {
             journal: AGG.get_or_init(Aggregate::default),
             aliases: ALIASES.get_or_init(AliasDictionary::empty),
             retrieval: RetrievalSignals::default(),
             memory: MemoryEvidence::empty(),
+            config: CONFIG.get_or_init(RankerConfig::default),
         }
     }
 }
@@ -297,6 +239,7 @@ pub struct SlotSelection {
 
 /// Everything derived once from the query text, shared read-only across scan shards.
 struct Prepared {
+    text: TextMatchWeights,
     query_lower: String,
     query_name_filter: u64,
     path_shaped: bool,
@@ -352,7 +295,7 @@ struct FuzzyNameFilter {
 const MAX_PATH_NEEDLES: usize = 63;
 
 impl Prepared {
-    fn new(index: &IndexData, trimmed: &str, query_lower: &str) -> Self {
+    fn new(index: &IndexData, trimmed: &str, query_lower: &str, config: &RankerConfig) -> Self {
         let known = known_places(&index.root);
         let query_name_filter = name_filter(query_lower);
         let path_shaped = is_path_shaped(trimmed);
@@ -435,6 +378,7 @@ impl Prepared {
                 .collect()
         };
         Self {
+            text: config.text_match.clone(),
             query_lower: query_lower.to_owned(),
             query_name_filter,
             path_shaped,
@@ -679,7 +623,7 @@ pub fn ordered_tail_literal_slots(
 ) -> SlotSelection {
     let trimmed = query.trim();
     let query_lower = trimmed.to_lowercase();
-    let prep = Prepared::new(index, trimmed, &query_lower);
+    let prep = Prepared::new(index, trimmed, &query_lower, RankContext::empty().config);
     let mut needles = Vec::new();
     if prep.path_shaped {
         if prep.segments.len() > 1 {
@@ -723,7 +667,15 @@ pub fn ordered_tail_literal_slots(
             .entry(slot as usize)
             .expect("live overlay iterator returned a removed entry");
         if needles.iter().any(|(needle, filter)| {
-            quality_match(entry.name, entry.filter, needle, *filter, &mut scratch).is_some()
+            quality_match(
+                entry.name,
+                entry.filter,
+                needle,
+                *filter,
+                &mut scratch,
+                &prep.text,
+            )
+            .is_some()
         }) {
             slots.push(slot);
         }
@@ -781,7 +733,7 @@ fn run_fuzzy_inner(
             candidate_entries: Vec::new(),
         };
     }
-    let prep = Prepared::new(index, trimmed, &query_lower);
+    let prep = Prepared::new(index, trimmed, &query_lower, ctx.config);
     let shards = resolve_fuzzy_shards(slots.len(), prep.use_path_mask);
     let (mut candidates, scanned, aborted) = if shards <= 1 {
         scan_fuzzy_slots(index, ctx, &prep, slots, cancel, short_fuzzy)
@@ -828,7 +780,7 @@ fn run_fuzzy_inner(
         };
     }
     if let Some(target) = ctx.aliases.resolve(&query_lower) {
-        inject(&mut candidates, index, target, ALIAS_RECOMMEND, true);
+        inject(&mut candidates, index, target, ctx.config.alias.exact, true);
     }
     inject_memory_candidates(&mut candidates, index, ctx);
     rank_fuzzy_candidates(&mut candidates, limit);
@@ -913,7 +865,7 @@ fn scan_fuzzy_slots(
                 score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut edit_scratch)
             })
         {
-            score += ctx.retrieval.boost(slot);
+            score += ctx.retrieval.boost(slot, ctx.config);
             candidates.push(Candidate {
                 score,
                 path,
@@ -936,27 +888,43 @@ fn score_fuzzy_entry(
     edit_scratch: &mut EditScratch,
 ) -> Option<(i64, String)> {
     let (quality, corrected) = if prep.path_shaped {
-        let quality =
-            fuzzy_path_interpretation(index, item, &prep.segments, short_fuzzy, edit_scratch)?;
-        (quality + SCOPE_BONUS, false)
+        let quality = fuzzy_path_interpretation(
+            index,
+            item,
+            &prep.segments,
+            short_fuzzy,
+            edit_scratch,
+            &prep.text,
+        )?;
+        (quality + prep.text.path_scope, false)
     } else if prep.tokens.len() > 1 {
-        let mut best = fuzzy_token_set(index, item, &prep.tokens, short_fuzzy, edit_scratch);
+        let mut best = fuzzy_token_set(
+            index,
+            item,
+            &prep.tokens,
+            short_fuzzy,
+            edit_scratch,
+            &prep.text,
+        );
         best = best.max(fuzzy_path_interpretation(
             index,
             item,
             &prep.tokens,
             short_fuzzy,
             edit_scratch,
+            &prep.text,
         ));
         let mut corrected = false;
         for tokens in &prep.corrected_tokens {
-            let mut candidate = fuzzy_token_set(index, item, tokens, short_fuzzy, edit_scratch);
+            let mut candidate =
+                fuzzy_token_set(index, item, tokens, short_fuzzy, edit_scratch, &prep.text);
             candidate = candidate.max(fuzzy_path_interpretation(
                 index,
                 item,
                 tokens,
                 short_fuzzy,
                 edit_scratch,
+                &prep.text,
             ));
             if candidate > best {
                 best = candidate;
@@ -966,12 +934,24 @@ fn score_fuzzy_entry(
         (best?, corrected)
     } else {
         let direct = prep.tokens.first().and_then(|token| {
-            fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch)
+            fuzzy_name_quality(
+                item.entry.name,
+                token,
+                short_fuzzy,
+                edit_scratch,
+                &prep.text,
+            )
         });
         let mut best = direct;
         let mut corrected = false;
         for variant in &prep.corrected {
-            let candidate = fuzzy_name_quality(item.entry.name, variant, short_fuzzy, edit_scratch);
+            let candidate = fuzzy_name_quality(
+                item.entry.name,
+                variant,
+                short_fuzzy,
+                edit_scratch,
+                &prep.text,
+            );
             if candidate > best {
                 best = candidate;
                 corrected = true;
@@ -980,16 +960,15 @@ fn score_fuzzy_entry(
         (best?, corrected)
     };
 
-    let mut score = quality - tier_penalty(item.entry.tier);
+    let mut score = quality - tier_penalty(item.entry.tier, &ctx.config.penalties);
     if corrected {
-        score -= CORRECTION_PENALTY;
+        score -= ctx.config.text_match.layout_correction_penalty;
     }
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
-    score += ctx.journal.boost(&path_str);
-    score += ctx.memory.boost(&path_str);
+    score += personal_boost(ctx, &path_str, item.entry.is_directory);
     if prep.known.contains(&path) {
-        score += KNOWN_PLACE_BOOST;
+        score += ctx.config.context.known_place;
     }
     Some((score, path_str))
 }
@@ -1000,12 +979,14 @@ fn fuzzy_token_set(
     tokens: &[String],
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     let ancestors = ancestor_names(index, item.entry.parent);
     let mut weakest = i64::MAX;
     let mut name_match = false;
     for token in tokens {
-        if let Some(quality) = fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch)
+        if let Some(quality) =
+            fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch, weights)
         {
             weakest = weakest.min(quality);
             name_match = true;
@@ -1014,10 +995,10 @@ fn fuzzy_token_set(
         let quality = ancestors
             .iter()
             .filter_map(|component| {
-                fuzzy_component_quality(component, token, short_fuzzy, edit_scratch)
+                fuzzy_component_quality(component, token, short_fuzzy, edit_scratch, weights)
             })
             .max()?;
-        weakest = weakest.min(quality.min(QUAL_PATH));
+        weakest = weakest.min(quality.min(weights.path_component));
     }
     name_match.then_some(weakest)
 }
@@ -1028,9 +1009,11 @@ fn fuzzy_path_interpretation(
     tokens: &[String],
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     let (last, parents) = tokens.split_last()?;
-    let final_quality = fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch)?;
+    let final_quality =
+        fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch, weights)?;
     let ancestors = ancestor_names(index, item.entry.parent);
     let mut cursor = ancestors.len();
     let mut weakest = final_quality;
@@ -1038,10 +1021,14 @@ fn fuzzy_path_interpretation(
         let mut found = None;
         while cursor > 0 {
             cursor -= 1;
-            if let Some(quality) =
-                fuzzy_component_quality(&ancestors[cursor], token, short_fuzzy, edit_scratch)
-            {
-                found = Some(quality.min(QUAL_PATH));
+            if let Some(quality) = fuzzy_component_quality(
+                &ancestors[cursor],
+                token,
+                short_fuzzy,
+                edit_scratch,
+                weights,
+            ) {
+                found = Some(quality.min(weights.path_component));
                 break;
             }
         }
@@ -1055,13 +1042,14 @@ fn fuzzy_name_quality(
     query: &str,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     let lower = name.to_lowercase();
     let stem = lower
         .rsplit_once('.')
         .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
         .map_or(lower.as_str(), |(stem, _)| stem);
-    fuzzy_targets(&lower, stem, query, short_fuzzy, edit_scratch)
+    fuzzy_targets(&lower, stem, query, short_fuzzy, edit_scratch, weights)
 }
 
 fn fuzzy_component_quality(
@@ -1069,9 +1057,10 @@ fn fuzzy_component_quality(
     query: &str,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     let lower = component.to_lowercase();
-    fuzzy_targets(&lower, &lower, query, short_fuzzy, edit_scratch)
+    fuzzy_targets(&lower, &lower, query, short_fuzzy, edit_scratch, weights)
 }
 
 fn fuzzy_targets(
@@ -1080,6 +1069,7 @@ fn fuzzy_targets(
     query: &str,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     let edits = allowed_typo_edits(query.chars().count(), short_fuzzy);
     if edits == 0 {
@@ -1092,7 +1082,9 @@ fn fuzzy_targets(
         .filter(|target| !target.is_empty())
     {
         if let Some(distance) = edit_scratch.distance(query, target, edits) {
-            let quality = QUAL_TYPO - distance as i64 * 100_000;
+            let quality = weights
+                .typo_name
+                .saturating_sub(distance as i64 * weights.typo_edit_penalty);
             best = Some(best.map_or(quality, |current: i64| current.max(quality)));
         }
     }
@@ -1271,7 +1263,13 @@ pub(crate) fn run_impl(
     if is_path_shaped(trimmed) {
         if let Some((target, is_dir)) = existing_typed_path(trimmed, &index.root) {
             let mut candidates = Vec::with_capacity(1);
-            inject(&mut candidates, index, &target, EXISTING_PATH, is_dir);
+            inject(
+                &mut candidates,
+                index,
+                &target,
+                ctx.config.text_match.existing_path,
+                is_dir,
+            );
             let hits = candidates
                 .into_iter()
                 .map(|candidate| SearchHit {
@@ -1291,7 +1289,7 @@ pub(crate) fn run_impl(
         }
     }
 
-    let prep = Prepared::new(index, trimmed, &query_lower);
+    let prep = Prepared::new(index, trimmed, &query_lower, ctx.config);
     let (mut candidates, scanned, aborted, capped) = match reuse {
         Some(slots) => scan_reuse(index, &prep, ctx, slots, cancel),
         None => scan_full(index, &prep, ctx, cancel, shards),
@@ -1322,7 +1320,13 @@ pub(crate) fn run_impl(
     // Guarantee (g): an alias word recommends its target — added, never used to filter.
     if let Some(target) = ctx.aliases.resolve(&query_lower) {
         let target = target.to_path_buf();
-        inject(&mut candidates, index, &target, ALIAS_RECOMMEND, true);
+        inject(
+            &mut candidates,
+            index,
+            &target,
+            ctx.config.alias.exact,
+            true,
+        );
     }
     inject_memory_candidates(&mut candidates, index, ctx);
 
@@ -1458,7 +1462,7 @@ fn scan_range(
         if let Some((mut score, path)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
-            score += ctx.retrieval.boost(slot as u32);
+            score += ctx.retrieval.boost(slot as u32, ctx.config);
             local.push(Candidate {
                 score,
                 path,
@@ -1512,7 +1516,7 @@ fn scan_reuse(
         if let Some((mut score, path)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
-            score += ctx.retrieval.boost(slot);
+            score += ctx.retrieval.boost(slot, ctx.config);
             local.push(Candidate {
                 score,
                 path,
@@ -1565,6 +1569,7 @@ fn score_plain(
         &prep.query_lower,
         prep.query_name_filter,
         scratch,
+        &prep.text,
     ) {
         (quality, false)
     } else {
@@ -1582,6 +1587,7 @@ fn score_plain(
                 needle,
                 *needle_filter,
                 scratch,
+                &prep.text,
             ) {
                 best = Some(best.map_or(quality, |current| current.max(quality)));
             }
@@ -1590,16 +1596,15 @@ fn score_plain(
     };
 
     if corrected_match {
-        score -= CORRECTION_PENALTY;
+        score -= ctx.config.text_match.layout_correction_penalty;
     }
-    score -= tier_penalty(item.entry.tier);
+    score -= tier_penalty(item.entry.tier, &ctx.config.penalties);
 
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
-    score += ctx.journal.boost(&path_str);
-    score += ctx.memory.boost(&path_str);
+    score += personal_boost(ctx, &path_str, item.entry.is_directory);
     if prep.known.contains(&path) {
-        score += KNOWN_PLACE_BOOST;
+        score += ctx.config.context.known_place;
     }
     Some((score, path_str))
 }
@@ -1643,16 +1648,15 @@ fn score_multi(
     };
 
     if corrected_match {
-        score -= CORRECTION_PENALTY;
+        score -= ctx.config.text_match.layout_correction_penalty;
     }
-    score -= tier_penalty(item.entry.tier);
+    score -= tier_penalty(item.entry.tier, &ctx.config.penalties);
 
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
-    score += ctx.journal.boost(&path_str);
-    score += ctx.memory.boost(&path_str);
+    score += personal_boost(ctx, &path_str, item.entry.is_directory);
     if prep.known.contains(&path) {
-        score += KNOWN_PLACE_BOOST;
+        score += ctx.config.context.known_place;
     }
     Some((score, path_str))
 }
@@ -1695,8 +1699,9 @@ fn implicit_path_quality(
         last,
         last_filter,
         scratch,
+        &prep.text,
     )?;
-    ancestors_match(index, item.entry.parent, prefix).then_some(quality + SCOPE_BONUS)
+    ancestors_match(index, item.entry.parent, prefix).then_some(quality + prep.text.path_scope)
 }
 
 /// The quality band of an entry against a whole token set: the minimum per-token quality, or
@@ -1723,7 +1728,7 @@ fn match_token_set(
     }
     (band != i64::MAX).then_some(
         band + if all_in_name {
-            QUAL_ALL_TOKENS_IN_NAME
+            prep.text.all_tokens_in_name
         } else {
             0
         },
@@ -1762,6 +1767,7 @@ fn token_quality(
         token,
         prep.path_needle_name_filters[flat_index],
         scratch,
+        &prep.text,
     ) {
         return Some(TokenQuality {
             score: quality,
@@ -1782,7 +1788,7 @@ fn token_quality(
         }
     };
     in_path.then_some(TokenQuality {
-        score: QUAL_PATH,
+        score: prep.text.path_component,
         in_name: false,
     })
 }
@@ -1812,27 +1818,27 @@ fn score_path_shaped(
         last,
         last_filter,
         scratch,
+        &prep.text,
     )?;
 
     let scoped = !prefix.is_empty() && ancestors_match(index, item.entry.parent, prefix);
     if scoped {
-        score += SCOPE_BONUS;
+        score += prep.text.path_scope;
     }
 
     // Junk stays penalized even under a typed prefix; only the hidden penalty is waived
     // for a scoped match (guarantee c: "no hidden penalty").
     match item.entry.tier {
-        Tier::Junk => score -= JUNK_PENALTY,
-        Tier::Hidden if !scoped => score -= HIDDEN_PENALTY,
+        Tier::Junk => score -= tier_penalty(Tier::Junk, &ctx.config.penalties),
+        Tier::Hidden if !scoped => score -= tier_penalty(Tier::Hidden, &ctx.config.penalties),
         _ => {}
     }
 
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
-    score += ctx.journal.boost(&path_str);
-    score += ctx.memory.boost(&path_str);
+    score += personal_boost(ctx, &path_str, item.entry.is_directory);
     if prep.known.contains(&path) {
-        score += KNOWN_PLACE_BOOST;
+        score += ctx.config.context.known_place;
     }
     Some((score, path_str))
 }
@@ -1910,12 +1916,13 @@ fn quality_match(
     needle: &str,
     needle_filter: u64,
     scratch: &mut String,
+    weights: &TextMatchWeights,
 ) -> Option<i64> {
     if !filter_contains(item_filter, needle_filter) {
         return None;
     }
     if name.is_ascii() && needle.is_ascii() {
-        return quality_ascii(name.as_bytes(), needle.as_bytes());
+        return quality_ascii(name.as_bytes(), needle.as_bytes(), weights);
     }
     // A non-ASCII needle (e.g. a layout-corrected Cyrillic token) can never occur in an
     // ASCII name, so reject before copying the name into `scratch`. This is what keeps the
@@ -1925,35 +1932,35 @@ fn quality_match(
         return None;
     }
     lower_into(name, scratch);
-    quality_of(scratch, needle)
+    quality_of(scratch, needle, weights)
 }
 
 /// Match quality of `needle` against an already-lowercased `haystack` (Unicode path).
-fn quality_of(haystack: &str, needle: &str) -> Option<i64> {
+fn quality_of(haystack: &str, needle: &str, weights: &TextMatchWeights) -> Option<i64> {
     if haystack == needle {
-        Some(QUAL_EXACT)
+        Some(weights.exact_name)
     } else if haystack.starts_with(needle) {
-        Some(QUAL_PREFIX)
+        Some(weights.prefix_name)
     } else if haystack.contains(needle) {
-        Some(QUAL_SUBSTRING)
+        Some(weights.substring_name)
     } else {
         None
     }
 }
 
 /// Case-insensitive ASCII match quality of `needle` (lowercase) against `name` bytes.
-fn quality_ascii(name: &[u8], needle: &[u8]) -> Option<i64> {
+fn quality_ascii(name: &[u8], needle: &[u8], weights: &TextMatchWeights) -> Option<i64> {
     if needle.is_empty() || name.len() < needle.len() {
         return None;
     }
     if name.len() == needle.len() && ascii_ci_eq(name, needle) {
-        return Some(QUAL_EXACT);
+        return Some(weights.exact_name);
     }
     if ascii_ci_eq(&name[..needle.len()], needle) {
-        return Some(QUAL_PREFIX);
+        return Some(weights.prefix_name);
     }
     if ascii_contains_ci(name, needle) {
-        return Some(QUAL_SUBSTRING);
+        return Some(weights.substring_name);
     }
     None
 }
@@ -2003,12 +2010,28 @@ fn ascii_contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|start| ascii_ci_eq(&haystack[start..start + needle.len()], needle))
 }
 
-fn tier_penalty(tier: Tier) -> i64 {
-    match tier {
+fn tier_penalty(tier: Tier, weights: &PenaltyWeights) -> i64 {
+    let penalty = match tier {
         Tier::Normal => 0,
-        Tier::Hidden => HIDDEN_PENALTY,
-        Tier::Junk => JUNK_PENALTY,
-    }
+        Tier::Hidden => weights.hidden,
+        Tier::Junk => weights.junk,
+    };
+    penalty.min(weights.total_cap)
+}
+
+fn personal_boost(ctx: &RankContext, path: &str, is_directory: bool) -> i64 {
+    let visit = ctx
+        .journal
+        .strength_milli(path)
+        .saturating_mul(ctx.config.general_usage.visit_max)
+        / 1_000;
+    let learned = ctx.memory.boost(path, ctx.config);
+    let kind = if is_directory {
+        ctx.config.item_kind.directory
+    } else {
+        ctx.config.item_kind.file
+    };
+    visit.saturating_add(learned).saturating_add(kind)
 }
 
 /// Lowercase `name` into the reused `scratch` buffer. The overwhelming majority of file
@@ -2159,7 +2182,7 @@ fn inject(
 /// never turns the global Name Index scan into a path walk.
 fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, ctx: &RankContext) {
     for path in ctx.memory.paths() {
-        let score = ctx.memory.boost(path);
+        let mut score = ctx.memory.boost(path, ctx.config);
         if score <= 0 {
             continue;
         }
@@ -2173,6 +2196,11 @@ fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, 
             // Dormant deleted/unmounted evidence never creates a ghost result.
             continue;
         };
+        score = score.saturating_add(if is_directory {
+            ctx.config.item_kind.directory
+        } else {
+            ctx.config.item_kind.file
+        });
         let name = target
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -2251,6 +2279,7 @@ mod tests {
                 &needle,
                 needle_filter,
                 &mut String::new(),
+                &RankerConfig::default().text_match,
             )
             .is_some());
         }
@@ -2336,6 +2365,7 @@ mod tests {
             aliases: &AliasDictionary::empty(),
             retrieval: RetrievalSignals::default(),
             memory: MemoryEvidence::empty(),
+            config: RankContext::empty().config,
         };
         let boosted = search(&index, &ctx, "notes", 50);
         assert_eq!(boosted[0].path, "/home/tester/sub/notes"); // visited path lifted
@@ -2346,13 +2376,13 @@ mod tests {
         let mut index = index();
         index.add_file(0, "methodology-notes.md", Tier::Normal);
         index.add_file(0, "unrelated.txt", Tier::Normal);
-        let memory =
-            MemoryEvidence::from_scores(&[("/home/tester/methodology-notes.md", 3_000_000)]);
+        let memory = MemoryEvidence::from_scores(&[("/home/tester/methodology-notes.md", 1_000)]);
         let ctx = RankContext {
             journal: &Aggregate::default(),
             aliases: &AliasDictionary::empty(),
             retrieval: RetrievalSignals::default(),
             memory: &memory,
+            config: RankContext::empty().config,
         };
 
         let hits = search(&index, &ctx, "project alpha", 50);
@@ -2377,6 +2407,7 @@ mod tests {
             aliases: &AliasDictionary::empty(),
             retrieval,
             memory: MemoryEvidence::empty(),
+            config: RankContext::empty().config,
         };
         let hits = search(&index, &ctx, "report", 50);
 
@@ -2400,11 +2431,50 @@ mod tests {
             aliases: &AliasDictionary::empty(),
             retrieval,
             memory: MemoryEvidence::empty(),
+            config: RankContext::empty().config,
         };
 
         let hits = search(&index, &ctx, "skills", 50);
         assert_eq!(hits[0].path, "/home/tester/current/skills-drafts");
         assert_eq!(hits[1].path, "/home/tester/skills");
+    }
+
+    #[test]
+    fn ranker_config_changes_order_without_changing_retrieval() {
+        let mut index = index();
+        index.add_file(0, "skills", Tier::Normal);
+        let current = index.add_dir(0, "current", Tier::Normal, 0);
+        let local_slot = index.slot_len() as u32;
+        index.add_file(current, "skills-drafts", Tier::Normal);
+        let mut retrieval = RetrievalSignals::default();
+        retrieval.insert(local_slot, RetrievalSource::CurrentLocation);
+
+        let mut config = RankerConfig::default();
+        config.context.current_location = 0;
+        let without_boost = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval: retrieval.clone(),
+            memory: MemoryEvidence::empty(),
+            config: &config,
+        };
+        assert_eq!(
+            search(&index, &without_boost, "skills", 50)[0].path,
+            "/home/tester/skills"
+        );
+
+        config.context.current_location = 1_500_000;
+        let with_boost = RankContext {
+            journal: &Aggregate::default(),
+            aliases: &AliasDictionary::empty(),
+            retrieval,
+            memory: MemoryEvidence::empty(),
+            config: &config,
+        };
+        assert_eq!(
+            search(&index, &with_boost, "skills", 50)[0].path,
+            "/home/tester/current/skills-drafts"
+        );
     }
 
     #[test]
@@ -2433,6 +2503,7 @@ mod tests {
             aliases: &aliases,
             retrieval: RetrievalSignals::default(),
             memory: MemoryEvidence::empty(),
+            config: RankContext::empty().config,
         };
         let hits = search(&index, &ctx, "docs", 50);
         assert_eq!(hits[0].path, "/home/tester/Projects");

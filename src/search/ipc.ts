@@ -6,6 +6,7 @@ import { z } from "zod";
 import { fromTauri, reportShellError, type ShellError } from "../shell";
 
 const QGRAM_READY_EVENT = "beeline://search-qgram-ready";
+const RANKER_RELOADED_EVENT = "beeline://ranker-reloaded";
 
 const tierSchema = z.enum(["normal", "hidden", "junk"]);
 export type Tier = z.infer<typeof tierSchema>;
@@ -35,6 +36,16 @@ export type SearchWave = z.infer<typeof searchWaveSchema>;
 
 const unitSchema = z.null();
 const readyPayloadSchema = z.object({}).strict();
+const rankerReloadPayloadSchema = z
+  .object({ fingerprint: z.string().min(1) })
+  .strict();
+const rankerReloadOutcomeSchema = z
+  .object({
+    fingerprint: z.string().min(1),
+    source: z.enum(["file", "embedded_default"]),
+  })
+  .strict();
+export type RankerReloadOutcome = z.infer<typeof rankerReloadOutcomeSchema>;
 const unlistenSchema = z.custom<UnlistenFn>(
   (value) => typeof value === "function",
 );
@@ -125,5 +136,30 @@ export function recordSearchSignal(
 export function resetLearnedRanking(): ResultAsync<null, ShellError> {
   return fromTauri("reset_learned_ranking", unitSchema, () =>
     invoke("reset_learned_ranking"),
+  );
+}
+
+export function reloadRankerConfig(): ResultAsync<RankerReloadOutcome, ShellError> {
+  return fromTauri("reload_ranker_config", rankerReloadOutcomeSchema, () =>
+    invoke("reload_ranker_config"),
+  );
+}
+
+export function subscribeRankerReloaded(
+  handler: (fingerprint: string) => void,
+): ResultAsync<UnlistenFn, ShellError> {
+  return fromTauri(`listen:${RANKER_RELOADED_EVENT}`, unlistenSchema, () =>
+    listen(RANKER_RELOADED_EVENT, (event) => {
+      const parsed = rankerReloadPayloadSchema.safeParse(event.payload);
+      if (parsed.success) {
+        handler(parsed.data.fingerprint);
+      } else {
+        reportShellError({
+          code: "invalid-boundary-payload",
+          operation: RANKER_RELOADED_EVENT,
+          cause: parsed.error,
+        });
+      }
+    }),
   );
 }

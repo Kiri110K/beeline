@@ -100,6 +100,11 @@ impl Aggregate {
         (freq + recency).min(VISIT_CAP)
     }
 
+    /// Code-defined recency/frequency curve normalized for the configurable ranker.
+    pub fn strength_milli(&self, path: &str) -> i64 {
+        self.boost(path).saturating_mul(1_000) / VISIT_CAP
+    }
+
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.by_path.keys().map(String::as_str)
     }

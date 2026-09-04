@@ -16,14 +16,14 @@ use std::{
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+use super::ranker_config::RankerConfig;
+
 const SCHEMA_VERSION: u32 = 1;
 const LOG_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LEARNED_RECORDS: usize = 200_000;
 const DAY_MS: i64 = 86_400_000;
 const HALF_LIFE_DAYS: i64 = 90;
 
-const MEMORY_SCORE_CAP: i64 = 3_000_000;
-const USAGE_SCORE_CAP: i64 = 200_000;
 const SATURATION_POINTS: u64 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +186,13 @@ impl Aggregate {
 /// Query-specific score contributions and the learned paths injected into the Working Set.
 #[derive(Clone, Default)]
 pub struct MemoryEvidence {
-    by_path: HashMap<String, i64>,
+    by_path: HashMap<String, LearnedStrength>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LearnedStrength {
+    memory_milli: i64,
+    usage_milli: i64,
 }
 
 impl MemoryEvidence {
@@ -196,8 +202,18 @@ impl MemoryEvidence {
         EMPTY.get_or_init(MemoryEvidence::default)
     }
 
-    pub fn boost(&self, path: &str) -> i64 {
-        self.by_path.get(path).copied().unwrap_or(0)
+    pub fn boost(&self, path: &str, config: &RankerConfig) -> i64 {
+        let strength = self.by_path.get(path).copied().unwrap_or_default();
+        strength
+            .memory_milli
+            .saturating_mul(config.search_memory.max)
+            .saturating_div(1_000)
+            .saturating_add(
+                strength
+                    .usage_milli
+                    .saturating_mul(config.search_memory.usage_max)
+                    .saturating_div(1_000),
+            )
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &str> {
@@ -211,7 +227,15 @@ impl MemoryEvidence {
         Self {
             by_path: entries
                 .iter()
-                .map(|(path, score)| ((*path).to_owned(), *score))
+                .map(|(path, strength)| {
+                    (
+                        (*path).to_owned(),
+                        LearnedStrength {
+                            memory_milli: *strength,
+                            usage_milli: 0,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -332,7 +356,10 @@ impl SearchMemory {
                 (strength > 0).then(|| {
                     (
                         path.clone(),
-                        strength.saturating_mul(USAGE_SCORE_CAP) / 1_000,
+                        LearnedStrength {
+                            memory_milli: 0,
+                            usage_milli: strength,
+                        },
                     )
                 })
             })
@@ -344,23 +371,9 @@ impl SearchMemory {
                 if similarity == 0 {
                     continue;
                 }
-                let contribution = stats
-                    .strength_milli(now_ms)
-                    .saturating_mul(MEMORY_SCORE_CAP)
-                    .saturating_mul(similarity)
-                    / 1_000_000;
-                let score = by_path.entry(key.path.clone()).or_default();
-                *score = (*score).max(
-                    contribution.saturating_add(
-                        aggregate
-                            .usage
-                            .get(&key.path)
-                            .map(|usage| {
-                                usage.strength_milli(now_ms).saturating_mul(USAGE_SCORE_CAP) / 1_000
-                            })
-                            .unwrap_or(0),
-                    ),
-                );
+                let contribution = stats.strength_milli(now_ms).saturating_mul(similarity) / 1_000;
+                let strength = by_path.entry(key.path.clone()).or_default();
+                strength.memory_milli = strength.memory_milli.max(contribution);
             }
         }
         MemoryEvidence { by_path }
@@ -662,15 +675,30 @@ mod tests {
                 )
                 .expect("record");
             let evidence = memory.evidence("work/wip", 1_000);
-            assert!(evidence.boost(path) > 0);
+            assert!(evidence.boost(path, &RankerConfig::default()) > 0);
         }
         let memory = SearchMemory::load(&dir.0).expect("reload");
-        assert!(memory.evidence("work wip", 1_000).boost(path) > 0);
+        assert!(
+            memory
+                .evidence("work wip", 1_000)
+                .boost(path, &RankerConfig::default())
+                > 0
+        );
         memory.reset().expect("reset");
-        assert_eq!(memory.evidence("work wip", 1_000).boost(path), 0);
+        assert_eq!(
+            memory
+                .evidence("work wip", 1_000)
+                .boost(path, &RankerConfig::default()),
+            0
+        );
         drop(memory);
         let empty = SearchMemory::load(&dir.0).expect("reload empty");
-        assert_eq!(empty.evidence("work wip", 1_000).boost(path), 0);
+        assert_eq!(
+            empty
+                .evidence("work wip", 1_000)
+                .boost(path, &RankerConfig::default()),
+            0
+        );
     }
 
     #[test]
@@ -681,11 +709,12 @@ mod tests {
         memory
             .record(path, Some("report"), false, SignalKind::ActionMenu, 1_000)
             .expect("weak");
-        let weak = memory.evidence("report", 1_000).boost(path);
+        let config = RankerConfig::default();
+        let weak = memory.evidence("report", 1_000).boost(path, &config);
         memory
             .record(path, Some("report"), false, SignalKind::QuickLook, 2_000)
             .expect("medium");
-        let medium = memory.evidence("report", 2_000).boost(path);
+        let medium = memory.evidence("report", 2_000).boost(path, &config);
         memory
             .record(
                 path,
@@ -695,11 +724,11 @@ mod tests {
                 3_000,
             )
             .expect("strong");
-        let strong = memory.evidence("report", 3_000).boost(path);
+        let strong = memory.evidence("report", 3_000).boost(path, &config);
         assert!(weak < medium && medium < strong);
         let aged = memory
             .evidence("report", 3_000 + 2 * HALF_LIFE_DAYS * DAY_MS)
-            .boost(path);
+            .boost(path, &config);
         assert!(aged < strong);
     }
 }

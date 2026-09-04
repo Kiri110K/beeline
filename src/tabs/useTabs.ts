@@ -74,6 +74,7 @@ import {
   recordSearchSignal,
   recordVisit,
   searchNameIndex,
+  subscribeRankerReloaded,
   subscribeSearchQgramReady,
   type SearchHit,
   type SearchSignalKind,
@@ -1487,6 +1488,25 @@ export function useTabs(
       if (unlisten !== null) {
         unlisten();
       }
+    };
+  }, [runSearch]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    void subscribeRankerReloaded(() => {
+      const current = stateRef.current;
+      const active = tabById(current, current.activeId);
+      if (active?.search.mode === "search" && active.search.query.trim() !== "") {
+        runSearch(active.id, active.search.query);
+      }
+    }).match(
+      (stop) => {
+        unlisten = stop;
+      },
+      reportShellError,
+    );
+    return () => {
+      unlisten?.();
     };
   }, [runSearch]);
 

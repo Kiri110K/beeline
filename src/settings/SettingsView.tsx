@@ -24,7 +24,7 @@ import {
   type Slot,
 } from "../operations/settings";
 import { reportShellError, type ShellError } from "../shell";
-import { resetLearnedRanking } from "../search/ipc";
+import { reloadRankerConfig, resetLearnedRanking } from "../search/ipc";
 import { strings } from "../strings";
 import type { SetSettingsOutcome } from "./ipc";
 import {
@@ -94,6 +94,9 @@ export function SettingsView({
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [learnedReset, setLearnedReset] = useState<
     "idle" | "confirm" | "running" | "done"
+  >("idle");
+  const [rankerReload, setRankerReload] = useState<
+    "idle" | "running" | "done"
   >("idle");
   // Which known apps are installed, for the slot pickers (SPEC §8 detection).
   const [installed, setInstalled] = useState<ReadonlySet<string>>(new Set());
@@ -679,6 +682,33 @@ export function SettingsView({
                 <span className="text-[12px] text-neutral-400">
                   {s.learnedRanking.done}
                 </span>
+              ) : null}
+            </div>
+          </Field>
+
+          <Field label={s.ranker.heading} hint={s.ranker.hint}>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={rankerReload === "running"}
+                onClick={() => {
+                  setRankerReload("running");
+                  void reloadRankerConfig().match(
+                    () => {
+                      setRankerReload("done");
+                    },
+                    (error) => {
+                      setRankerReload("idle");
+                      reportShellError(error);
+                    },
+                  );
+                }}
+                className="rounded border border-neutral-600 px-3 py-1 hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {rankerReload === "running" ? s.ranker.running : s.ranker.reload}
+              </button>
+              {rankerReload === "done" ? (
+                <span className="text-[12px] text-neutral-400">{s.ranker.done}</span>
               ) : null}
             </div>
           </Field>

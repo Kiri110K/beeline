@@ -155,6 +155,13 @@ export const strings = {
       running: "Resetting…",
       done: "Learned ranking reset",
     },
+    ranker: {
+      heading: "Ranker configuration",
+      hint: "Reload ranker.json from Beeline application data without restarting.",
+      reload: "Reload ranker.json",
+      running: "Reloading…",
+      done: "Ranker configuration reloaded",
+    },
     afterAction: {
       heading: "After an action",
       hide: "Hide window",

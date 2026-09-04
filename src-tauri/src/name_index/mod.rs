@@ -16,6 +16,7 @@ mod model;
 mod persist;
 mod qgram;
 mod query;
+mod ranker_config;
 mod search_memory;
 mod visit_journal;
 mod watcher;
@@ -43,12 +44,14 @@ use junk_refresh::JunkRefresh;
 use model::{IndexData, Tier};
 use qgram::QGramIndex;
 use query::{RankContext, RetrievalSignals, RetrievalSource, SearchHit};
+use ranker_config::RankerConfig;
 use search_memory::{MemoryEvidence, SearchMemory, SignalKind};
 use visit_journal::{VisitJournal, VisitKind};
 
 /// The volume key for the home root. Mounted volumes get their own keys later.
 const HOME_VOLUME_KEY: &str = "home";
 const QGRAM_READY_EVENT: &str = "beeline://search-qgram-ready";
+const RANKER_RELOADED_EVENT: &str = "beeline://ranker-reloaded";
 
 /// The built-in Junk seed list (SPEC §6), re-exported so the settings store can seed a
 /// fresh install's editable list from the same source (SPEC §12).
@@ -66,6 +69,7 @@ pub(crate) fn junk_seed_v2_names() -> Vec<String> {
 }
 
 pub(crate) use benchmark::run as run_benchmark;
+pub(crate) use ranker_config::run_cli as run_ranker_cli;
 
 /// A swappable Junk-patterns handle. Search, the watcher, and the Junk drain each take a
 /// cheap snapshot (`.read().clone()`); `apply_settings` swaps the inner `Arc` so a Settings
@@ -99,6 +103,8 @@ pub struct NameIndex {
     journal: Arc<VisitJournal>,
     /// Persistent explicit-interaction evidence and query-independent learned usage.
     search_memory: Arc<SearchMemory>,
+    /// One active, atomically swappable Ranker Configuration.
+    ranker: Arc<RwLock<Arc<RankerConfig>>>,
     /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
     /// searches rank against the current aliases.
     aliases: RwLock<Arc<AliasDictionary>>,
@@ -281,6 +287,25 @@ impl NameIndex {
             SearchMemory::load(&app_data_dir)
                 .map_err(|error| format!("failed to load Search Memory: {error}"))?,
         );
+        let ranker = match RankerConfig::load(&app_data_dir) {
+            Ok(Some(config)) => {
+                record(
+                    app,
+                    "ranker_config_loaded",
+                    json!({ "fingerprint": config.fingerprint(), "source": "file" }),
+                );
+                config
+            }
+            Ok(None) => RankerConfig::default(),
+            Err(error) => {
+                record(
+                    app,
+                    "ranker_config_rejected",
+                    json!({ "error": error, "phase": "startup" }),
+                );
+                RankerConfig::default()
+            }
+        };
 
         Ok(Self {
             data,
@@ -289,6 +314,7 @@ impl NameIndex {
             index_file,
             journal,
             search_memory,
+            ranker: Arc::new(RwLock::new(Arc::new(ranker))),
             aliases,
             generation: Arc::new(AtomicU64::new(0)),
             reuse: Arc::new(Mutex::new(None)),
@@ -305,6 +331,10 @@ impl NameIndex {
     /// A cheap snapshot of the current Alias Dictionary (SPEC §6), for a search.
     fn aliases_snapshot(&self) -> Arc<AliasDictionary> {
         self.aliases.read().expect("aliases lock poisoned").clone()
+    }
+
+    fn ranker_snapshot(&self) -> Arc<RankerConfig> {
+        self.ranker.read().expect("ranker lock poisoned").clone()
     }
 
     /// Swap in Junk patterns and aliases from a Settings change (SPEC §12). Future
@@ -479,6 +509,13 @@ pub struct SearchWave {
     pub hits: Vec<SearchHit>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankerReloadOutcome {
+    fingerprint: String,
+    source: &'static str,
+}
+
 /// One executed search: the ranked outcome plus the revision it ran against and whether it
 /// reused a cached candidate set.
 struct Executed {
@@ -539,6 +576,7 @@ fn execute_search(
     journal: &VisitJournal,
     aliases: &AliasDictionary,
     memory: &MemoryEvidence,
+    ranker: &RankerConfig,
     junk_refresh: Option<&JunkRefresh>,
     query: &str,
     limit: usize,
@@ -560,6 +598,7 @@ fn execute_search(
         aliases,
         retrieval,
         memory,
+        config: ranker,
     };
     let index = data.read().expect("name index lock poisoned");
     let revision = index.revision;
@@ -633,6 +672,7 @@ fn run_search(
 ) -> SearchResponse {
     let started = Instant::now();
     let memory = MemoryEvidence::default();
+    let ranker = RankerConfig::default();
     let executed = execute_search(
         data,
         junk,
@@ -640,6 +680,7 @@ fn run_search(
         journal,
         aliases,
         &memory,
+        &ranker,
         None,
         query,
         limit,
@@ -753,6 +794,7 @@ pub async fn search_name_index_v2(
 
     let journal = state.journal.clone();
     let search_memory = state.search_memory.clone();
+    let ranker = state.ranker_snapshot();
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
@@ -785,6 +827,7 @@ pub async fn search_name_index_v2(
                 aliases: &aliases,
                 retrieval,
                 memory: &memory,
+                config: &ranker,
             };
             let outcome = query::run_fuzzy(
                 &index,
@@ -801,7 +844,8 @@ pub async fn search_name_index_v2(
             return Err("search superseded".to_owned());
         }
         let working_empty = working.hits.is_empty();
-        let global = qgram::significant_len(&query) >= 5;
+        let global =
+            qgram::significant_len(&query) >= ranker.global_retrieval_significant_chars as usize;
         let qgram_ready = qgrams.read().expect("q-gram lock poisoned").is_some();
         send_wave(
             &on_wave,
@@ -988,6 +1032,7 @@ pub async fn search_name_index_v2(
             &journal,
             &aliases,
             &memory,
+            &ranker,
             Some(&junk_refresh),
             &query,
             limit as usize,
@@ -1100,6 +1145,42 @@ pub async fn reset_learned_ranking(state: State<'_, NameIndex>) -> Result<(), St
         .await
         .map_err(|_| "reset learned ranking task failed".to_owned())?
         .map_err(|error| format!("failed to reset learned ranking: {error}"))
+}
+
+/// Strictly load and atomically activate `ranker.json`. Missing means embedded default;
+/// invalid input leaves the previous active snapshot untouched. The event makes the
+/// frontend rerun the unchanged active query with a new request sequence.
+#[tauri::command]
+pub async fn reload_ranker_config(
+    app: AppHandle,
+    state: State<'_, NameIndex>,
+) -> Result<RankerReloadOutcome, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("failed to resolve app data dir: {error}"))?;
+    let loaded = tauri::async_runtime::spawn_blocking(move || RankerConfig::load(&app_data_dir))
+        .await
+        .map_err(|_| "ranker reload task failed".to_owned())??;
+    let (config, source) = match loaded {
+        Some(config) => (config, "file"),
+        None => (RankerConfig::default(), "embedded_default"),
+    };
+    let fingerprint = config.fingerprint();
+    *state.ranker.write().expect("ranker lock poisoned") = Arc::new(config);
+    state.generation.fetch_add(1, Ordering::SeqCst);
+    *state.reuse.lock().expect("reuse cache lock poisoned") = None;
+    record(
+        &app,
+        "ranker_config_reloaded",
+        json!({ "fingerprint": fingerprint, "source": source }),
+    );
+    app.emit(RANKER_RELOADED_EVENT, json!({ "fingerprint": fingerprint }))
+        .map_err(|error| format!("failed to emit ranker reload: {error}"))?;
+    Ok(RankerReloadOutcome {
+        fingerprint,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -1933,6 +2014,7 @@ mod tests {
         let junk = Arc::new(JunkPatterns::default());
         let aliases = AliasDictionary::empty();
         let memory = MemoryEvidence::default();
+        let ranker = RankerConfig::default();
 
         // Single-token «процед» matches only the directory entry, by name.
         let base = execute_search(
@@ -1942,6 +2024,7 @@ mod tests {
             &journal,
             &aliases,
             &memory,
+            &ranker,
             None,
             "процед",
             50,
@@ -1965,6 +2048,7 @@ mod tests {
             &journal,
             &aliases,
             &memory,
+            &ranker,
             None,
             "процедура приемки",
             50,
@@ -1979,6 +2063,7 @@ mod tests {
             &journal,
             &aliases,
             &memory,
+            &ranker,
             None,
             "процедура приемки",
             50,
