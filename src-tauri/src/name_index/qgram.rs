@@ -197,13 +197,14 @@ impl QGramIndex {
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut counts = vec![0u32; BUCKETS];
         let mut gram_scratch = Vec::new();
+        let mut gram_seen = vec![0u8; BUCKETS];
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
                 continue;
             };
             let slot = u32::try_from(slot)
                 .map_err(|_| std::io::Error::other("Name Index exceeds u32 slots"))?;
-            gram_buckets_into(entry.name, &mut gram_scratch);
+            build_gram_buckets_into(entry.name, &mut gram_scratch, &mut gram_seen);
             for &bucket in &gram_scratch {
                 let bucket = bucket as usize;
                 let count = &mut counts[bucket];
@@ -705,12 +706,28 @@ fn normalize(value: &str) -> String {
 
 fn gram_buckets(value: &str) -> Vec<u32> {
     let mut buckets = Vec::new();
-    gram_buckets_into(value, &mut buckets);
+    visit_gram_buckets(value, |bucket| buckets.push(bucket));
+    buckets.sort_unstable();
+    buckets.dedup();
     buckets
 }
 
-fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
+fn build_gram_buckets_into(value: &str, buckets: &mut Vec<u32>, seen: &mut [u8]) {
+    debug_assert!(seen.len() >= BUCKETS);
     buckets.clear();
+    visit_gram_buckets(value, |bucket| {
+        let marker = &mut seen[bucket as usize];
+        if *marker == 0 {
+            *marker = 1;
+            buckets.push(bucket);
+        }
+    });
+    for &bucket in buckets.iter() {
+        seen[bucket as usize] = 0;
+    }
+}
+
+fn visit_gram_buckets(value: &str, mut visit: impl FnMut(u32)) {
     if value.is_ascii() {
         let mut previous = [0u8; 2];
         let mut previous_len = 0usize;
@@ -725,15 +742,13 @@ fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
                 previous_len += 1;
                 continue;
             }
-            buckets.push(bucket(&[
+            visit(bucket(&[
                 previous[0] as char,
                 previous[1] as char,
                 byte as char,
             ]));
             previous = [previous[1], byte];
         }
-        buckets.sort_unstable();
-        buckets.dedup();
         return;
     }
     let mut previous = [None, None];
@@ -746,13 +761,11 @@ fn gram_buckets_into(value: &str, buckets: &mut Vec<u32>) {
             [None, _] => previous[0] = Some(character),
             [Some(_), None] => previous[1] = Some(character),
             [Some(first), Some(second)] => {
-                buckets.push(bucket(&[first, second, character]));
+                visit(bucket(&[first, second, character]));
                 previous = [Some(second), Some(character)];
             }
         }
     }
-    buckets.sort_unstable();
-    buckets.dedup();
 }
 
 fn bucket(gram: &[char]) -> u32 {
@@ -954,6 +967,23 @@ mod tests {
 
             assert_eq!(gram_buckets(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn build_qgram_scratch_deduplicates_and_clears_dense_markers() {
+        let mut buckets = Vec::new();
+        let mut seen = vec![0u8; BUCKETS];
+
+        build_gram_buckets_into("aaaaa", &mut buckets, &mut seen);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets, gram_buckets("aaaaa"));
+
+        build_gram_buckets_into("ab", &mut buckets, &mut seen);
+        assert!(buckets.is_empty());
+
+        build_gram_buckets_into("methodology", &mut buckets, &mut seen);
+        buckets.sort_unstable();
+        assert_eq!(buckets, gram_buckets("methodology"));
     }
 
     #[test]
