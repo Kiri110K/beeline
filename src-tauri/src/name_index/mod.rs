@@ -1662,6 +1662,49 @@ mod tests {
         assert!(shared.read().unwrap().junk_dirty.is_empty());
     }
 
+    #[test]
+    fn junk_drain_reconciles_dirty_directories_without_rebuilding_their_subtrees() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        touch(&root.join("node_modules/pkg/deep/stable.js"));
+        touch(&root.join("node_modules/other/untouched.js"));
+        let patterns = JunkPatterns::default();
+        let shared = new_index(root);
+        crawl::initial_crawl(&shared, root.to_path_buf(), &patterns, None);
+
+        let stable = root.join("node_modules/pkg/deep/stable.js");
+        let stable_slot = shared.read().unwrap().resolve_item_slot(&stable).unwrap();
+        let new_file = root.join("node_modules/pkg/deep/added.js");
+        touch(&new_file);
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &new_file, &patterns);
+            let junk_root = index.resolve_dir(&root.join("node_modules")).unwrap();
+            index.junk_dirty.insert(junk_root);
+        }
+        let revision_before_drain = shared.read().unwrap().revision;
+
+        let outcome = crawl::drain_junk_dirty(&shared, root, &patterns);
+        let index = shared.read().unwrap();
+        assert_eq!(outcome.dirty_dirs, 2);
+        assert_eq!(index.resolve_item_slot(&stable), Some(stable_slot));
+        assert!(index.resolve_item_slot(&new_file).is_some());
+        assert!(index.junk_dirty.is_empty());
+        assert!(index.revision - revision_before_drain <= 3);
+        drop(index);
+
+        fs::remove_file(&stable).unwrap();
+        touch(&stable.join("nested.txt"));
+        {
+            let mut index = shared.write().unwrap();
+            crawl::apply_fs_event(&mut index, &stable, &patterns);
+        }
+        crawl::drain_junk_dirty(&shared, root, &patterns);
+        let index = shared.read().unwrap();
+        let replacement = index.resolve_dir(&stable).unwrap();
+        assert!(index.has_child(replacement, "nested.txt"));
+    }
+
     // FSEvents delivery is environment- and timing-dependent, so the real watcher is
     // only smoke-covered here and ignored by default. Run with `cargo test -- --ignored`.
     #[test]
@@ -1923,6 +1966,42 @@ mod tests {
             "live mapped subtree removal: {removed} slots in {duration_ms:.2} ms from {} total slots",
             index.slot_len()
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_junk_shallow_reconcile_timing() {
+        let index_path = std::env::var_os("BEELINE_LIVE_INDEX")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_INDEX to the persisted home.idx path");
+        let root = std::env::var_os("BEELINE_LIVE_ROOT")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_ROOT to the indexed home root");
+        let target = std::env::var_os("BEELINE_LIVE_JUNK_DIR")
+            .map(PathBuf::from)
+            .expect("set BEELINE_LIVE_JUNK_DIR to an indexed Junk directory");
+        let patterns = JunkPatterns::default();
+        let index = persist::load(&index_path, &root).expect("load live persisted index");
+        let target_id = index
+            .resolve_dir(&target)
+            .expect("live Junk directory must be indexed");
+        assert_eq!(
+            patterns.classify(target.strip_prefix(&root).unwrap()),
+            model::Tier::Junk
+        );
+        let shared = Arc::new(RwLock::new(index));
+        shared.write().unwrap().junk_dirty.insert(target_id);
+
+        let started = Instant::now();
+        let outcome = crawl::drain_junk_dirty(&shared, &root, &patterns);
+        println!(
+            "live Junk shallow reconcile: {} dirty dirs in {:.2} ms, {} live Items",
+            outcome.dirty_dirs,
+            started.elapsed().as_secs_f64() * 1000.0,
+            shared.read().unwrap().len()
+        );
+        assert_eq!(outcome.dirty_dirs, 1);
+        assert!(shared.read().unwrap().junk_dirty.is_empty());
     }
 
     #[test]

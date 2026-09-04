@@ -988,11 +988,6 @@ impl IndexData {
         self.remove_slots(vec![slot as u32])
     }
 
-    pub fn clear_children(&mut self, dir_id: DirId) {
-        let slots = self.direct_entry_slots(dir_id);
-        self.remove_slots(slots);
-    }
-
     /// Remove whole directory subtrees without using the call stack. A deleted tree in a
     /// real v4 index previously recursed through `remove_slot`/`clear_children` 10,102 times,
     /// retained every sibling buffer on that stack, and then aborted on the stack guard.

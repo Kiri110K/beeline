@@ -14,7 +14,7 @@ use std::{
         Arc, RwLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::json;
@@ -28,10 +28,16 @@ use super::{crawl, model::IndexData, SharedJunk};
 /// milliseconds. Wait for a real quiet window before recrawling, without delaying the
 /// immediate non-Junk event path in the watcher.
 const FILESYSTEM_QUIET: Duration = Duration::from_secs(5);
-/// Continuous Junk traffic (for example an active build plus `.codex` logs) must not keep
-/// an external-power queue dirty forever. This remains a one-shot event deadline, not a
-/// periodic timer: when no Junk event is pending, the worker blocks indefinitely.
-const FILESYSTEM_MAX_DELAY: Duration = Duration::from_secs(30);
+
+fn wait_until_quiet(rx: &mpsc::Receiver<()>, quiet: Duration) -> bool {
+    loop {
+        match rx.recv_timeout(quiet) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return true,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct JunkRefresh {
@@ -67,26 +73,16 @@ impl JunkRefresh {
             thread::spawn(move || {
                 crate::qos::set_background_qos();
                 while rx.recv().is_ok() {
-                    // Each new burst resets the one-shot quiet window. This is event-driven:
-                    // once no burst is pending the worker blocks indefinitely on `recv`.
-                    let deadline = Instant::now() + FILESYSTEM_MAX_DELAY;
-                    loop {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        match rx.recv_timeout(FILESYSTEM_QUIET.min(remaining)) {
-                            Ok(()) => {}
-                            Err(mpsc::RecvTimeoutError::Timeout) => break,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
+                    // Each new burst restarts the quiet window. Continuous cache/build/log
+                    // traffic leaves Junk dirty and searchable through its existing snapshot;
+                    // it must not force repeated multi-minute recrawls in a hidden app.
+                    if !wait_until_quiet(&rx, FILESYSTEM_QUIET) {
+                        return;
                     }
-                    let reason = if Instant::now() >= deadline {
-                        "filesystem_deadline"
-                    } else {
-                        "filesystem_quiet"
-                    };
-                    worker.after_fs_burst_for_reason(crate::power::current_source(), reason);
+                    worker.after_fs_burst_for_reason(
+                        crate::power::current_source(),
+                        "filesystem_quiet",
+                    );
                 }
             });
         }
@@ -182,5 +178,37 @@ impl JunkRefresh {
 
     pub fn targeting_query(&self) {
         self.drain("targeting_query");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn each_junk_burst_restarts_the_quiet_window() {
+        let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sender = thread::spawn(move || {
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(5));
+                tx.send(()).unwrap();
+            }
+            release_rx.recv().unwrap();
+        });
+        let started = Instant::now();
+
+        assert!(wait_until_quiet(&rx, Duration::from_millis(20)));
+        release_tx.send(()).unwrap();
+        sender.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(35));
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_report_a_quiet_window() {
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        assert!(!wait_until_quiet(&rx, Duration::from_millis(1)));
     }
 }

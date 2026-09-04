@@ -422,17 +422,21 @@ fn reconcile_dir(
     let mut new_subdirs: Vec<(DirId, PathBuf)> = Vec::new();
     {
         let mut index = shared.write().expect("name index lock poisoned");
-        for (name, _) in &index_children {
-            if !disk.contains_key(name) {
+        for (name, is_directory) in &index_children {
+            if disk
+                .get(name)
+                .is_none_or(|child| child.is_dir != *is_directory)
+            {
                 index.remove_child(dir_id, name);
             }
         }
-        let known: std::collections::HashSet<&str> = index_children
-            .iter()
-            .map(|(name, _)| name.as_str())
+        let known: HashSet<String> = index
+            .direct_children(dir_id)
+            .into_iter()
+            .map(|(name, _)| name)
             .collect();
         for child in disk.values() {
-            if known.contains(child.name.as_str()) {
+            if known.contains(&child.name) {
                 continue;
             }
             if child.is_dir {
@@ -530,47 +534,41 @@ pub struct JunkDrainOutcome {
     pub duration_ms: u64,
 }
 
-/// Rescan every dirty Junk directory, then clear the dirty set. A targeting query always
+/// Reconcile every dirty Junk directory, then clear the dirty set. A targeting query always
 /// calls this; filesystem-idle and external-power callers are gated by the energy policy.
-/// Each dirty directory is emptied and re-crawled fresh.
+/// Only direct children are compared. Existing descendants keep their stable slots, while a
+/// genuinely new directory is crawled once from its nearest indexed parent.
 pub fn drain_junk_dirty(
     shared: &Arc<RwLock<IndexData>>,
     root: &Path,
     junk: &JunkPatterns,
 ) -> JunkDrainOutcome {
     let started = Instant::now();
-    let dirty: Vec<(DirId, PathBuf)> = {
+    let mut dirty: Vec<(DirId, PathBuf)> = {
         let mut index = shared.write().expect("name index lock poisoned");
         let ids: HashSet<DirId> = index.junk_dirty.drain().collect();
-        // FSEvents may report both a Junk directory and one of its descendants in the same
-        // burst. Refresh only the highest dirty ancestor: clearing it already replaces the
-        // descendant, whose old node id must not be recrawled as an orphan afterwards.
-        let roots: Vec<DirId> = ids
-            .iter()
-            .copied()
-            .filter(|id| {
-                let mut parent = index.node(*id).expect("dirty directory node").parent;
-                while parent != 0 {
-                    if ids.contains(&parent) {
-                        return false;
-                    }
-                    parent = index.node(parent).expect("dirty ancestor node").parent;
-                }
-                true
-            })
-            .collect();
-        roots
-            .into_iter()
-            .map(|id| (id, index.full_path(id)))
+        ids.into_iter()
+            .filter_map(|id| index.node(id).map(|_| (id, index.full_path(id))))
             .collect()
     };
+    // A parent reconcile can remove, replace, or create a child directory. Visit parents
+    // first, then verify the captured identity before touching each descendant.
+    dirty.sort_unstable_by(|left, right| {
+        left.1
+            .components()
+            .count()
+            .cmp(&right.1.components().count())
+            .then_with(|| left.1.cmp(&right.1))
+    });
     let dirty_dirs = dirty.len();
     for (id, path) in dirty {
-        {
-            let mut index = shared.write().expect("name index lock poisoned");
-            index.clear_children(id);
+        let still_same_directory = {
+            let index = shared.read().expect("name index lock poisoned");
+            index.node(id).is_some() && index.full_path(id) == path
+        };
+        if still_same_directory {
+            reconcile_dir(shared, id, &path, root, junk);
         }
-        crawl_walk(shared, id, path, root, junk, None, false);
     }
     JunkDrainOutcome {
         dirty_dirs,

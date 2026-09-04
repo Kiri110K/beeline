@@ -286,6 +286,40 @@ final p95 was 198.32, 211.09, and 420.74 ms respectively. In the newly installed
 physical footprint settled at 74.8 MiB after startup, with a 105.5 MiB startup peak. The app
 remained hidden with no windows during this verification.
 
+## Junk refresh long-session follow-up — 2026-09-04
+
+The remaining watcher traffic was captured at the filesystem boundary rather than inferred from
+batch telemetry. Over 30 seconds the home watcher received 194 path notifications for 55 distinct
+paths. None was inside Beeline's app-data subtree or one of its ancestors. The largest sources were
+T3 trace logs, T3/Chromium LevelDB and caches, Telegram, WhatsApp, and Teams. The app-data exclusion
+therefore works; the continued event stream is real activity from other applications.
+
+The expensive behavior was the Junk refresh policy. Over 4 hours 19 minutes, the previous installed
+build recorded 3,816 watcher batches. Of those, 3,060 made no index mutation. Batch application
+accounted for 92.55 seconds in total, but the largest no-op batch waited 24.96 seconds for the index
+write lock. Four forced Junk rescans ran after the fixed 30-second deadline and took 43.00 seconds,
+1,188.84 seconds, 1,288.17 seconds, and 305.51 seconds. Continuous cache/log activity therefore
+caused repeated whole-subtree rebuilds instead of postponing maintenance.
+
+The worker no longer forces a refresh during continuous traffic. Every Junk event restarts the
+five-second quiet window; an explicit Junk-targeting query still refreshes immediately. When a
+refresh does run, it reconciles only direct children of each dirty directory. It preserves stable
+descendant slots, crawls only genuinely new directories, handles file/directory type changes, and
+verifies a captured directory identity after an ancestor update. The obsolete clear-and-recrawl
+path was removed.
+
+A read-only release run against the persisted 5,244,905-Item production base reconciled the whole
+`~/Library/Application Support` Junk root in 57.94 ms and found five new direct Items. The prior
+algorithm could select the same high-level dirty root and spend 19–21 minutes rebuilding its full
+subtree. The new regression suite has 112 passing Rust tests and nine ignored machine/system
+tests; the dedicated ignored live timing also passed. Clippy with warnings denied, frontend
+contracts, lint, typecheck, production build, and signed bundle all pass.
+
+The updated installed bundle remained hidden with no windows. After startup reconciliation its
+physical footprint was 60.6 MiB with a 66.8 MiB peak. During the first three minutes it handled 82
+batches in 605 ms total, with no Junk refresh; the machine was on battery, so this run validates the
+deferred path rather than the external-power quiet drain.
+
 ## Known limits
 
 - The hashed trigram overlap rule passed the labeled matrix but has no proof of exhaustive
@@ -297,6 +331,6 @@ remained hidden with no windows during this verification.
   not the selected on-disk format.
 - The harness uses empty Search Memory and Alias Dictionary state. It resolves live Recents
   and Visit Journal paths only as Working Set and ranking signals.
-- Search Memory, energy, incremental sidecar maintenance, and post-reboot page-fault behavior
-  remain unmeasured. IPC/render timing and stale-result rejection are now covered by the
-  production integration and its reducer contract test.
+- Search Memory, incremental sidecar maintenance, post-reboot page-fault behavior, and a longer
+  external-power idle sample after the Junk-refresh fix remain unmeasured. IPC/render timing and
+  stale-result rejection are covered by the production integration and its reducer contract test.

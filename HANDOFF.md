@@ -123,6 +123,27 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   окон нет. Полный Rust suite: 109 passed, 8 ignored; clippy `-D warnings` и все
   frontend contract tests зелёные. Backup предыдущего приложения:
   `/private/tmp/Beeline-before-overlay-fix.app`.
+- Продолжение long-idle проверки локализовало оставшуюся нагрузку. За 30 секунд
+  FSEvents дал 194 уведомления по 55 путям; ни одного внутри app-data Beeline или
+  его предков. Основные источники — T3 trace/LevelDB, браузерные кэши, Telegram,
+  WhatsApp и Teams. Но старый Junk worker после 30 секунд непрерывного потока
+  принудительно запускал clear-and-recrawl. Четыре таких прохода заняли 43,00;
+  1 188,84; 1 288,17 и 305,51 секунды, а обычный watcher ждал write-lock до
+  24,96 секунды.
+- Локально Junk refresh больше не срабатывает по принудительному deadline:
+  каждое событие заново отсчитывает пять секунд настоящей тишины. Сам refresh
+  сравнивает только непосредственных детей каждой dirty directory, сохраняет
+  стабильные slots неизменившихся поддеревьев, индексирует только новые
+  каталоги и корректно обрабатывает смену file↔directory. Старый полный
+  clear-and-recrawl и мёртвый `clear_children` удалены.
+- Read-only release-проверка на persisted production base из 5 244 905 Items
+  обработала целиком `~/Library/Application Support` как dirty Junk root за
+  57,94 мс и нашла пять новых непосредственных Items. Обновлённый signed bundle
+  установлен скрыто; после startup physical footprint 60,6 MiB, peak 66,8 MiB.
+  За первые три минуты на батарее было 82 batch за 605 мс суммарно и ни одного
+  Junk refresh. Зелёные: 112 Rust tests, 9 ignored, отдельный live ignored test,
+  clippy `-D warnings`, frontend contracts, lint, typecheck и production build.
+  Предыдущая сборка: `/private/tmp/Beeline-before-junk-refresh.app`.
 - Продукт делается для одного пользователя и быстрых итераций. Не сохранять
   compatibility с v1 или экспериментальным learned state. Настройки ранжирования
   держать централизованными и дешёвыми для изменения. При замене search/ranking/
