@@ -384,6 +384,13 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   Финальный sidecar format и query path не менялись. Полный checkpoint: 142 Rust
   passed / 12 ignored, clippy `-D warnings`, frontend contracts, typecheck, build
   и lint зелёные. Подробности: `prototypes/qgram-delta-shard-records/RESULTS.md`.
+- `experiment/qgram-skip-stride-128` (`e3dcb50`) отклонён. Удвоение расстояния
+  между checkpoints уменьшило sidecar на 8,503,760 bytes (-4.6%), но ordered-tail
+  literal retrieval стабильно вырос с 0.18–0.19 до 0.32 мс p95. Suite CPU и wall
+  не улучшились воспроизводимо; все 2,200 наблюдений сохранили точные candidates,
+  posting visits, target ranks и top-10 fingerprints. При текущих 185,963,243
+  bytes из бюджета 600 MiB такой обмен не нужен. Код оставлен только в remote-
+  ветке; отрицательный verdict: `prototypes/qgram-skip-stride-128/RESULTS.md`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
