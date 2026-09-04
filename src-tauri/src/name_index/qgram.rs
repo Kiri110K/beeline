@@ -27,7 +27,6 @@ const SKIP_STRIDE: usize = 64;
 const SKIP_RECORD_BYTES: usize = 8;
 const BUILD_SHARDS: usize = 64;
 const BUILD_SHARD_BUCKETS: usize = BUCKETS / BUILD_SHARDS;
-const BUILD_RECORD_BYTES: usize = 6;
 const ENCODED_POSTING_SLOTS: usize = 256 * 1024;
 
 #[derive(Debug)]
@@ -62,6 +61,36 @@ struct DenseWorkspace {
 
 struct BuildParts {
     path: PathBuf,
+}
+
+struct BuildShardWriter {
+    writer: BufWriter<File>,
+    previous_slot: u32,
+}
+
+impl BuildShardWriter {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            writer: BufWriter::new(File::create(path)?),
+            previous_slot: 0,
+        })
+    }
+
+    fn write(&mut self, bucket: u16, slot: u32) -> std::io::Result<()> {
+        let delta = slot
+            .checked_sub(self.previous_slot)
+            .ok_or_else(|| std::io::Error::other("q-gram build slots are not monotone"))?;
+        let mut record = [0u8; 7];
+        record[..2].copy_from_slice(&bucket.to_le_bytes());
+        let encoded = encode_var_u32_slice(delta, &mut record[2..]);
+        self.writer.write_all(&record[..2 + encoded])?;
+        self.previous_slot = slot;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 impl BuildParts {
@@ -190,7 +219,7 @@ impl QGramIndex {
         // This replaces the 520-MiB global postings vector with one roughly 8-MiB shard.
         let parts = BuildParts::create(path)?;
         let mut part_writers = (0..BUILD_SHARDS)
-            .map(|shard| File::create(parts.shard(shard)).map(BufWriter::new))
+            .map(|shard| BuildShardWriter::create(&parts.shard(shard)))
             .collect::<std::io::Result<Vec<_>>>()?;
         for slot in 0..source_entries {
             let Some(entry) = index.entry(slot) else {
@@ -203,8 +232,7 @@ impl QGramIndex {
                 let shard = bucket / BUILD_SHARD_BUCKETS;
                 let local_bucket = u16::try_from(bucket % BUILD_SHARD_BUCKETS)
                     .expect("q-gram build shard bucket fits u16");
-                part_writers[shard].write_all(&local_bucket.to_le_bytes())?;
-                part_writers[shard].write_all(&slot.to_le_bytes())?;
+                part_writers[shard].write(local_bucket, slot)?;
             }
         }
         for writer in &mut part_writers {
@@ -234,10 +262,16 @@ impl QGramIndex {
         let mut emitted_postings = 0usize;
         for shard in 0..BUILD_SHARDS {
             let bytes = fs::read(parts.shard(shard))?;
-            if !bytes.len().is_multiple_of(BUILD_RECORD_BYTES) {
-                return Err(std::io::Error::other("partial q-gram build record"));
-            }
-            let records = bytes.len() / BUILD_RECORD_BYTES;
+            let mut local_counts = vec![0u32; BUILD_SHARD_BUCKETS];
+            let records = walk_build_records(&bytes, |bucket, _| {
+                let count = local_counts
+                    .get_mut(bucket)
+                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket out of range"))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket exceeds u32"))?;
+                Ok(())
+            })?;
             let first_bucket = shard * BUILD_SHARD_BUCKETS;
             let expected_records = offsets[first_bucket + BUILD_SHARD_BUCKETS]
                 .checked_sub(offsets[first_bucket])
@@ -249,13 +283,6 @@ impl QGramIndex {
             emitted_postings = emitted_postings
                 .checked_add(records)
                 .ok_or_else(|| std::io::Error::other("q-gram emitted posting count overflow"))?;
-            let mut local_counts = vec![0u32; BUILD_SHARD_BUCKETS];
-            for record in bytes.chunks_exact(BUILD_RECORD_BYTES) {
-                let bucket = u16::from_le_bytes([record[0], record[1]]) as usize;
-                local_counts[bucket] = local_counts[bucket]
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("q-gram shard bucket exceeds u32"))?;
-            }
             let mut local_offsets = Vec::with_capacity(BUILD_SHARD_BUCKETS + 1);
             local_offsets.push(0u32);
             for count in local_counts {
@@ -274,15 +301,14 @@ impl QGramIndex {
             );
             let mut positions = local_offsets[..BUILD_SHARD_BUCKETS].to_vec();
             let mut postings = vec![0u32; records];
-            for record in bytes.chunks_exact(BUILD_RECORD_BYTES) {
-                let bucket = u16::from_le_bytes([record[0], record[1]]) as usize;
-                let slot = u32::from_le_bytes([record[2], record[3], record[4], record[5]]);
+            walk_build_records(&bytes, |bucket, slot| {
                 let position = &mut positions[bucket];
                 postings[*position as usize] = slot;
                 *position = position
                     .checked_add(1)
                     .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
-            }
+                Ok(())
+            })?;
             for local_bucket in 0..BUILD_SHARD_BUCKETS {
                 byte_offsets.push(u32::try_from(encoded_bytes).map_err(|_| {
                     std::io::Error::other("encoded q-gram exceeds u32 byte offsets")
@@ -758,6 +784,47 @@ fn encode_var_u32(mut value: u32, output: &mut Vec<u8>) {
     output.push(value as u8);
 }
 
+fn encode_var_u32_slice(mut value: u32, output: &mut [u8]) -> usize {
+    debug_assert!(output.len() >= 5);
+    let mut length = 0;
+    while value >= 0x80 {
+        output[length] = (value as u8 & 0x7f) | 0x80;
+        length += 1;
+        value >>= 7;
+    }
+    output[length] = value as u8;
+    length + 1
+}
+
+fn walk_build_records(
+    bytes: &[u8],
+    mut visit: impl FnMut(usize, u32) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    let mut position = 0;
+    let mut previous_slot = 0u32;
+    let mut records = 0usize;
+    while position < bytes.len() {
+        let bucket = bytes
+            .get(position..position + 2)
+            .and_then(|value| value.try_into().ok())
+            .map(u16::from_le_bytes)
+            .ok_or_else(|| std::io::Error::other("partial q-gram build bucket"))?
+            as usize;
+        position += 2;
+        let delta = read_var_u32(bytes, &mut position, bytes.len())
+            .ok_or_else(|| std::io::Error::other("partial q-gram build slot"))?;
+        let slot = previous_slot
+            .checked_add(delta)
+            .ok_or_else(|| std::io::Error::other("q-gram build slot overflow"))?;
+        visit(bucket, slot)?;
+        previous_slot = slot;
+        records = records
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("q-gram build record count overflow"))?;
+    }
+    Ok(records)
+}
+
 fn read_var_u32(bytes: &[u8], position: &mut usize, end: usize) -> Option<u32> {
     let mut value = 0u32;
     for shift in [0, 7, 14, 21, 28] {
@@ -850,6 +917,50 @@ mod tests {
             );
         }
         assert_eq!(position, bytes.len());
+    }
+
+    #[test]
+    fn build_shard_records_round_trip_monotone_slots() {
+        let dir = TempDir::new();
+        let path = dir.0.join("shard.part");
+        let expected = [
+            (0u16, 0u32),
+            (17, 0x7f),
+            (u16::MAX, 0x80),
+            (42, 0x4000),
+            (7, 0x4000),
+            (9, u32::MAX),
+        ];
+        {
+            let mut writer = BuildShardWriter::create(&path).expect("create shard writer");
+            for (bucket, slot) in expected {
+                writer.write(bucket, slot).expect("write shard record");
+            }
+            writer.flush().expect("flush shard writer");
+        }
+
+        let bytes = std::fs::read(path).expect("read shard records");
+        let mut actual = Vec::new();
+        let records = walk_build_records(&bytes, |bucket, slot| {
+            actual.push((bucket as u16, slot));
+            Ok(())
+        })
+        .expect("decode shard records");
+
+        assert_eq!(records, expected.len());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn build_shard_records_reject_non_monotone_and_partial_input() {
+        let dir = TempDir::new();
+        let path = dir.0.join("shard.part");
+        let mut writer = BuildShardWriter::create(&path).expect("create shard writer");
+        writer.write(1, 10).expect("write first shard record");
+        assert!(writer.write(2, 9).is_err());
+
+        assert!(walk_build_records(&[1], |_, _| Ok(())).is_err());
+        assert!(walk_build_records(&[1, 0, 0x80], |_, _| Ok(())).is_err());
     }
 
     #[test]
