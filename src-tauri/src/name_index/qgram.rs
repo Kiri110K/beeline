@@ -6,7 +6,7 @@
 
 use std::{
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -18,10 +18,12 @@ use super::{
     query::{self, Cancel},
 };
 
-const MAGIC: &[u8; 8] = b"BLQGM001";
-const HEADER_BYTES: usize = 40;
+const MAGIC: &[u8; 8] = b"BLQGM002";
+const HEADER_BYTES: usize = 64;
 const BUCKETS: usize = 1 << 20;
 const RETAINED_WORKSPACES: usize = 1;
+const SKIP_STRIDE: usize = 64;
+const SKIP_RECORD_BYTES: usize = 8;
 const BUILD_SHARDS: usize = 64;
 const BUILD_SHARD_BUCKETS: usize = BUCKETS / BUILD_SHARDS;
 const BUILD_RECORD_BYTES: usize = 6;
@@ -34,9 +36,19 @@ pub struct CandidateSet {
     pub aborted: bool,
 }
 
+#[derive(Clone, Copy)]
+struct PostingRange {
+    start: usize,
+    end: usize,
+    skip_start: usize,
+    skip_end: usize,
+}
+
 pub struct QGramIndex {
     mapping: MappedFile,
     postings_offset: usize,
+    skip_offsets_offset: usize,
+    skips_offset: usize,
     postings: usize,
     source_entries: usize,
     workspaces: Mutex<Vec<DenseWorkspace>>,
@@ -65,6 +77,10 @@ impl BuildParts {
 
     fn shard(&self, shard: usize) -> PathBuf {
         self.path.join(format!("{shard:02}.part"))
+    }
+
+    fn skips(&self) -> PathBuf {
+        self.path.join("skips.part")
     }
 }
 
@@ -101,14 +117,29 @@ impl QGramIndex {
             return None;
         }
         let postings = read_u64(bytes, 16)? as usize;
-        let postings_offset = HEADER_BYTES.checked_add((BUCKETS + 1).checked_mul(8)?)?;
-        let expected = postings_offset.checked_add(postings.checked_mul(4)?)?;
+        let encoded_bytes = read_u64(bytes, 40)? as usize;
+        let skip_count = read_u64(bytes, 48)? as usize;
+        if read_u64(bytes, 56)? as usize != SKIP_STRIDE {
+            return None;
+        }
+        let offsets_bytes = (BUCKETS + 1).checked_mul(8)?;
+        let skip_offsets_offset = HEADER_BYTES.checked_add(offsets_bytes)?;
+        let postings_offset = skip_offsets_offset.checked_add(offsets_bytes)?;
+        let skips_offset = postings_offset.checked_add(encoded_bytes)?;
+        let expected = skips_offset.checked_add(skip_count.checked_mul(SKIP_RECORD_BYTES)?)?;
         if bytes.len() != expected {
+            return None;
+        }
+        if read_u64(bytes, HEADER_BYTES + BUCKETS * 8)? as usize != encoded_bytes
+            || read_u64(bytes, skip_offsets_offset + BUCKETS * 8)? as usize != skip_count
+        {
             return None;
         }
         Some(Self {
             mapping,
             postings_offset,
+            skip_offsets_offset,
+            skips_offset,
             postings,
             source_entries,
             workspaces: Mutex::new(Vec::new()),
@@ -187,10 +218,17 @@ impl QGramIndex {
         writer.write_all(&(posting_count as u64).to_le_bytes())?;
         writer.write_all(&source_hash.to_le_bytes())?;
         writer.write_all(&(source_entries as u64).to_le_bytes())?;
-        for &offset in &offsets {
-            writer.write_all(&u64::from(offset).to_le_bytes())?;
-        }
+        writer.write_all(&0u64.to_le_bytes())?; // encoded posting bytes, backfilled below
+        writer.write_all(&0u64.to_le_bytes())?; // skip record count, backfilled below
+        writer.write_all(&(SKIP_STRIDE as u64).to_le_bytes())?;
+        write_zeroes(&mut writer, (BUCKETS + 1) * 16)?;
+
         let mut encoded = Vec::with_capacity(ENCODED_POSTING_SLOTS * 4);
+        let mut byte_offsets = Vec::with_capacity(BUCKETS + 1);
+        let mut skip_offsets = Vec::with_capacity(BUCKETS + 1);
+        let mut skip_writer = BufWriter::new(File::create(parts.skips())?);
+        let mut encoded_bytes = 0u64;
+        let mut skip_count = 0u64;
         let mut emitted_postings = 0usize;
         for shard in 0..BUILD_SHARDS {
             let bytes = fs::read(parts.shard(shard))?;
@@ -243,16 +281,74 @@ impl QGramIndex {
                     .checked_add(1)
                     .ok_or_else(|| std::io::Error::other("q-gram shard position exceeds u32"))?;
             }
-            for chunk in postings.chunks(ENCODED_POSTING_SLOTS) {
-                encoded.clear();
-                for slot in chunk {
-                    encoded.extend_from_slice(&slot.to_le_bytes());
+            for local_bucket in 0..BUILD_SHARD_BUCKETS {
+                byte_offsets.push(encoded_bytes);
+                skip_offsets.push(skip_count);
+                let bucket_start = encoded_bytes;
+                let start = local_offsets[local_bucket] as usize;
+                let end = local_offsets[local_bucket + 1] as usize;
+                let mut previous = 0u32;
+                for (index, &slot) in postings[start..end].iter().enumerate() {
+                    let delta = if index == 0 {
+                        slot
+                    } else {
+                        slot.checked_sub(previous).ok_or_else(|| {
+                            std::io::Error::other("q-gram postings are not sorted")
+                        })?
+                    };
+                    let before = encoded.len();
+                    encode_var_u32(delta, &mut encoded);
+                    encoded_bytes = encoded_bytes
+                        .checked_add((encoded.len() - before) as u64)
+                        .ok_or_else(|| std::io::Error::other("encoded q-gram size overflow"))?;
+                    if index.is_multiple_of(SKIP_STRIDE) {
+                        let after = u32::try_from(encoded_bytes - bucket_start).map_err(|_| {
+                            std::io::Error::other("q-gram bucket exceeds u32 encoded bytes")
+                        })?;
+                        skip_writer.write_all(&slot.to_le_bytes())?;
+                        skip_writer.write_all(&after.to_le_bytes())?;
+                        skip_count = skip_count
+                            .checked_add(1)
+                            .ok_or_else(|| std::io::Error::other("q-gram skip count overflow"))?;
+                    }
+                    previous = slot;
+                    if encoded.len() >= ENCODED_POSTING_SLOTS * 4 {
+                        writer.write_all(&encoded)?;
+                        encoded.clear();
+                    }
                 }
-                writer.write_all(&encoded)?;
             }
         }
         if emitted_postings != posting_count {
             return Err(std::io::Error::other("q-gram posting count mismatch"));
+        }
+        byte_offsets.push(encoded_bytes);
+        skip_offsets.push(skip_count);
+        if byte_offsets.len() != BUCKETS + 1 || skip_offsets.len() != BUCKETS + 1 {
+            return Err(std::io::Error::other("q-gram bucket offset count mismatch"));
+        }
+        if !encoded.is_empty() {
+            writer.write_all(&encoded)?;
+        }
+        skip_writer.flush()?;
+        drop(skip_writer);
+        let copied_skips = std::io::copy(&mut File::open(parts.skips())?, &mut writer)?;
+        let expected_skip_bytes = skip_count
+            .checked_mul(SKIP_RECORD_BYTES as u64)
+            .ok_or_else(|| std::io::Error::other("q-gram skip byte size overflow"))?;
+        if copied_skips != expected_skip_bytes {
+            return Err(std::io::Error::other("q-gram skip byte count mismatch"));
+        }
+
+        writer.seek(SeekFrom::Start(40))?;
+        writer.write_all(&encoded_bytes.to_le_bytes())?;
+        writer.write_all(&skip_count.to_le_bytes())?;
+        writer.seek(SeekFrom::Start(HEADER_BYTES as u64))?;
+        for offset in byte_offsets {
+            writer.write_all(&offset.to_le_bytes())?;
+        }
+        for offset in skip_offsets {
+            writer.write_all(&offset.to_le_bytes())?;
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
@@ -335,14 +431,35 @@ impl QGramIndex {
         }
     }
 
-    fn posting_range(&self, bucket: usize) -> (usize, usize) {
+    fn posting_byte_range(&self, bucket: usize) -> (usize, usize) {
         let bytes = self.mapping.bytes();
         let start =
             read_u64(bytes, HEADER_BYTES + bucket * 8).expect("validated q-gram offset") as usize;
         let end = read_u64(bytes, HEADER_BYTES + (bucket + 1) * 8).expect("validated q-gram offset")
             as usize;
-        debug_assert!(end <= self.postings);
+        debug_assert!(start <= end);
+        (self.postings_offset + start, self.postings_offset + end)
+    }
+
+    fn skip_range(&self, bucket: usize) -> (usize, usize) {
+        let bytes = self.mapping.bytes();
+        let start = read_u64(bytes, self.skip_offsets_offset + bucket * 8)
+            .expect("validated q-gram skip offset") as usize;
+        let end = read_u64(bytes, self.skip_offsets_offset + (bucket + 1) * 8)
+            .expect("validated q-gram skip offset") as usize;
+        debug_assert!(start <= end);
         (start, end)
+    }
+
+    fn posting_range(&self, bucket: usize) -> PostingRange {
+        let (start, end) = self.posting_byte_range(bucket);
+        let (skip_start, skip_end) = self.skip_range(bucket);
+        PostingRange {
+            start,
+            end,
+            skip_start,
+            skip_end,
+        }
     }
 
     /// Add one token's complete typo-safe q-gram candidates. Returns `true` when a newer
@@ -365,14 +482,19 @@ impl QGramIndex {
             .max(1);
         workspace.clear();
         for bucket in buckets {
-            let (start, end) = self.posting_range(bucket as usize);
-            for position in start..end {
+            let (mut position, end) = self.posting_byte_range(bucket as usize);
+            let mut previous = 0u32;
+            while position < end {
                 if posting_visits.is_multiple_of(4096) && cancel.superseded() {
                     return true;
                 }
                 *posting_visits += 1;
-                let slot = read_u32(self.mapping.bytes(), self.postings_offset + position * 4)
+                let delta = read_var_u32(self.mapping.bytes(), &mut position, end)
                     .expect("validated q-gram posting");
+                let slot = previous
+                    .checked_add(delta)
+                    .expect("validated q-gram posting delta");
+                previous = slot;
                 let Some(count) = workspace.counts.get_mut(slot as usize) else {
                     continue;
                 };
@@ -411,23 +533,27 @@ impl QGramIndex {
             .into_iter()
             .map(|bucket| self.posting_range(bucket as usize))
             .collect::<Vec<_>>();
-        ranges.sort_unstable_by_key(|(start, end)| end - start);
-        let (start, end) = ranges[0];
+        ranges.sort_unstable_by_key(|range| range.end - range.start);
+        let mut position = ranges[0].start;
+        let end = ranges[0].end;
         let bytes = self.mapping.bytes();
-        for position in start..end {
+        let mut previous = 0u32;
+        while position < end {
             if posting_visits.is_multiple_of(4096) && cancel.superseded() {
                 return true;
             }
             *posting_visits += 1;
-            let slot = read_u32(bytes, self.postings_offset + position * 4)
-                .expect("validated q-gram posting");
+            let delta = read_var_u32(bytes, &mut position, end).expect("validated q-gram posting");
+            let slot = previous
+                .checked_add(delta)
+                .expect("validated q-gram posting delta");
+            previous = slot;
             let mut present = true;
-            for &(other_start, other_end) in &ranges[1..] {
+            for range in &ranges[1..] {
                 let Some(found) = posting_contains(
                     bytes,
-                    self.postings_offset,
-                    other_start,
-                    other_end,
+                    self.skips_offset,
+                    range,
                     slot,
                     posting_visits,
                     cancel,
@@ -449,13 +575,14 @@ impl QGramIndex {
 
 fn posting_contains(
     bytes: &[u8],
-    postings_offset: usize,
-    mut lo: usize,
-    mut hi: usize,
+    skips_offset: usize,
+    range: &PostingRange,
     slot: u32,
     posting_visits: &mut usize,
     cancel: &Cancel<'_>,
 ) -> Option<bool> {
+    let mut lo = range.skip_start;
+    let mut hi = range.skip_end;
     while lo < hi {
         if posting_visits.is_multiple_of(4096) && cancel.superseded() {
             return None;
@@ -463,11 +590,44 @@ fn posting_contains(
         let mid = lo + (hi - lo) / 2;
         *posting_visits += 1;
         let candidate =
-            read_u32(bytes, postings_offset + mid * 4).expect("validated q-gram posting");
-        match candidate.cmp(&slot) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
+            read_u32(bytes, skips_offset + mid * SKIP_RECORD_BYTES).expect("validated q-gram skip");
+        if candidate <= slot {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == range.skip_start {
+        return Some(false);
+    }
+    let checkpoint = lo - 1;
+    let record = skips_offset + checkpoint * SKIP_RECORD_BYTES;
+    let mut previous = read_u32(bytes, record).expect("validated q-gram skip");
+    if previous == slot {
+        return Some(true);
+    }
+    let after = read_u32(bytes, record + 4).expect("validated q-gram skip") as usize;
+    let mut position = range.start + after;
+    let decode_end = if checkpoint + 1 < range.skip_end {
+        let next_record = skips_offset + (checkpoint + 1) * SKIP_RECORD_BYTES;
+        range.start + read_u32(bytes, next_record + 4).expect("validated q-gram skip") as usize
+    } else {
+        range.end
+    };
+    while position < decode_end {
+        if posting_visits.is_multiple_of(4096) && cancel.superseded() {
+            return None;
+        }
+        *posting_visits += 1;
+        let delta =
+            read_var_u32(bytes, &mut position, decode_end).expect("validated q-gram posting");
+        previous = previous
+            .checked_add(delta)
+            .expect("validated q-gram posting delta");
+        match previous.cmp(&slot) {
+            std::cmp::Ordering::Less => {}
             std::cmp::Ordering::Equal => return Some(true),
+            std::cmp::Ordering::Greater => return Some(false),
         }
     }
     Some(false)
@@ -561,6 +721,40 @@ fn bucket(gram: &[char]) -> u32 {
     (hash as usize & (BUCKETS - 1)) as u32
 }
 
+fn write_zeroes(writer: &mut impl Write, mut bytes: usize) -> std::io::Result<()> {
+    const ZEROES: [u8; 8192] = [0; 8192];
+    while bytes > 0 {
+        let chunk = bytes.min(ZEROES.len());
+        writer.write_all(&ZEROES[..chunk])?;
+        bytes -= chunk;
+    }
+    Ok(())
+}
+
+fn encode_var_u32(mut value: u32, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn read_var_u32(bytes: &[u8], position: &mut usize, end: usize) -> Option<u32> {
+    let mut value = 0u32;
+    for shift in [0, 7, 14, 21, 28] {
+        let byte = *bytes.get(*position..end)?.first()?;
+        *position += 1;
+        if shift == 28 && byte & 0xf0 != 0 {
+            return None;
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(offset..offset + 8)?.try_into().ok()?,
@@ -610,6 +804,33 @@ mod tests {
         assert!(gram_buckets("ab").is_empty());
         assert_eq!(gram_buckets("abcd").len(), 2);
         assert_eq!(significant_len("work/w"), 5);
+    }
+
+    #[test]
+    fn var_u32_round_trips_boundaries() {
+        let values = [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            0x1f_ffff,
+            0x20_0000,
+            u32::MAX,
+        ];
+        let mut bytes = Vec::new();
+        for value in values {
+            encode_var_u32(value, &mut bytes);
+        }
+        let mut position = 0;
+        for value in values {
+            assert_eq!(
+                read_var_u32(&bytes, &mut position, bytes.len()),
+                Some(value)
+            );
+        }
+        assert_eq!(position, bytes.len());
     }
 
     #[test]
