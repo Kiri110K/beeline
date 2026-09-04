@@ -324,6 +324,23 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   43 MiB, startup peak 78 MiB. Rollback bundle:
   `/private/tmp/Beeline-before-qgram-u32-20260905.app`; предыдущий sidecar:
   `/private/tmp/beeline-home-qgram-v2-20260905.qgram`.
+- PR #68 влит в main как `6eb1e9f`. Durable overlay journal теперь сохраняет
+  один collision-proof logical marker на dirty Junk directory вместо каждого
+  изменённого child path; Normal/Hidden paths и первый Junk component остаются
+  точными. Marker содержит невозможный в имени файла NUL и при replay напрямую
+  восстанавливает dirty directory даже после изменения Junk patterns. Старый
+  journal атомарно coalesce-ится при load. На production-копии: 49,838 → 8,983
+  records, 6,951,098 → 1,145,256 bytes, release apply 960 → 305 мс. Первый
+  migration load+apply около 594 мс; final Item count и все 560 dirty directories
+  совпали. 138 Rust passed / 12 ignored, fmt, clippy, typecheck и lint зелёные.
+- Signed bundle `6eb1e9f` установлен, backup:
+  `/private/tmp/Beeline-before-junk-journal-coalescing-20260905.app`; исходный
+  journal: `/private/tmp/beeline-overlay-before-coalescing-20260905.ndjson`.
+  Реальный первый startup уплотнил 50,646 records / 7,056,118 bytes до 9,670 /
+  1,239,666, несмотря на 11,283 новых catch-up paths. Replay применил 4,076
+  logical entries за 617 мс против 973 мс предыдущего старта с меньшим catch-up.
+  Q-gram loaded без rebuild, prewarm 16 мс, full diff skipped. PID 75911 hidden,
+  0 windows/not frontmost; после Junk drain physical footprint 124 MiB, CPU 0%.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
