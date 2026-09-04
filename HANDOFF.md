@@ -304,6 +304,12 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   skipped. Через 19 секунд process physical footprint 42 MiB, peak 74 MiB.
   Rollback: `/private/tmp/Beeline-before-qgram-varint-20260905.app` и
   `/private/tmp/beeline-home-qgram-v1-20260905.qgram`.
+- Независимый UI-pass установленного v2 sidecar прошёл в одной живой сессии:
+  `ьуерщвщдщпн` дал methodology.md rank 1, `work wip` и `work/wip` дали
+  `/Users/kiri110k/work/wip` rank 1. Между запросами нет stale rows, пустой
+  выдачи или дублированных exact paths; freeze/crash/focus loss не было. После
+  Escape PID 53884 остался жив, hidden/0 windows/not frontmost. Отчёт и три
+  проверенных скриншота: `/private/tmp/beeline-qgram-v2-ui.qp4vbb/`.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
