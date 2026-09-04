@@ -1192,7 +1192,7 @@ fn scan_fuzzy_slots(
 ) -> (Vec<Candidate>, usize, bool) {
     let mut candidates = Vec::new();
     let mut scratch = String::new();
-    let mut edit_scratch = EditScratch::default();
+    let mut fuzzy_scratch = FuzzyScratch::default();
     let mut dir_masks = new_dir_masks(index, prep);
     let mut scanned = 0usize;
     for (position, &slot) in slots.iter().enumerate() {
@@ -1212,15 +1212,7 @@ fn scan_fuzzy_slots(
         scanned += 1;
         if let Some((mut score, path, text_evidence)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch).or_else(|| {
-                score_fuzzy_entry(
-                    index,
-                    item,
-                    prep,
-                    ctx,
-                    short_fuzzy,
-                    &mut scratch,
-                    &mut edit_scratch,
-                )
+                score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut fuzzy_scratch)
             })
         {
             score += ctx.retrieval.boost(slot, ctx.config);
@@ -1257,25 +1249,29 @@ fn score_fuzzy_entry(
     prep: &Prepared,
     ctx: &RankContext,
     short_fuzzy: bool,
-    name_lower: &mut String,
-    edit_scratch: &mut EditScratch,
+    fuzzy_scratch: &mut FuzzyScratch,
 ) -> Option<(i64, String, TextMatchEvidence)> {
     // Every direct, path, and corrected-layout interpretation inspects the same Item name.
     // Keep its lowercase form in the worker's reusable buffer instead of allocating once per
     // interpretation.
-    lower_into(item.entry.name, name_lower);
+    lower_into(item.entry.name, &mut fuzzy_scratch.name_lower);
+    let name_lower = fuzzy_scratch.name_lower.as_str();
     // The direct query, its ordered Path Interpretation, and every layout variant all
     // inspect the same directory chain. Lowercase that chain once per Item.
-    let ancestors = (prep.path_shaped || prep.tokens.len() > 1)
-        .then(|| ancestor_names(index, item.entry.parent));
-    let ancestors = ancestors.as_deref().unwrap_or_default();
+    let ancestors = if prep.path_shaped || prep.tokens.len() > 1 {
+        fuzzy_scratch
+            .ancestors
+            .lower_names(index, item.entry.parent)
+    } else {
+        &[]
+    };
     let (quality, corrected, path_scope) = if prep.path_shaped {
         let quality = fuzzy_path_interpretation(
             name_lower,
             &prep.segments,
             ancestors,
             short_fuzzy,
-            edit_scratch,
+            &mut fuzzy_scratch.edit,
             &prep.text,
         )?;
         (quality, false, true)
@@ -1285,7 +1281,7 @@ fn score_fuzzy_entry(
             &prep.tokens,
             ancestors,
             short_fuzzy,
-            edit_scratch,
+            &mut fuzzy_scratch.edit,
             &prep.text,
         );
         best = best.max(fuzzy_path_interpretation(
@@ -1293,7 +1289,7 @@ fn score_fuzzy_entry(
             &prep.tokens,
             ancestors,
             short_fuzzy,
-            edit_scratch,
+            &mut fuzzy_scratch.edit,
             &prep.text,
         ));
         let mut corrected = false;
@@ -1303,7 +1299,7 @@ fn score_fuzzy_entry(
                 tokens,
                 ancestors,
                 short_fuzzy,
-                edit_scratch,
+                &mut fuzzy_scratch.edit,
                 &prep.text,
             );
             candidate = candidate.max(fuzzy_path_interpretation(
@@ -1311,7 +1307,7 @@ fn score_fuzzy_entry(
                 tokens,
                 ancestors,
                 short_fuzzy,
-                edit_scratch,
+                &mut fuzzy_scratch.edit,
                 &prep.text,
             ));
             if candidate > best {
@@ -1322,7 +1318,13 @@ fn score_fuzzy_entry(
         (best?, corrected, false)
     } else {
         let direct = prep.tokens.first().and_then(|token| {
-            fuzzy_lower_name_quality(name_lower, token, short_fuzzy, edit_scratch, &prep.text)
+            fuzzy_lower_name_quality(
+                name_lower,
+                token,
+                short_fuzzy,
+                &mut fuzzy_scratch.edit,
+                &prep.text,
+            )
         });
         let mut best = direct;
         let mut corrected = false;
@@ -1331,7 +1333,7 @@ fn score_fuzzy_entry(
                 name_lower,
                 variant,
                 short_fuzzy,
-                edit_scratch,
+                &mut fuzzy_scratch.edit,
                 &prep.text,
             );
             if candidate > best {
@@ -1513,6 +1515,41 @@ struct EditScratch {
     left_chars: Vec<char>,
     right_chars: Vec<char>,
     rows: EditRows,
+}
+
+#[derive(Default)]
+struct FuzzyScratch {
+    name_lower: String,
+    edit: EditScratch,
+    ancestors: AncestorScratch,
+}
+
+#[derive(Default)]
+struct AncestorScratch {
+    dirs: Vec<DirId>,
+    names: Vec<String>,
+}
+
+impl AncestorScratch {
+    /// Return lowercase component names from the root down to `dir`, retaining every backing
+    /// allocation for the worker's next candidate.
+    fn lower_names(&mut self, index: &IndexData, mut dir: DirId) -> &[String] {
+        self.dirs.clear();
+        while dir != 0 {
+            self.dirs.push(dir);
+            dir = index.node(dir).expect("indexed directory node").parent;
+        }
+        self.dirs.reverse();
+
+        while self.names.len() < self.dirs.len() {
+            self.names.push(String::new());
+        }
+        for (&dir, name) in self.dirs.iter().zip(&mut self.names) {
+            let node = index.node(dir).expect("indexed directory node");
+            lower_into(node.name, name);
+        }
+        &self.names[..self.dirs.len()]
+    }
 }
 
 impl EditScratch {
