@@ -272,6 +272,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> 
         aliases: &aliases,
         retrieval,
         memory: super::search_memory::MemoryEvidence::empty(),
+        config: RankContext::empty().config,
     };
     for case in &cases {
         for _ in 0..config.warmups {
