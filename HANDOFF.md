@@ -267,6 +267,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   unlisted siblings, exact-path вариант это теряет. 15,047 мс в installed app
   объясняются background-QoS throttling; drain запускается только после quiet на
   AC или синхронно при Junk-targeting query. Текущий main оставлен без изменений.
+- PR #65 влит в main как `e9bcfca`. Q-gram builder больше не держит глобальный
+  raw postings vector: второй index pass пишет 6-byte `(local bucket, slot)` в 64
+  временных shard, затем каждый shard counting-sort-ится и последовательно
+  дописывается в прежний sidecar format. Production output побитно идентичен:
+  554,313,828 bytes, SHA-256 `33160717b15d8de5a5b8e63d818e38f2b88380cdb350874f5933c0ee5a792107`.
+  Peak physical 536.09 → 79.83 MiB (-85.1%), max RSS 864.89 → 412.88 MiB,
+  wall 18.55 → 18.41 с; repeat 17.06 с / 79.92 MiB. Цена — 780.95 MiB temp
+  records только во время rebuild; RAII cleanup работает на success/error. Три
+  одноразовых 529 MiB sidecar удалены после SHA-сверки, `.time`/stdout сохранены
+  в `/private/tmp` под prefix `beeline-qgram-sharded-`. Полный checkpoint: 134
+  Rust passed / 11 ignored, fmt и clippy зелёные.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
