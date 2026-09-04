@@ -370,8 +370,13 @@ pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<(), Stri
         }
         "replay" => {
             let path = next_path(&mut arguments)?;
+            let alternative = arguments.next().map(PathBuf::from);
             no_more(&mut arguments)?;
-            println!("{}", super::ranking_trace::replay(&path)?);
+            let alternative = alternative.as_deref().map(load_explicit).transpose()?;
+            println!(
+                "{}",
+                super::ranking_trace::replay(&path, alternative.as_ref())?
+            );
         }
         _ => return Err(cli_usage()),
     }
@@ -403,7 +408,7 @@ fn no_more(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), String>
 }
 
 fn cli_usage() -> String {
-    "usage: beeline --ranker-config default | validate <file> | explain <file> | compare <left> <right> | apply <file> <app-data-dir> | replay <trace>"
+    "usage: beeline --ranker-config default | validate <file> | explain <file> | compare <left> <right> | apply <file> <app-data-dir> | replay <trace> [alternative-config]"
         .to_owned()
 }
 

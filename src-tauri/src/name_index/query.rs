@@ -148,6 +148,17 @@ impl RetrievalSignals {
         }
         (context, general_usage)
     }
+
+    fn contains(&self, slot: u32, source: RetrievalSource) -> bool {
+        let bit = match source {
+            RetrievalSource::CurrentLocation => 1,
+            RetrievalSource::PinnedAnchor => 1 << 1,
+            RetrievalSource::Recents => 1 << 2,
+        };
+        self.by_slot
+            .get(&slot)
+            .is_some_and(|sources| sources & bit != 0)
+    }
 }
 
 impl RankContext<'static> {
@@ -183,6 +194,8 @@ pub struct SearchHit {
     pub score: i64,
     #[serde(skip)]
     pub contributions: ScoreContributions,
+    #[serde(skip)]
+    pub evidence: ScoreEvidence,
 }
 
 impl PartialEq for SearchHit {
@@ -208,6 +221,284 @@ pub struct ScoreContributions {
     pub penalties: i64,
 }
 
+/// Config-independent evidence retained for the small ranked result set. It is enough to
+/// re-apply every production weight without touching the filesystem or Name Index.
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoreEvidence {
+    pub text_match: TextMatchEvidence,
+    pub search_memory_milli: i64,
+    pub learned_usage_milli: i64,
+    pub visit_milli: i64,
+    pub current_location: bool,
+    pub pinned_anchor: bool,
+    pub recents: bool,
+    pub known_place: bool,
+    pub alias: bool,
+    pub item_kind_applied: bool,
+    pub is_directory: bool,
+    pub tier: String,
+    pub tier_penalty_waived: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TextMatchFeature {
+    #[default]
+    None,
+    ExactName,
+    PrefixName,
+    SubstringName,
+    TypoName,
+    PathComponent,
+    ExistingPath,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TextMatchEvidence {
+    pub feature: TextMatchFeature,
+    pub typo_edits: u8,
+    pub all_tokens_in_name: bool,
+    pub path_scope: bool,
+    pub layout_corrected: bool,
+}
+
+impl TextMatchEvidence {
+    fn contribution(&self, config: &RankerConfig) -> i64 {
+        self.contribution_with_weights(&config.text_match)
+    }
+
+    fn contribution_with_weights(&self, weights: &TextMatchWeights) -> i64 {
+        let mut contribution = match self.feature {
+            TextMatchFeature::None => 0,
+            TextMatchFeature::ExactName => weights.exact_name,
+            TextMatchFeature::PrefixName => weights.prefix_name,
+            TextMatchFeature::SubstringName => weights.substring_name,
+            TextMatchFeature::TypoName => weights.typo_name.saturating_sub(
+                i64::from(self.typo_edits).saturating_mul(weights.typo_edit_penalty),
+            ),
+            TextMatchFeature::PathComponent => weights.path_component,
+            TextMatchFeature::ExistingPath => weights.existing_path,
+        };
+        if self.all_tokens_in_name {
+            contribution = contribution.saturating_add(weights.all_tokens_in_name);
+        }
+        if self.path_scope {
+            contribution = contribution.saturating_add(weights.path_scope);
+        }
+        if self.layout_corrected {
+            contribution = contribution.saturating_sub(weights.layout_correction_penalty);
+        }
+        contribution
+    }
+}
+
+impl ScoreEvidence {
+    /// Re-apply every non-text production weight. `text_match_resolved` is intentionally
+    /// carried through until the matcher emits decomposed literal/fuzzy facts too.
+    pub fn contributions(&self, config: &RankerConfig) -> ScoreContributions {
+        let search_memory = self
+            .search_memory_milli
+            .saturating_mul(config.search_memory.max)
+            / 1_000;
+        let learned_usage = self
+            .learned_usage_milli
+            .saturating_mul(config.search_memory.usage_max)
+            / 1_000;
+        let visit = self
+            .visit_milli
+            .saturating_mul(config.general_usage.visit_max)
+            / 1_000;
+        let recents = i64::from(self.recents).saturating_mul(config.general_usage.recents);
+        let current =
+            i64::from(self.current_location).saturating_mul(config.context.current_location);
+        let pinned = i64::from(self.pinned_anchor).saturating_mul(config.context.pinned_anchor);
+        let known = i64::from(self.known_place).saturating_mul(config.context.known_place);
+        let alias = i64::from(self.alias).saturating_mul(config.alias.exact);
+        let item_kind = if !self.item_kind_applied {
+            0
+        } else if self.is_directory {
+            config.item_kind.directory
+        } else {
+            config.item_kind.file
+        };
+        let penalties = if self.tier_penalty_waived {
+            0
+        } else {
+            match self.tier.as_str() {
+                "hidden" => config.penalties.hidden.min(config.penalties.total_cap),
+                "junk" => config.penalties.junk.min(config.penalties.total_cap),
+                _ => 0,
+            }
+        };
+        ScoreContributions {
+            text_match: self.text_match.contribution(config),
+            search_memory,
+            general_usage: learned_usage.saturating_add(visit).saturating_add(recents),
+            context: current.saturating_add(pinned).saturating_add(known),
+            alias,
+            item_kind,
+            penalties,
+        }
+    }
+
+    pub fn weighted_features(&self, config: &RankerConfig) -> Vec<WeightedFeature> {
+        let mut features = Vec::with_capacity(12);
+        let mut push = |feature: &'static str, raw: i64, normalized_milli: i64, weight: i64| {
+            features.push(WeightedFeature {
+                feature: feature.to_owned(),
+                raw,
+                normalized_milli,
+                weight,
+                contribution: normalized_milli.saturating_mul(weight) / 1_000,
+            });
+        };
+        let (text_feature, text_weight) = match self.text_match.feature {
+            TextMatchFeature::None => (None, 0),
+            TextMatchFeature::ExactName => {
+                (Some("text_match.exact_name"), config.text_match.exact_name)
+            }
+            TextMatchFeature::PrefixName => (
+                Some("text_match.prefix_name"),
+                config.text_match.prefix_name,
+            ),
+            TextMatchFeature::SubstringName => (
+                Some("text_match.substring_name"),
+                config.text_match.substring_name,
+            ),
+            TextMatchFeature::TypoName => {
+                (Some("text_match.typo_name"), config.text_match.typo_name)
+            }
+            TextMatchFeature::PathComponent => (
+                Some("text_match.path_component"),
+                config.text_match.path_component,
+            ),
+            TextMatchFeature::ExistingPath => (
+                Some("text_match.existing_path"),
+                config.text_match.existing_path,
+            ),
+        };
+        if let Some(feature) = text_feature {
+            push(feature, 1, 1_000, text_weight);
+        }
+        if self.text_match.typo_edits > 0 {
+            push(
+                "text_match.typo_edit_penalty",
+                i64::from(self.text_match.typo_edits),
+                -1_000 * i64::from(self.text_match.typo_edits),
+                config.text_match.typo_edit_penalty,
+            );
+        }
+        if self.text_match.all_tokens_in_name {
+            push(
+                "text_match.all_tokens_in_name",
+                1,
+                1_000,
+                config.text_match.all_tokens_in_name,
+            );
+        }
+        if self.text_match.path_scope {
+            push(
+                "text_match.path_scope",
+                1,
+                1_000,
+                config.text_match.path_scope,
+            );
+        }
+        if self.text_match.layout_corrected {
+            push(
+                "text_match.layout_correction_penalty",
+                1,
+                -1_000,
+                config.text_match.layout_correction_penalty,
+            );
+        }
+        if self.search_memory_milli > 0 {
+            push(
+                "search_memory.association",
+                self.search_memory_milli,
+                self.search_memory_milli,
+                config.search_memory.max,
+            );
+        }
+        if self.learned_usage_milli > 0 {
+            push(
+                "general_usage.learned",
+                self.learned_usage_milli,
+                self.learned_usage_milli,
+                config.search_memory.usage_max,
+            );
+        }
+        if self.visit_milli > 0 {
+            push(
+                "general_usage.visits",
+                self.visit_milli,
+                self.visit_milli,
+                config.general_usage.visit_max,
+            );
+        }
+        if self.recents {
+            push(
+                "general_usage.recents",
+                1,
+                1_000,
+                config.general_usage.recents,
+            );
+        }
+        if self.current_location {
+            push(
+                "context.current_location",
+                1,
+                1_000,
+                config.context.current_location,
+            );
+        }
+        if self.pinned_anchor {
+            push(
+                "context.pinned_anchor",
+                1,
+                1_000,
+                config.context.pinned_anchor,
+            );
+        }
+        if self.known_place {
+            push("context.known_place", 1, 1_000, config.context.known_place);
+        }
+        if self.alias {
+            push("alias.exact", 1, 1_000, config.alias.exact);
+        }
+        if self.item_kind_applied {
+            let (feature, weight) = if self.is_directory {
+                ("item_kind.directory", config.item_kind.directory)
+            } else {
+                ("item_kind.file", config.item_kind.file)
+            };
+            push(feature, 1, 1_000, weight);
+        }
+        let penalty = match self.tier.as_str() {
+            "hidden" => Some(("penalties.hidden", config.penalties.hidden)),
+            "junk" => Some(("penalties.junk", config.penalties.junk)),
+            _ => None,
+        };
+        if let Some((feature, weight)) = penalty {
+            let applied = if self.tier_penalty_waived { 0 } else { -1_000 };
+            push(feature, 1, applied, weight.min(config.penalties.total_cap));
+        }
+        features
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WeightedFeature {
+    pub feature: String,
+    pub raw: i64,
+    pub normalized_milli: i64,
+    pub weight: i64,
+    pub contribution: i64,
+}
+
 impl ScoreContributions {
     pub fn total(&self) -> i64 {
         self.text_match
@@ -224,6 +515,7 @@ impl ScoreContributions {
 struct Candidate {
     score: i64,
     contributions: ScoreContributions,
+    evidence: ScoreEvidence,
     path: String,
     name: String,
     is_directory: bool,
@@ -885,6 +1177,7 @@ fn fuzzy_hits(candidates: &[Candidate]) -> Vec<SearchHit> {
             tier: candidate.tier.as_str(),
             score: candidate.score,
             contributions: candidate.contributions.clone(),
+            evidence: candidate.evidence.clone(),
         })
         .collect()
 }
@@ -917,13 +1210,13 @@ fn scan_fuzzy_slots(
             continue;
         }
         scanned += 1;
-        if let Some((mut score, path)) =
+        if let Some((mut score, path, text_evidence)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch).or_else(|| {
                 score_fuzzy_entry(index, item, prep, ctx, short_fuzzy, &mut edit_scratch)
             })
         {
             score += ctx.retrieval.boost(slot, ctx.config);
-            let contributions = score_contributions(
+            let (contributions, evidence) = score_contributions(
                 score,
                 slot,
                 &path,
@@ -933,10 +1226,12 @@ fn scan_fuzzy_slots(
                 prep,
                 ctx,
                 index,
+                text_evidence,
             );
             candidates.push(Candidate {
                 score,
                 contributions,
+                evidence,
                 path,
                 name: entry.name.to_owned(),
                 is_directory: entry.is_directory,
@@ -955,8 +1250,8 @@ fn score_fuzzy_entry(
     ctx: &RankContext,
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
-) -> Option<(i64, String)> {
-    let (quality, corrected) = if prep.path_shaped {
+) -> Option<(i64, String, TextMatchEvidence)> {
+    let (quality, corrected, path_scope) = if prep.path_shaped {
         let quality = fuzzy_path_interpretation(
             index,
             item,
@@ -965,7 +1260,7 @@ fn score_fuzzy_entry(
             edit_scratch,
             &prep.text,
         )?;
-        (quality + prep.text.path_scope, false)
+        (quality, false, true)
     } else if prep.tokens.len() > 1 {
         let mut best = fuzzy_token_set(
             index,
@@ -1000,7 +1295,7 @@ fn score_fuzzy_entry(
                 corrected = true;
             }
         }
-        (best?, corrected)
+        (best?, corrected, false)
     } else {
         let direct = prep.tokens.first().and_then(|token| {
             fuzzy_name_quality(
@@ -1026,20 +1321,24 @@ fn score_fuzzy_entry(
                 corrected = true;
             }
         }
-        (best?, corrected)
+        (best?, corrected, false)
     };
-
-    let mut score = quality - tier_penalty(item.entry.tier, &ctx.config.penalties);
-    if corrected {
-        score -= ctx.config.text_match.layout_correction_penalty;
-    }
+    let text_evidence = TextMatchEvidence {
+        feature: quality.feature,
+        typo_edits: quality.typo_edits,
+        path_scope,
+        layout_corrected: corrected,
+        ..TextMatchEvidence::default()
+    };
+    let mut score = text_evidence.contribution(ctx.config)
+        - tier_penalty(item.entry.tier, &ctx.config.penalties);
     let path = index.entry_path(item.entry);
     let path_str = path.to_string_lossy().into_owned();
     score += personal_boost(ctx, &path_str, item.entry.is_directory);
     if prep.known.contains(&path) {
         score += ctx.config.context.known_place;
     }
-    Some((score, path_str))
+    Some((score, path_str, text_evidence))
 }
 
 fn fuzzy_token_set(
@@ -1049,15 +1348,15 @@ fn fuzzy_token_set(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     let ancestors = ancestor_names(index, item.entry.parent);
-    let mut weakest = i64::MAX;
+    let mut weakest: Option<MatchQuality> = None;
     let mut name_match = false;
     for token in tokens {
         if let Some(quality) =
             fuzzy_name_quality(item.entry.name, token, short_fuzzy, edit_scratch, weights)
         {
-            weakest = weakest.min(quality);
+            weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
             name_match = true;
             continue;
         }
@@ -1067,9 +1366,14 @@ fn fuzzy_token_set(
                 fuzzy_component_quality(component, token, short_fuzzy, edit_scratch, weights)
             })
             .max()?;
-        weakest = weakest.min(quality.min(weights.path_component));
+        let quality = quality.cap_as_path(weights);
+        weakest = Some(weakest.map_or(quality, |current| current.min(quality)));
     }
-    name_match.then_some(weakest)
+    if name_match {
+        weakest
+    } else {
+        None
+    }
 }
 
 fn fuzzy_path_interpretation(
@@ -1079,7 +1383,7 @@ fn fuzzy_path_interpretation(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     let (last, parents) = tokens.split_last()?;
     let final_quality =
         fuzzy_name_quality(item.entry.name, last, short_fuzzy, edit_scratch, weights)?;
@@ -1097,7 +1401,7 @@ fn fuzzy_path_interpretation(
                 edit_scratch,
                 weights,
             ) {
-                found = Some(quality.min(weights.path_component));
+                found = Some(quality.cap_as_path(weights));
                 break;
             }
         }
@@ -1112,7 +1416,7 @@ fn fuzzy_name_quality(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     let lower = name.to_lowercase();
     let stem = lower
         .rsplit_once('.')
@@ -1127,7 +1431,7 @@ fn fuzzy_component_quality(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     let lower = component.to_lowercase();
     fuzzy_targets(&lower, &lower, query, short_fuzzy, edit_scratch, weights)
 }
@@ -1139,7 +1443,7 @@ fn fuzzy_targets(
     short_fuzzy: bool,
     edit_scratch: &mut EditScratch,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     let edits = allowed_typo_edits(query.chars().count(), short_fuzzy);
     if edits == 0 {
         return None;
@@ -1151,10 +1455,21 @@ fn fuzzy_targets(
         .filter(|target| !target.is_empty())
     {
         if let Some(distance) = edit_scratch.distance(query, target, edits) {
-            let quality = weights
+            let score = weights
                 .typo_name
                 .saturating_sub(distance as i64 * weights.typo_edit_penalty);
-            best = Some(best.map_or(quality, |current: i64| current.max(quality)));
+            let quality = MatchQuality {
+                score,
+                feature: TextMatchFeature::TypoName,
+                typo_edits: u8::try_from(distance).unwrap_or(u8::MAX),
+            };
+            best = Some(best.map_or(quality, |current: MatchQuality| {
+                if quality.score > current.score {
+                    quality
+                } else {
+                    current
+                }
+            }));
         }
     }
     best
@@ -1349,6 +1664,7 @@ pub(crate) fn run_impl(
                     tier: candidate.tier.as_str(),
                     score: candidate.score,
                     contributions: candidate.contributions,
+                    evidence: candidate.evidence,
                 })
                 .collect();
             return SearchOutcome {
@@ -1421,6 +1737,7 @@ pub(crate) fn run_impl(
             tier: candidate.tier.as_str(),
             score: candidate.score,
             contributions: candidate.contributions,
+            evidence: candidate.evidence,
         })
         .collect();
     SearchOutcome {
@@ -1534,11 +1851,11 @@ fn scan_range(
             entry,
             name_filter: item_filter,
         };
-        if let Some((mut score, path)) =
+        if let Some((mut score, path, text_evidence)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             score += ctx.retrieval.boost(slot as u32, ctx.config);
-            let contributions = score_contributions(
+            let (contributions, evidence) = score_contributions(
                 score,
                 slot as u32,
                 &path,
@@ -1548,10 +1865,12 @@ fn scan_range(
                 prep,
                 ctx,
                 index,
+                text_evidence,
             );
             local.push(Candidate {
                 score,
                 contributions,
+                evidence,
                 path,
                 name: item.entry.name.to_string(),
                 is_directory: item.entry.is_directory,
@@ -1600,11 +1919,11 @@ fn scan_reuse(
             entry,
             name_filter: item_filter,
         };
-        if let Some((mut score, path)) =
+        if let Some((mut score, path, text_evidence)) =
             score_entry(index, item, prep, ctx, &mut dir_masks, &mut scratch)
         {
             score += ctx.retrieval.boost(slot, ctx.config);
-            let contributions = score_contributions(
+            let (contributions, evidence) = score_contributions(
                 score,
                 slot,
                 &path,
@@ -1614,10 +1933,12 @@ fn scan_reuse(
                 prep,
                 ctx,
                 index,
+                text_evidence,
             );
             local.push(Candidate {
                 score,
                 contributions,
+                evidence,
                 path,
                 name: item.entry.name.to_string(),
                 is_directory: item.entry.is_directory,
@@ -1643,7 +1964,7 @@ fn score_entry(
     ctx: &RankContext,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<(i64, String)> {
+) -> Option<(i64, String, TextMatchEvidence)> {
     if prep.path_shaped {
         score_path_shaped(index, item, prep, ctx, scratch)
     } else if prep.tokens.len() > 1 {
@@ -1661,8 +1982,8 @@ fn score_plain(
     prep: &Prepared,
     ctx: &RankContext,
     scratch: &mut String,
-) -> Option<(i64, String)> {
-    let (mut score, corrected_match) = if let Some(quality) = quality_match(
+) -> Option<(i64, String, TextMatchEvidence)> {
+    let (quality, corrected_match) = if let Some(quality) = quality_match(
         item.entry.name,
         item.name_filter,
         &prep.query_lower,
@@ -1672,7 +1993,7 @@ fn score_plain(
     ) {
         (quality, false)
     } else {
-        let mut best: Option<i64> = None;
+        let mut best: Option<MatchQuality> = None;
         for (needle, needle_filter) in prep.corrected.iter().zip(&prep.corrected_name_filters) {
             // A corrected needle can only match a name of the same script: a Cyrillic
             // needle never occurs in an ASCII name, so skip that pair before touching
@@ -1694,9 +2015,13 @@ fn score_plain(
         (best?, true)
     };
 
-    if corrected_match {
-        score -= ctx.config.text_match.layout_correction_penalty;
-    }
+    let text_evidence = TextMatchEvidence {
+        feature: quality.feature,
+        typo_edits: quality.typo_edits,
+        layout_corrected: corrected_match,
+        ..TextMatchEvidence::default()
+    };
+    let mut score = text_evidence.contribution(ctx.config);
     score -= tier_penalty(item.entry.tier, &ctx.config.penalties);
 
     let path = index.entry_path(item.entry);
@@ -1705,7 +2030,7 @@ fn score_plain(
     if prep.known.contains(&path) {
         score += ctx.config.context.known_place;
     }
-    Some((score, path_str))
+    Some((score, path_str, text_evidence))
 }
 
 /// Score a multi-token plain query against one entry (SPEC §6 token contract): the entry
@@ -1722,15 +2047,15 @@ fn score_multi(
     ctx: &RankContext,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<(i64, String)> {
+) -> Option<(i64, String, TextMatchEvidence)> {
     // The direct token set is the flat needle prefix (offset 0); each corrected set follows at
     // its recorded offset, so a per-set token position maps to a flat bit index.
-    let (mut score, corrected_match) = if let Some(band) =
+    let (mut text_evidence, corrected_match) = if let Some(band) =
         best_multi_interpretation(index, item, &prep.tokens, 0, prep, dir_masks, scratch)
     {
         (band, false)
     } else {
-        let mut best: Option<i64> = None;
+        let mut best: Option<TextMatchEvidence> = None;
         for (k, set) in prep.corrected_tokens.iter().enumerate() {
             // A corrected token of the other script never matches a same-script name or
             // path; `quality_match`/`contains_ci` reject that mismatch before any copy, so
@@ -1740,15 +2065,20 @@ fn score_multi(
             if let Some(band) =
                 best_multi_interpretation(index, item, set, offset, prep, dir_masks, scratch)
             {
-                best = Some(best.map_or(band, |current| current.max(band)));
+                best = Some(best.map_or(band.clone(), |current| {
+                    if band.contribution(ctx.config) > current.contribution(ctx.config) {
+                        band
+                    } else {
+                        current
+                    }
+                }));
             }
         }
         (best?, true)
     };
 
-    if corrected_match {
-        score -= ctx.config.text_match.layout_correction_penalty;
-    }
+    text_evidence.layout_corrected = corrected_match;
+    let mut score = text_evidence.contribution(ctx.config);
     score -= tier_penalty(item.entry.tier, &ctx.config.penalties);
 
     let path = index.entry_path(item.entry);
@@ -1757,7 +2087,7 @@ fn score_multi(
     if prep.known.contains(&path) {
         score += ctx.config.context.known_place;
     }
-    Some((score, path_str))
+    Some((score, path_str, text_evidence))
 }
 
 /// The strongest direct interpretation of a multi-token query. Ordinary matching allows
@@ -1771,10 +2101,21 @@ fn best_multi_interpretation(
     prep: &Prepared,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<i64> {
+) -> Option<TextMatchEvidence> {
     let ordinary = match_token_set(index, item, tokens, offset, prep, dir_masks, scratch);
     let scoped = implicit_path_quality(index, item, tokens, offset, prep, scratch);
-    ordinary.max(scoped)
+    match (ordinary, scoped) {
+        (Some(left), Some(right)) => {
+            if right.contribution_with_weights(&prep.text)
+                > left.contribution_with_weights(&prep.text)
+            {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (left, right) => left.or(right),
+    }
 }
 
 fn implicit_path_quality(
@@ -1784,7 +2125,7 @@ fn implicit_path_quality(
     offset: usize,
     prep: &Prepared,
     scratch: &mut String,
-) -> Option<i64> {
+) -> Option<TextMatchEvidence> {
     let (last, prefix) = tokens.split_last()?;
     if prefix.is_empty() {
         return None;
@@ -1800,7 +2141,12 @@ fn implicit_path_quality(
         scratch,
         &prep.text,
     )?;
-    ancestors_match(index, item.entry.parent, prefix).then_some(quality + prep.text.path_scope)
+    ancestors_match(index, item.entry.parent, prefix).then_some(TextMatchEvidence {
+        feature: quality.feature,
+        typo_edits: quality.typo_edits,
+        path_scope: true,
+        ..TextMatchEvidence::default()
+    })
 }
 
 /// The quality band of an entry against a whole token set: the minimum per-token quality, or
@@ -1815,27 +2161,27 @@ fn match_token_set(
     prep: &Prepared,
     dir_masks: &mut Option<DirMaskCache>,
     scratch: &mut String,
-) -> Option<i64> {
-    let mut band = i64::MAX;
+) -> Option<TextMatchEvidence> {
+    let mut band: Option<MatchQuality> = None;
     let mut all_in_name = true;
     for (j, token) in tokens.iter().enumerate() {
         // `offset + j` is this token's index in `Prepared::path_needles`, i.e. its bit in a
         // dir mask.
         let quality = token_quality(index, item, token, offset + j, prep, dir_masks, scratch)?;
-        band = band.min(quality.score);
+        band = Some(band.map_or(quality.quality, |current| current.min(quality.quality)));
         all_in_name &= quality.in_name;
     }
-    (band != i64::MAX).then_some(
-        band + if all_in_name {
-            prep.text.all_tokens_in_name
-        } else {
-            0
-        },
-    )
+    let band = band?;
+    Some(TextMatchEvidence {
+        feature: band.feature,
+        typo_edits: band.typo_edits,
+        all_tokens_in_name: all_in_name,
+        ..TextMatchEvidence::default()
+    })
 }
 
 struct TokenQuality {
-    score: i64,
+    quality: MatchQuality,
     in_name: bool,
 }
 
@@ -1869,7 +2215,7 @@ fn token_quality(
         &prep.text,
     ) {
         return Some(TokenQuality {
-            score: quality,
+            quality,
             in_name: true,
         });
     }
@@ -1887,7 +2233,7 @@ fn token_quality(
         }
     };
     in_path.then_some(TokenQuality {
-        score: prep.text.path_component,
+        quality: MatchQuality::literal(prep.text.path_component, TextMatchFeature::PathComponent),
         in_name: false,
     })
 }
@@ -1908,10 +2254,10 @@ fn score_path_shaped(
     prep: &Prepared,
     ctx: &RankContext,
     scratch: &mut String,
-) -> Option<(i64, String)> {
+) -> Option<(i64, String, TextMatchEvidence)> {
     let (last, prefix) = prep.segments.split_last()?;
     let last_filter = *prep.segment_name_filters.last()?;
-    let mut score = quality_match(
+    let quality = quality_match(
         item.entry.name,
         item.name_filter,
         last,
@@ -1921,9 +2267,13 @@ fn score_path_shaped(
     )?;
 
     let scoped = !prefix.is_empty() && ancestors_match(index, item.entry.parent, prefix);
-    if scoped {
-        score += prep.text.path_scope;
-    }
+    let text_evidence = TextMatchEvidence {
+        feature: quality.feature,
+        typo_edits: quality.typo_edits,
+        path_scope: scoped,
+        ..TextMatchEvidence::default()
+    };
+    let mut score = text_evidence.contribution(ctx.config);
 
     // Junk stays penalized even under a typed prefix; only the hidden penalty is waived
     // for a scoped match (guarantee c: "no hidden penalty").
@@ -1939,7 +2289,7 @@ fn score_path_shaped(
     if prep.known.contains(&path) {
         score += ctx.config.context.known_place;
     }
-    Some((score, path_str))
+    Some((score, path_str, text_evidence))
 }
 
 /// Whether the ordered `segments` each occur (as a substring) in the ancestor component
@@ -2009,6 +2359,31 @@ fn ancestor_names(index: &IndexData, dir: DirId) -> Vec<String> {
 /// Match quality of the already-lowercased `needle` against a `name`. When both are ASCII
 /// (the vast majority of file names) it compares bytes case-insensitively with no
 /// allocation; otherwise it Unicode-lowercases `name` into `scratch` and compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MatchQuality {
+    score: i64,
+    feature: TextMatchFeature,
+    typo_edits: u8,
+}
+
+impl MatchQuality {
+    fn literal(score: i64, feature: TextMatchFeature) -> Self {
+        Self {
+            score,
+            feature,
+            typo_edits: 0,
+        }
+    }
+
+    fn cap_as_path(self, weights: &TextMatchWeights) -> Self {
+        if self.score <= weights.path_component {
+            self
+        } else {
+            Self::literal(weights.path_component, TextMatchFeature::PathComponent)
+        }
+    }
+}
+
 fn quality_match(
     name: &str,
     item_filter: u64,
@@ -2016,7 +2391,7 @@ fn quality_match(
     needle_filter: u64,
     scratch: &mut String,
     weights: &TextMatchWeights,
-) -> Option<i64> {
+) -> Option<MatchQuality> {
     if !filter_contains(item_filter, needle_filter) {
         return None;
     }
@@ -2035,31 +2410,49 @@ fn quality_match(
 }
 
 /// Match quality of `needle` against an already-lowercased `haystack` (Unicode path).
-fn quality_of(haystack: &str, needle: &str, weights: &TextMatchWeights) -> Option<i64> {
+fn quality_of(haystack: &str, needle: &str, weights: &TextMatchWeights) -> Option<MatchQuality> {
     if haystack == needle {
-        Some(weights.exact_name)
+        Some(MatchQuality::literal(
+            weights.exact_name,
+            TextMatchFeature::ExactName,
+        ))
     } else if haystack.starts_with(needle) {
-        Some(weights.prefix_name)
+        Some(MatchQuality::literal(
+            weights.prefix_name,
+            TextMatchFeature::PrefixName,
+        ))
     } else if haystack.contains(needle) {
-        Some(weights.substring_name)
+        Some(MatchQuality::literal(
+            weights.substring_name,
+            TextMatchFeature::SubstringName,
+        ))
     } else {
         None
     }
 }
 
 /// Case-insensitive ASCII match quality of `needle` (lowercase) against `name` bytes.
-fn quality_ascii(name: &[u8], needle: &[u8], weights: &TextMatchWeights) -> Option<i64> {
+fn quality_ascii(name: &[u8], needle: &[u8], weights: &TextMatchWeights) -> Option<MatchQuality> {
     if needle.is_empty() || name.len() < needle.len() {
         return None;
     }
     if name.len() == needle.len() && ascii_ci_eq(name, needle) {
-        return Some(weights.exact_name);
+        return Some(MatchQuality::literal(
+            weights.exact_name,
+            TextMatchFeature::ExactName,
+        ));
     }
     if ascii_ci_eq(&name[..needle.len()], needle) {
-        return Some(weights.prefix_name);
+        return Some(MatchQuality::literal(
+            weights.prefix_name,
+            TextMatchFeature::PrefixName,
+        ));
     }
     if ascii_contains_ci(name, needle) {
-        return Some(weights.substring_name);
+        return Some(MatchQuality::literal(
+            weights.substring_name,
+            TextMatchFeature::SubstringName,
+        ));
     }
     None
 }
@@ -2144,16 +2537,15 @@ fn score_contributions(
     prep: &Prepared,
     ctx: &RankContext,
     index: &IndexData,
-) -> ScoreContributions {
+    text_match: TextMatchEvidence,
+) -> (ScoreContributions, ScoreEvidence) {
+    let (search_memory_milli, learned_usage_milli) = ctx.memory.strengths_milli(path);
     let (search_memory, learned_usage) = ctx.memory.contributions(path, ctx.config);
-    let visit = ctx
-        .journal
-        .strength_milli(path, &ctx.config.general_usage)
-        .saturating_mul(ctx.config.general_usage.visit_max)
-        / 1_000;
+    let visit_milli = ctx.journal.strength_milli(path, &ctx.config.general_usage);
+    let visit = visit_milli.saturating_mul(ctx.config.general_usage.visit_max) / 1_000;
     let (retrieval_context, recents) = ctx.retrieval.contributions(slot, ctx.config);
-    let known = i64::from(prep.known.contains(Path::new(path)))
-        .saturating_mul(ctx.config.context.known_place);
+    let is_known_place = prep.known.contains(Path::new(path));
+    let known = i64::from(is_known_place).saturating_mul(ctx.config.context.known_place);
     let context = retrieval_context.saturating_add(known);
     let general_usage = learned_usage.saturating_add(visit).saturating_add(recents);
     let item_kind = if is_directory {
@@ -2171,13 +2563,8 @@ fn score_contributions(
     } else {
         tier_penalty(tier, &ctx.config.penalties)
     };
-    let accounted = search_memory
-        .saturating_add(general_usage)
-        .saturating_add(context)
-        .saturating_add(item_kind)
-        .saturating_sub(penalties);
     let contributions = ScoreContributions {
-        text_match: total.saturating_sub(accounted),
+        text_match: text_match.contribution(ctx.config),
         search_memory,
         general_usage,
         context,
@@ -2186,7 +2573,24 @@ fn score_contributions(
         penalties,
     };
     debug_assert_eq!(contributions.total(), total);
-    contributions
+    let evidence = ScoreEvidence {
+        text_match,
+        search_memory_milli,
+        learned_usage_milli,
+        visit_milli,
+        current_location: ctx
+            .retrieval
+            .contains(slot, RetrievalSource::CurrentLocation),
+        pinned_anchor: ctx.retrieval.contains(slot, RetrievalSource::PinnedAnchor),
+        recents: ctx.retrieval.contains(slot, RetrievalSource::Recents),
+        known_place: is_known_place,
+        alias: false,
+        item_kind_applied: true,
+        is_directory,
+        tier: tier.as_str().to_owned(),
+        tier_penalty_waived: scoped_hidden,
+    };
+    (contributions, evidence)
 }
 
 /// Lowercase `name` into the reused `scratch` buffer. The overwhelming majority of file
@@ -2315,6 +2719,7 @@ fn inject(
     fallback_is_dir: bool,
     group: InjectedGroup,
 ) {
+    let (is_directory, tier) = find_entry(index, target).unwrap_or((fallback_is_dir, Tier::Normal));
     let contributions = match group {
         InjectedGroup::TextMatch => ScoreContributions {
             text_match: score,
@@ -2325,15 +2730,30 @@ fn inject(
             ..ScoreContributions::default()
         },
     };
+    let evidence = ScoreEvidence {
+        text_match: if matches!(group, InjectedGroup::TextMatch) {
+            TextMatchEvidence {
+                feature: TextMatchFeature::ExistingPath,
+                ..TextMatchEvidence::default()
+            }
+        } else {
+            TextMatchEvidence::default()
+        },
+        alias: matches!(group, InjectedGroup::Alias),
+        is_directory,
+        tier: tier.as_str().to_owned(),
+        tier_penalty_waived: true,
+        ..ScoreEvidence::default()
+    };
     let path_str = target.to_string_lossy().into_owned();
     if let Some(existing) = candidates.iter_mut().find(|c| c.path == path_str) {
         if score > existing.score {
             existing.score = score;
             existing.contributions = contributions;
+            existing.evidence = evidence;
         }
         return;
     }
-    let (is_directory, tier) = find_entry(index, target).unwrap_or((fallback_is_dir, Tier::Normal));
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -2341,6 +2761,7 @@ fn inject(
     candidates.push(Candidate {
         score,
         contributions,
+        evidence,
         path: path_str,
         name,
         is_directory,
@@ -2386,6 +2807,15 @@ fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, 
             item_kind,
             penalties: tier_penalty(tier, &ctx.config.penalties),
         };
+        let (search_memory_milli, learned_usage_milli) = ctx.memory.strengths_milli(path);
+        let evidence = ScoreEvidence {
+            search_memory_milli,
+            learned_usage_milli,
+            item_kind_applied: true,
+            is_directory,
+            tier: tier.as_str().to_owned(),
+            ..ScoreEvidence::default()
+        };
         let score = contributions.total();
         let name = target
             .file_name()
@@ -2394,6 +2824,7 @@ fn inject_memory_candidates(candidates: &mut Vec<Candidate>, index: &IndexData, 
         candidates.push(Candidate {
             score,
             contributions,
+            evidence,
             path: path.to_owned(),
             name,
             is_directory,

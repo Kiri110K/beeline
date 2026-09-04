@@ -260,6 +260,11 @@ impl MemoryEvidence {
         (memory, usage)
     }
 
+    pub fn strengths_milli(&self, path: &str) -> (i64, i64) {
+        let strength = self.by_path.get(path).copied().unwrap_or_default();
+        (strength.memory_milli, strength.usage_milli)
+    }
+
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.by_path.keys().map(String::as_str)
     }

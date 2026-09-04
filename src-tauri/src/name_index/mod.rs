@@ -668,6 +668,16 @@ fn direct_existing_path_response(
                 text_match: ranker.text_match.existing_path,
                 ..query::ScoreContributions::default()
             },
+            evidence: query::ScoreEvidence {
+                text_match: query::TextMatchEvidence {
+                    feature: query::TextMatchFeature::ExistingPath,
+                    ..query::TextMatchEvidence::default()
+                },
+                is_directory,
+                tier: tier.as_str().to_owned(),
+                tier_penalty_waived: true,
+                ..query::ScoreEvidence::default()
+            },
         }],
     })
 }

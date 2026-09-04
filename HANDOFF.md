@@ -63,8 +63,7 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   config fingerprint; effective configs сохраняются content-addressed в
   `ranker_snapshots/`. NDJSON чистится по 30 дням и 256 MiB, maintenance идёт
   только на startup/новом событии. UI по-прежнему получает top-50; расширенный
-  top-256 остаётся локально для анализа. Следующий шаг — named score contribution
-  breakdown и полноценный CLI replay/diff.
+  top-256 остаётся локально для анализа.
 - Detailed trace теперь хранит для каждого top-256 Item точный final score и
   named contributions: Text Match, Search Memory, General Usage, Context, Alias,
   Item Kind и Penalties. Инвариант суммы покрыт тестами для literal, fuzzy,
@@ -72,6 +71,17 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   получает penalty. CLI `replay` строго парсит NDJSON и проверяет contiguous rank,
   невозрастающий score и совпадение score с contribution total. Config snapshots,
   на которые больше не ссылаются retained traces, удаляются во время maintenance.
+- Trace schema v2 теперь сохраняет config-independent Candidate Evidence и для
+  каждого применимого leaf feature отдельно пишет raw value, normalized milli,
+  weight и signed contribution. Text Match разложен на exact/prefix/substring/
+  typo/path/existing-path, typo edit count, all-tokens bonus, path scope и layout
+  correction; остальные facts покрывают learned association/usage, visits,
+  Recents, Current Location, Pinned Anchor, Known Place, Alias, Item Kind и
+  Hidden/Junk. Replay заново собирает contributions из fingerprinted config и
+  отвергает несовпадение. `replay <trace> <alternative-config>` пересчитывает
+  весь top-256 без Name Index или filesystem, сообщает изменившиеся snapshots и
+  до 1000 точных old/new rank+score deltas. Старые trace schema намеренно не
+  поддерживаются.
 - Signal points, saturation/aging/transfer curves Search Memory и frequency/
   recency curve General Usage вынесены в тот же strict `ranker.json`; активный
   snapshot применяется и при startup pruning. Успешный batch Copy/Move теперь
