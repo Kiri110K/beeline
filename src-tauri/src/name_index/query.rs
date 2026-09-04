@@ -163,7 +163,7 @@ impl RankContext<'static> {
 }
 
 /// One search result, shaped for the IPC boundary (camelCase to match the TS schema).
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     pub name: String,
@@ -171,7 +171,22 @@ pub struct SearchHit {
     pub is_directory: bool,
     /// `"normal" | "hidden" | "junk"`.
     pub tier: &'static str,
+    /// Internal diagnostic value. The UI receives only the presentation fields above;
+    /// Ranking Traces retain this score with the active config fingerprint.
+    #[serde(skip)]
+    pub score: i64,
 }
+
+impl PartialEq for SearchHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.path == other.path
+            && self.is_directory == other.is_directory
+            && self.tier == other.tier
+    }
+}
+
+impl Eq for SearchHit {}
 
 #[derive(Clone)]
 struct Candidate {
@@ -828,6 +843,7 @@ fn fuzzy_hits(candidates: &[Candidate]) -> Vec<SearchHit> {
             path: candidate.path.clone(),
             is_directory: candidate.is_directory,
             tier: candidate.tier.as_str(),
+            score: candidate.score,
         })
         .collect()
 }
@@ -1277,6 +1293,7 @@ pub(crate) fn run_impl(
                     path: candidate.path,
                     is_directory: candidate.is_directory,
                     tier: candidate.tier.as_str(),
+                    score: candidate.score,
                 })
                 .collect();
             return SearchOutcome {
@@ -1346,6 +1363,7 @@ pub(crate) fn run_impl(
             path: candidate.path,
             is_directory: candidate.is_directory,
             tier: candidate.tier.as_str(),
+            score: candidate.score,
         })
         .collect();
     SearchOutcome {

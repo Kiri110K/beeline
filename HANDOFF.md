@@ -57,6 +57,14 @@ GitHub-трекер: https://github.com/Kiri110K/beeline/issues/23 (родите
   нового пути и воспроизводится из NDJSON после restart. Copy File/Path, Open in
   Terminal/Editor, Reveal in Finder и Open in New Tab также дают strong signal
   только после успешного dispatch; Trash/Delete/failed actions не обучают.
+- Ranking Traces получили первый production writer: один background-QoS worker
+  без polling пишет compact record каждого query update, отменяемый detailed
+  top-256 через 300 мс idle и немедленный action record. Каждый record содержит
+  config fingerprint; effective configs сохраняются content-addressed в
+  `ranker_snapshots/`. NDJSON чистится по 30 дням и 256 MiB, maintenance идёт
+  только на startup/новом событии. UI по-прежнему получает top-50; расширенный
+  top-256 остаётся локально для анализа. Следующий шаг — named score contribution
+  breakdown и полноценный CLI replay/diff.
 
 - Каноническая карта: [Wayfinder Map: Search v2](https://github.com/Kiri110K/beeline/issues/42).
   Цель — полная implementation-ready спека, не реализация.

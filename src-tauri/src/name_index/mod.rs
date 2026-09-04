@@ -17,6 +17,7 @@ mod persist;
 mod qgram;
 mod query;
 mod ranker_config;
+mod ranking_trace;
 mod search_memory;
 mod visit_journal;
 mod watcher;
@@ -45,6 +46,7 @@ use model::{IndexData, Tier};
 use qgram::QGramIndex;
 use query::{RankContext, RetrievalSignals, RetrievalSource, SearchHit};
 use ranker_config::RankerConfig;
+use ranking_trace::RankingTraces;
 use search_memory::{MemoryEvidence, SearchMemory, SignalKind};
 use visit_journal::{VisitJournal, VisitKind};
 
@@ -52,6 +54,7 @@ use visit_journal::{VisitJournal, VisitKind};
 const HOME_VOLUME_KEY: &str = "home";
 const QGRAM_READY_EVENT: &str = "beeline://search-qgram-ready";
 const RANKER_RELOADED_EVENT: &str = "beeline://ranker-reloaded";
+const TRACE_RESULT_LIMIT: usize = 256;
 
 /// The built-in Junk seed list (SPEC §6), re-exported so the settings store can seed a
 /// fresh install's editable list from the same source (SPEC §12).
@@ -105,6 +108,8 @@ pub struct NameIndex {
     search_memory: Arc<SearchMemory>,
     /// One active, atomically swappable Ranker Configuration.
     ranker: Arc<RwLock<Arc<RankerConfig>>>,
+    /// Event-driven local ranking diagnostics and config snapshots.
+    traces: RankingTraces,
     /// The Alias Dictionary (SPEC §6), swapped in place when Settings change so new
     /// searches rank against the current aliases.
     aliases: RwLock<Arc<AliasDictionary>>,
@@ -306,6 +311,9 @@ impl NameIndex {
                 RankerConfig::default()
             }
         };
+        let traces = RankingTraces::init(&app_data_dir)
+            .map_err(|error| format!("failed to initialize Ranking Traces: {error}"))?;
+        traces.snapshot_config(&ranker);
 
         Ok(Self {
             data,
@@ -315,6 +323,7 @@ impl NameIndex {
             journal,
             search_memory,
             ranker: Arc::new(RwLock::new(Arc::new(ranker))),
+            traces,
             aliases,
             generation: Arc::new(AtomicU64::new(0)),
             reuse: Arc::new(Mutex::new(None)),
@@ -624,6 +633,7 @@ fn direct_existing_path_response(
     data: &Arc<RwLock<IndexData>>,
     junk: &JunkPatterns,
     root: &Path,
+    ranker: &RankerConfig,
     query: &str,
     limit: usize,
     started: Instant,
@@ -653,6 +663,7 @@ fn direct_existing_path_response(
             path,
             is_directory,
             tier: tier.as_str(),
+            score: ranker.text_match.existing_path,
         }],
     })
 }
@@ -754,6 +765,10 @@ fn send_wave(channel: &Channel<SearchWave>, wave: SearchWave) -> Result<(), Stri
         .map_err(|error| format!("failed to send Search v2 wave: {error}"))
 }
 
+fn presentation_hits(hits: &[SearchHit], limit: usize) -> Vec<SearchHit> {
+    hits.iter().take(limit).cloned().collect()
+}
+
 /// Search v2 sends one ranked stream through a Tauri channel. The frontend may paint the
 /// complete Working Set before global work finishes, then reconcile exact/layout and fuzzy
 /// waves by stable Item path. One generation stamp covers the entire stream.
@@ -774,10 +789,37 @@ pub async fn search_name_index_v2(
     let data = state.data.clone();
     let junk = state.junk_snapshot();
     let root = state.root.clone();
-    if let Some(response) =
-        direct_existing_path_response(&data, &junk, &root, &query, limit as usize, started)
-    {
+    let ranker = state.ranker_snapshot();
+    let presentation_limit = limit as usize;
+    let ranking_limit = presentation_limit.max(TRACE_RESULT_LIMIT);
+    let significant_chars = qgram::significant_len(&query);
+    let global_requested = significant_chars >= ranker.global_retrieval_significant_chars as usize;
+    state.traces.query_started(
+        now_ms(),
+        &query,
+        &ranker,
+        significant_chars,
+        global_requested,
+    );
+    if let Some(response) = direct_existing_path_response(
+        &data,
+        &junk,
+        &root,
+        &ranker,
+        &query,
+        presentation_limit,
+        started,
+    ) {
         *state.reuse.lock().expect("reuse cache lock poisoned") = None;
+        state.traces.results_complete(
+            now_ms(),
+            &query,
+            &ranker,
+            "exact",
+            response.backend_duration_ms,
+            response.scanned,
+            &response.hits,
+        );
         return send_wave(
             &on_wave,
             SearchWave {
@@ -794,12 +836,12 @@ pub async fn search_name_index_v2(
 
     let journal = state.journal.clone();
     let search_memory = state.search_memory.clone();
-    let ranker = state.ranker_snapshot();
     let aliases = state.aliases_snapshot();
     let generation = state.generation.clone();
     let reuse = state.reuse.clone();
     let junk_refresh = state.junk_refresh.clone();
     let qgrams = state.qgrams.clone();
+    let traces = state.traces.clone();
     let recent_paths = recents.paths();
     let current_location = current_location.map(PathBuf::from);
     let pinned_paths = pinned_paths
@@ -833,7 +875,7 @@ pub async fn search_name_index_v2(
                 &index,
                 &context,
                 &query,
-                limit as usize,
+                ranking_limit,
                 &slots,
                 Some(&cancel),
                 true,
@@ -844,9 +886,21 @@ pub async fn search_name_index_v2(
             return Err("search superseded".to_owned());
         }
         let working_empty = working.hits.is_empty();
-        let global =
-            qgram::significant_len(&query) >= ranker.global_retrieval_significant_chars as usize;
+        let global = global_requested;
         let qgram_ready = qgrams.read().expect("q-gram lock poisoned").is_some();
+        let working_duration_ms =
+            u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if !global {
+            traces.results_complete(
+                now_ms(),
+                &query,
+                &ranker,
+                "working_set",
+                working_duration_ms,
+                working.scanned,
+                &working.hits,
+            );
+        }
         send_wave(
             &on_wave,
             SearchWave {
@@ -855,9 +909,8 @@ pub async fn search_name_index_v2(
                 complete: !global,
                 qgram_ready,
                 scanned: working.scanned,
-                backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-                hits: working.hits,
+                backend_duration_ms: working_duration_ms,
+                hits: presentation_hits(&working.hits, presentation_limit),
             },
         )?;
         if !global {
@@ -902,7 +955,7 @@ pub async fn search_name_index_v2(
                             &index,
                             &context,
                             &query,
-                            limit as usize,
+                            ranking_limit,
                             &priority_slots,
                             Some(&cancel),
                             false,
@@ -925,7 +978,7 @@ pub async fn search_name_index_v2(
                                     stream_started.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX),
-                                hits: priority.hits,
+                                hits: presentation_hits(&priority.hits, presentation_limit),
                             },
                         )?;
                         priority_sent = true;
@@ -963,7 +1016,7 @@ pub async fn search_name_index_v2(
                         scanned,
                         backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
-                        hits,
+                        hits: presentation_hits(&hits, presentation_limit),
                     },
                 ) {
                     partial_error = Some(error);
@@ -975,7 +1028,7 @@ pub async fn search_name_index_v2(
                     &index,
                     &context,
                     &query,
-                    limit as usize,
+                    ranking_limit,
                     &candidate_slots,
                     Some(&cancel),
                     false,
@@ -991,6 +1044,17 @@ pub async fn search_name_index_v2(
             let scanned = fuzzy.scanned;
             let hits = fuzzy.hits;
             let result_count = hits.len();
+            let complete_duration_ms =
+                u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            traces.results_complete(
+                now_ms(),
+                &query,
+                &ranker,
+                "fuzzy",
+                complete_duration_ms,
+                scanned,
+                &hits,
+            );
             send_wave(
                 &on_wave,
                 SearchWave {
@@ -999,9 +1063,8 @@ pub async fn search_name_index_v2(
                     complete: true,
                     qgram_ready: true,
                     scanned,
-                    backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
-                    hits,
+                    backend_duration_ms: complete_duration_ms,
+                    hits: presentation_hits(&hits, presentation_limit),
                 },
             )?;
             record(
@@ -1035,7 +1098,7 @@ pub async fn search_name_index_v2(
             &ranker,
             Some(&junk_refresh),
             &query,
-            limit as usize,
+            ranking_limit,
             cached.as_ref(),
             Some(&cancel),
             context.retrieval.clone(),
@@ -1058,6 +1121,17 @@ pub async fn search_name_index_v2(
 
         let exact_hits = exact.outcome.hits;
         let result_count = exact_hits.len();
+        let complete_duration_ms =
+            u64::try_from(stream_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        traces.results_complete(
+            now_ms(),
+            &query,
+            &ranker,
+            "exact",
+            complete_duration_ms,
+            exact.outcome.scanned,
+            &exact_hits,
+        );
         send_wave(
             &on_wave,
             SearchWave {
@@ -1066,9 +1140,8 @@ pub async fn search_name_index_v2(
                 complete: true,
                 qgram_ready,
                 scanned: exact.outcome.scanned,
-                backend_duration_ms: u64::try_from(stream_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
-                hits: exact_hits,
+                backend_duration_ms: complete_duration_ms,
+                hits: presentation_hits(&exact_hits, presentation_limit),
             },
         )?;
         record(
@@ -1121,7 +1194,11 @@ pub async fn record_search_signal(
         .as_deref()
         .is_some_and(|query| search_memory::is_path_interpretation(query, Path::new(&path)));
     let memory = state.search_memory.clone();
+    let ranker = state.ranker_snapshot();
     let timestamp = now_ms();
+    state
+        .traces
+        .action(timestamp, query.as_deref(), &path, &kind, &ranker);
     tauri::async_runtime::spawn_blocking(move || {
         memory.record(
             &path,
@@ -1185,6 +1262,7 @@ pub async fn reload_ranker_config(
         None => (RankerConfig::default(), "embedded_default"),
     };
     let fingerprint = config.fingerprint();
+    state.traces.snapshot_config(&config);
     *state.ranker.write().expect("ranker lock poisoned") = Arc::new(config);
     state.generation.fetch_add(1, Ordering::SeqCst);
     *state.reuse.lock().expect("reuse cache lock poisoned") = None;
@@ -1981,6 +2059,7 @@ mod tests {
             &shared,
             &JunkPatterns::default(),
             &root,
+            &RankerConfig::default(),
             &typed.to_string_lossy(),
             50,
             Instant::now(),
